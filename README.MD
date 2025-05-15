@@ -23,6 +23,7 @@ Some of them include:
 although a special care has been taken to ensure proper synchronization between them and finalizing on exit - 
 a solution would be to use an alternative to Flask that supports async (and also supports Server Sent Events)
 * RCE price chart is generated as a PNG image by matplotlib - it should be generated on the client side using JS
+* current hour import/export energy is not persisted across service restarts
 * PV forecast assumes that there are two PV strings with the same peak power and tilt but with a different orientation angle (basically east-west configuration)
 and that logic is quite hard-coded even though it looks like it's configurable
 * too much code in main.py - needs to be extracted for readability and maintainability
