@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="/static/bootstrap.min.css" rel="stylesheet">
+  <title>Energy Manager</title>
+</head>
+
+<body>
+  <div class="container">
+    <h1>Inverter runtime data</h1>
+    <div class="row">
+      <div class="col">
+        <div><span data-inverter="timestamp"></span></div>
+        <div>PV: <span data-inverter="ppv"></span>W</div>
+        <div>Battery: <span data-inverter="pbattery1"></span>W, <span data-inverter="battery_soc"></span>%, <span data-inverter="vbattery1"></span>V</div>
+        <div>Load: <span data-inverter="load_ptotal"></span>W (<span data-inverter="load_p1"></span> / <span data-inverter="load_p2"></span> / <span data-inverter="load_p3"></span> W)</div>
+        <div>Output: <span data-inverter="pgrid"></span> / <span data-inverter="pgrid2"></span> / <span data-inverter="pgrid3"></span> W</div>
+        <div>Grid: <span data-inverter="vgrid"></span> / <span data-inverter="vgrid2"></span> / <span data-inverter="vgrid3"></span> V, <span data-inverter="fgrid"></span> / <span data-inverter="fgrid2"></span> / <span data-inverter="fgrid3"></span> Hz</div>
+        <div>Meter: <span data-inverter="meter_active_power_total"></span>W (<span data-inverter="meter_active_power1"></span> / <span data-inverter="meter_active_power2"></span> / <span data-inverter="meter_active_power3"></span> W)</div>
+        <div>Backup: <span data-inverter="backup_ptotal"></span>W (<span data-inverter="backup_p1"></span> / <span data-inverter="backup_p2"></span> / <span data-inverter="backup_p3"></span> W)</div>
+        <div>Diagnose: <span data-inverter="diagnose_result_label"></span></div>
+        <div>Hourly export: <span data-inverter="_hourly_meter_export"></span> kWh</div>
+        <div>Hourly import: <span data-inverter="_hourly_meter_import"></span> kWh</div>
+        <div>Hourly load: <span data-inverter="_hourly_load"></span> kWh</div>
+      </div>
+    </div>
+    <div class="row">
+      <hr>
+      <div class="col">
+        <pre><code id="event-target">...</code></pre>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <a href="/eco" class="btn btn-success">🔋 Eco timer</a>
+        <a href="/config" class="btn btn-primary">🔧 Inverter Config</a>
+        <a href="/prices" class="btn btn-primary">📈 RCE</a>
+        <a href="/forecast" class="btn btn-primary">⛅ Forecast</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    var eventTarget = document.getElementById('event-target');
+    var eventSource = new EventSource('/listen');
+    eventSource.onmessage = function (e) {
+      let data = JSON.parse(e.data);
+      document.querySelectorAll("[data-inverter]").forEach(el => {
+        const key = el.getAttribute('data-inverter');
+        el.innerHTML = data[key];
+      });
+      eventTarget.innerHTML = Object.entries(data).map(([k, v]) => `${k}: ${v}<br>`).join('');
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+</body>
+
+</html>

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="/static/bootstrap.min.css" rel="stylesheet">
+  <title>RCE - Energy Manager</title>
+</head>
+
+<body>
+  <div class="container">
+    <h1>RCE</h1>
+    <h3>{{ date }}</h3>
+    <div class="row">
+      <div class="col-3">
+        <div class="input-group input-group-sm">
+          <input id="date-selector" type="date" class="form-control" value="{{ date }}" />
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <img src="/prices/rce.png?date={{ date }}" class="img-fluid" alt="RCE prices">
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <a href="/" class="btn btn-primary">< Back</a>
+        <a href="/eco" class="btn btn-success">🔋 Eco timer</a>
+        <a href="/config" class="btn btn-primary">🔧 Inverter Config</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('date-selector').addEventListener('change', function() {
+      window.location.href = '/prices?date=' + this.value;
+    });
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+</body>
+
+</html>

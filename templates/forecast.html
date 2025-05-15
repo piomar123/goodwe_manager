@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="/static/bootstrap.min.css" rel="stylesheet">
+  <title>Forecast - Energy Manager</title>
+</head>
+
+<body>
+  <div class="container">
+    <h1>Forecast</h1>
+    <h3>{{ date }}</h3>
+    <div class="row">
+      <div class="col-3">
+        <div class="input-group input-group-sm">
+          <input id="date-selector" type="date" class="form-control" value="{{ date }}" />
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <p>
+          90°: {{ forecast.angle90_in_kWh }} kWh<br>
+          270°: {{ forecast.angle270_in_kWh }} kWh<br>
+          Total: {{ forecast.total_in_kWh }} kWh
+        </p>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <a href="/" class="btn btn-primary">< Back</a>
+        <a href="/eco" class="btn btn-success">🔋 Eco timer</a>
+        <a href="/config" class="btn btn-primary">🔧 Inverter Config</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('date-selector').addEventListener('change', function() {
+      window.location.href = '/forecast?date=' + this.value;
+    });
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+</body>
+
+</html>
