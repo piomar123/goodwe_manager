@@ -112,7 +112,6 @@ def convert_to_series(response_data):
 
 def plot_rce(series, date) -> Figure:
     fig = plt.figure(f"RCE {date}", figsize=(14, 8))
-    ax = fig.subplots()
     axes = fig.gca()
     axes.plot([row[0] for row in series], [row[1] for row in series], '-', drawstyle='steps-post', label=f"RCE")
     axes.set_xlim(0, 24*4)

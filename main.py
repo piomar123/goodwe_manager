@@ -25,7 +25,7 @@ from goodwe.sensor import EcoModeV2
 import eco_encoder
 import forecast
 from announcer import MessageAnnouncer
-from rce import parse_date, query_pse_rce, plot_rce, setup_plot_style
+from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
 
 dotenv.load_dotenv()
 INVERTER_IP = os.environ.get('INVERTER_IP')
@@ -463,7 +463,7 @@ def get_prices_image():
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     logger.debug('Generating RCE prices images for date: {date_yyyymmdd}')
-    rce = query_pse_rce(date)
+    rce = query_pse_rce_15min(date)
     logger.debug(rce)
     fig = plot_rce(rce, date_yyyymmdd)
     output_io = io.BytesIO()
