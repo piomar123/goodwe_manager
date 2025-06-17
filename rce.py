@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import requests
 from matplotlib import rcParams
 from matplotlib.figure import Figure
+from matplotlib.ticker import FixedLocator
 
 ACCEPT_JSON_HEADER = {'Accept': 'application/json'}
 
@@ -38,19 +39,37 @@ def parse_date(date_str: str):
     raise RuntimeError(f"Unknown date format: {date_str}")
 
 
-def query_pse_rce(query_date: datetime.date) -> list[tuple[str, float]]:
+def query_pse_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
     """
     Returns e.g. [('00:00', 511.42), ('01:00', 500.12), ..., ('23:00', 432.12), ('24:00', 432.12)]
+    Example response from API query:
+        {"value": [
+            {
+                "dtime": "2024-06-14 00:15:00",
+                "period": "00:00 - 00:15",
+                "rce_pln": 876.1,
+                "dtime_utc": "2024-06-13 22:15:00",
+                "period_utc": "22:00 - 22:15",
+                "business_date": "2024-06-14",
+                "publication_ts": "2024-06-13 17:05:05",
+                "publication_ts_utc": "2024-06-13 15:05:05.000000"
+            },
     """
     date_yyyymmdd = query_date.strftime('%Y-%m-%d')
-    response = requests.get(f'https://api.raporty.pse.pl/api/rce-pln?$filter=doba%20eq%20%27{date_yyyymmdd}%27', headers=ACCEPT_JSON_HEADER)
+    response = requests.get(f'https://v2.api.raporty.pse.pl/api/rce-pln?$select=period,rce_pln&$filter=business_date%20eq%20%27{date_yyyymmdd}%27',
+                            headers=ACCEPT_JSON_HEADER)
     response.raise_for_status()
     data = response.json()
     if not data['value']:
         raise RuntimeError(f"No data found for {date_yyyymmdd}")
-    return convert_to_series(data)
-    # {'value': [{'doba': '2024-07-25', 'rce_pln': 511.42, 'udtczas': '2024-07-25 00:15',
-    # 'udtczas_oreb': '00:00 - 00:15', 'business_date': '2024-07-25', 'source_datetime': '2024-07-24 14:57:15.417'}, {...
+    return convert_to_series_15min(data)
+
+
+def query_pse_rce(query_date: datetime.date) -> list[tuple[str, float]]:
+    """
+    Returns hourly RCE prices. To get 15-minute intervals use query_pse_rce_15min().
+    """
+    return query_pse_rce_15min(query_date)[::4]  # take every 4th entry to get hourly prices
 
 
 def setup_plot_style():
@@ -71,33 +90,42 @@ def main():
 
     date_in = args.date or input("Date (or [t]oday, [y]esterday, [n]tomorrow): ")
     date = parse_date(date_in)
-    rce = query_pse_rce(date)
+    rce = query_pse_rce_15min(date)
     print(rce)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     fig = plot_rce(rce, date_yyyymmdd)
     plt.show()
 
 
-def convert_to_series(response_data):
-    series = [(entry['udtczas_oreb'][0:5], entry['rce_pln']) for entry in response_data['value']]
+def convert_to_series_15min(response_data):
+    series = [(entry['period'][0:5], entry['rce_pln']) for entry in response_data['value']]
     series.append(('24:00', series[-1][1]))
-    return series[::4]
+    return series
+
+
+def convert_to_series(response_data):
+    """
+    Use convert_to_series_15min instead
+    """
+    return convert_to_series_15min(response_data)[::4]
 
 
 def plot_rce(series, date) -> Figure:
     fig = plt.figure(f"RCE {date}", figsize=(14, 8))
+    ax = fig.subplots()
     axes = fig.gca()
     axes.plot([row[0] for row in series], [row[1] for row in series], '-', drawstyle='steps-post', label=f"RCE")
-    axes.set_xlim(0, 24)
+    axes.set_xlim(0, 24*4)
     min_price = min(row[1] for row in series)
     axes.set_ylim(min(min_price, 0), None)
     # plt.legend()
     if date == datetime.today().strftime('%Y-%m-%d'):
         now = datetime.now().time()
         hour_float = now.hour + now.minute / 60.
-        axes.axvline(x=hour_float, color='red')
+        axes.axvline(x=hour_float*4, color='red')
     axes.axhline(y=0, color='gray', linestyle=':')
     axes.grid(color='gray', linestyle=':')
+    axes.xaxis.set_major_locator(FixedLocator([i for i in range(0, 24*4+1, 4)]))
     fig.subplots_adjust(top=0.95, bottom=0.1, left=0.1, right=0.95)
     return fig
 
