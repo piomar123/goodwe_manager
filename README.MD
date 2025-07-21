@@ -1,5 +1,9 @@
 # Goodwe PV energy manager
 
+Quick overview:
+
+https://github.com/user-attachments/assets/0824e02f-0407-40a6-8b6f-845b09fb819b
+
 * Create venv `python3 -m venv venv` and activate it `. venv/bin/activate`
 * Install dependencies `pip install -r requirements.txt`
 * Copy `.env.example` to `.env` and fill in the values
