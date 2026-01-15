@@ -36,6 +36,12 @@
                 <input type="text" class="form-control" name="end_time" id="end_time_{{ slot.index }}" value="{{ slot.end_time }}" required>
               </div>
             </div>
+            <div class="col-3">
+              <div class="input-group input-group-sm">
+                <div class="input-group-text">Days</div>
+                <input type="text" class="form-control" name="days" id="days_{{ slot.index }}" value="{{ slot.get_days() }}" required>
+              </div>
+            </div>
             <div class="col-6">
               <div class="input-group input-group-sm">
                 <!-- <label class="input-group-text" for="mode_{{ slot.index }}">Mode:</label> -->

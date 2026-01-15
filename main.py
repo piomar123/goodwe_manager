@@ -42,6 +42,7 @@ announcer = MessageAnnouncer()
 dry_run = False
 
 EVERY_DAY = 0b1111111
+EVERY_DAY_STR = 'all'
 SELECTED_SENSORS = [
     'timestamp',
     'ppv',
@@ -349,8 +350,25 @@ class EcoSlot:
     def is_discharge(self) -> bool:
         return self.mode == EcoMode.DISCHARGE
 
+    def get_days(self) -> str:
+        if self.days == EVERY_DAY:
+            return EVERY_DAY_STR
+        return f'0b{self.days:07b}'
+
     def __str__(self):
         return f"{self.index}: {'ON' if self.on_off else 'OFF'} {self.start_time}-{self.end_time} {self.mode} {self.power}% on {self.days}"
+
+    @staticmethod
+    def to_days_int(s: str) -> int:
+        s = s.strip().lower()
+        if s == EVERY_DAY_STR:
+            return EVERY_DAY
+        elif s.startswith('0b'):
+            return int(s, 2)
+        elif s.startswith('0x'):
+            return int(s, 16)
+        else:
+            return int(s)
 
 
 @app.get('/eco')
@@ -365,6 +383,7 @@ def get_eco():
                                             enumerate(eco_configs, start=1)])
 
 
+
 @app.post('/eco/<int:index>')
 def update_eco(index: int):
     logger.debug('Updating eco settings')
@@ -373,7 +392,7 @@ def update_eco(index: int):
                    'on_off' in request.form,
                    request.form['start_time'],
                    request.form['end_time'],
-                   EVERY_DAY,
+                   EcoSlot.to_days_int(request.form['days']),
                    EcoMode(request.form['mode']),
                    int(request.form['power']))
     logger.info(f"Updating eco mode {index}: {slot}")
