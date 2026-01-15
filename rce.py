@@ -6,6 +6,7 @@ from pprint import pprint
 from typing import Pattern
 
 import matplotlib.pyplot as plt
+import numpy as np
 import requests
 from matplotlib import rcParams
 from matplotlib.figure import Figure
@@ -69,7 +70,10 @@ def query_pse_rce(query_date: datetime.date) -> list[tuple[str, float]]:
     """
     Returns hourly RCE prices. To get 15-minute intervals use query_pse_rce_15min().
     """
-    return query_pse_rce_15min(query_date)[::4]  # take every 4th entry to get hourly prices
+    rce_15min = query_pse_rce_15min(query_date)
+    # noinspection PyTypeChecker
+    s = np.array_split(rce_15min, range(4, len(rce_15min), 4))
+    return [(chunk[0][0].item(), np.mean([float(price) for _, price in chunk]).item()) for chunk in s]
 
 
 def setup_plot_style():
