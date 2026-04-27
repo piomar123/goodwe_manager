@@ -57,9 +57,8 @@ def query_pse_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
             },
     """
     date_yyyymmdd = query_date.strftime('%Y-%m-%d')
-    response = requests.get(f'https://v2.api.raporty.pse.pl/api/rce-pln?$select=period,rce_pln&$filter=business_date%20eq%20%27{date_yyyymmdd}%27',
-                            headers=ACCEPT_JSON_HEADER,
-                            verify=False)
+    response = requests.get(f'https://api.raporty.pse.pl/api/rce-pln?$select=period,rce_pln&$filter=business_date%20eq%20%27{date_yyyymmdd}%27',
+                            headers=ACCEPT_JSON_HEADER)
     response.raise_for_status()
     data = response.json()
     if not data['value']:
