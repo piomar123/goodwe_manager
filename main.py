@@ -30,6 +30,7 @@ from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
 dotenv.load_dotenv()
 INVERTER_IP = os.environ.get('INVERTER_IP')
 assert INVERTER_IP, "INVERTER_IP environment variable is not set, copy .env.example to .env and set it"
+APP_PORT = int(os.environ.get('APP_PORT', 5000))
 
 # FIXME poor-man's config - convert to .env and de-hard-code
 PV_ORIENTATIONS = (90, 270)  # this is used for the forecast only, if the count of orientations is changed, modify also ForecastData tuple and forecast.html template
@@ -543,7 +544,7 @@ def main():
 
     asyncio_thread.start()
     # atexit.register(stop_threads)
-    app.run('0.0.0.0', debug=True, use_reloader=False)
+    app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False)
 
     logger.info("Finishing the application...")
     asyncio_thread.finish()
