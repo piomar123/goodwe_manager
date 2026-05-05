@@ -28,6 +28,19 @@
     </div>
   </form>
   <hr>
+  <form class="row row-cols-lg-auto g-3 align-items-center" method="post" action="/config/shadow_scan">
+    <div class="col-9">
+      <div class="form-check form-switch form-check-inline fs-3">
+        <input class="form-check-input" type="checkbox" name="on_off" id="shadow_scan_value" {{ 'checked' if settings['shadow_scan'] }}>
+        <label class="form-label fs-6" for="shadow_scan_value">Shadow scan</label>
+      </div>
+    </div>
+    <div class="col-3">
+      <input type="submit" class="btn btn-sm btn-danger" value="Save">
+    </div>
+  </form>
+  <hr>
+
   <form class="row row-cols-lg-auto g-3 align-items-center" method="post" action="/config/grid_export">
     <div class="col-9">
       <div class="form-check form-switch form-check-inline fs-3">

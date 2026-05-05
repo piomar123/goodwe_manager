@@ -415,6 +415,7 @@ async def write_eco_setting(setting: EcoSlot):
 
 _SETTING_KEY_TO_TYPE = {
     'unbalanced_output': bool,
+    'shadow_scan': bool,
     'grid_export': bool,
     'grid_export_limit': int,
     'battery_discharge_depth': int,
