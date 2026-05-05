@@ -201,12 +201,16 @@ class AsyncioThread(threading.Thread):
         self._inverter_address = inverter_address
 
     def run(self):
-        self._asyncio_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._asyncio_loop)
-        if not dry_run:
-            self._asyncio_loop.create_task(self._get_inverter_data_with_retry())
-        self._asyncio_loop.run_forever()
-        logger.info("Finished the asyncio loop")
+        loop = asyncio.new_event_loop()
+        self._asyncio_loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            if not dry_run:
+                loop.create_task(self._get_inverter_data_with_retry())
+            loop.run_forever()
+        finally:
+            self._drain_and_close_loop(loop)
+            logger.info("Finished the asyncio loop")
 
     @property
     def loop(self):
@@ -218,37 +222,47 @@ class AsyncioThread(threading.Thread):
 
     def run_coroutine_threadsafe(self, coro) -> concurrent.futures.Future:
         """Run a coroutine from another thread in the asyncio loop and return a Future"""
-        return asyncio.run_coroutine_threadsafe(coro, self._asyncio_loop)
+        loop = self._asyncio_loop
+        if loop is None:
+            raise RuntimeError('The asyncio loop is not running')
+        return asyncio.run_coroutine_threadsafe(coro, loop)
 
     def finish(self):
         """Called from another thread to finish and stop the asyncio loop"""
         logger.info("Finishing asyncio loop...")
         self._should_stop.set()
-        if self._asyncio_loop is None:
+        loop = self._asyncio_loop
+        if loop is None:
             return
-        finished = threading.Event()
-        asyncio.run_coroutine_threadsafe(self.wait_for_asyncio_finish(self._asyncio_loop, finished), self._asyncio_loop)
+        try:
+            stop_future = asyncio.run_coroutine_threadsafe(self._stop_event_loop(), loop)
+            stop_future.result(timeout=5)
+        except concurrent.futures.TimeoutError:
+            logger.warning("Timed out while requesting asyncio loop stop")
+        except RuntimeError:
+            # Loop is already closed or closing.
+            return
         logger.info("Waiting for the asyncio loop finish result...")
-        finished.wait(timeout=30)
-        while self._asyncio_loop.is_running():
-            logger.info("Asyncio loop still running...")
-            time.sleep(1)
-        self._asyncio_loop.close()
+        self.join(timeout=30)
+        if self.is_alive():
+            logger.warning("Asyncio thread did not stop within timeout")
 
     @staticmethod
-    async def wait_for_asyncio_finish(loop: asyncio.AbstractEventLoop, finished: threading.Event):
+    async def _stop_event_loop():
+        asyncio.get_running_loop().stop()
+
+    @staticmethod
+    def _drain_and_close_loop(loop: asyncio.AbstractEventLoop):
         logger.info("Waiting for the asyncio tasks to finish...")
-        tasks_to_wait = asyncio.all_tasks(loop) - {asyncio.current_task(loop)}
-        if tasks_to_wait:
-            done, pending = await asyncio.wait(tasks_to_wait, timeout=15)
-            logger.debug(f"Done: {done}, Pending: {pending}")
-            if pending:
-                logger.warning(f"Still running tasks after timeout: {pending}")
-                for task in pending:
-                    task.cancel()
-        logger.info("Stopping the asyncio loop")
-        loop.stop()
-        finished.set()  # we need an external Event because loop is already stopped and won't return the future result
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+        logger.info("Stopping and closing the asyncio loop")
+        loop.close()
 
     async def _get_inverter_data_with_retry(self):
         while True:
@@ -544,13 +558,14 @@ def main():
 
     asyncio_thread.start()
     # atexit.register(stop_threads)
-    app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False)
-
-    logger.info("Finishing the application...")
-    asyncio_thread.finish()
-    logger.info("Waiting for the background thread to finish...")
-    asyncio_thread.join()
-    logger.info("Finished all threads")
+    try:
+        app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False)
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, shutting down")
+    finally:
+        logger.info("Finishing the application...")
+        asyncio_thread.finish()
+        logger.info("Finished all threads")
 
 
 if __name__ == '__main__':
