@@ -492,6 +492,19 @@ def get_prices():
     return flask.render_template('prices.html', date=date_yyyymmdd)
 
 
+@app.get('/prices/rce.json')
+def get_prices_json():
+    date_param = request.args.get('date', default='t')
+    date = parse_date(date_param)
+    date_yyyymmdd = date.strftime('%Y-%m-%d')
+    logger.debug(f'Serving RCE prices JSON for date: {date_yyyymmdd}')
+    rce = query_pse_rce_15min(date)
+    return flask.jsonify({
+        'date': date_yyyymmdd,
+        'series': [{'time': time, 'price': price} for time, price in rce],
+    })
+
+
 @app.get('/prices/rce.png')
 def get_prices_image():
     date_param = request.args.get('date', default='t')

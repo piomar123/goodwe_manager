@@ -21,10 +21,12 @@
     </div>
     <div class="row">
       <div class="col">
-        <img src="/prices/rce.png?date={{ date }}" class="img-fluid" alt="RCE prices">
+        <div style="background:#111;border-radius:6px;padding:12px">
+          <canvas id="rce-chart"></canvas>
+        </div>
       </div>
     </div>
-    <div class="row">
+    <div class="row mt-2">
       <div class="col">
         <a href="/" class="btn btn-primary">< Back</a>
         <a href="/eco" class="btn btn-success">🔋 Eco timer</a>
@@ -40,6 +42,120 @@
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script>
+    (async function () {
+      const chartDate = '{{ date }}';
+      const resp = await fetch('/prices/rce.json?date=' + chartDate);
+      const data = await resp.json();
+      const labels = data.series.map(p => p.time);
+      const prices = data.series.map(p => p.price);
+      const minPrice = Math.min(...prices);
+
+      const overlayPlugin = {
+        id: 'overlay',
+        afterDraw(chart) {
+          const { ctx, scales: { x, y } } = chart;
+
+          // horizontal dashed line at y=0
+          const y0 = y.getPixelForValue(0);
+          ctx.save();
+          ctx.strokeStyle = 'rgba(160,160,160,0.5)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x.left, y0);
+          ctx.lineTo(x.right, y0);
+          ctx.stroke();
+          ctx.restore();
+
+          // red vertical line at current time (today only)
+          const today = new Date().toISOString().slice(0, 10);
+          if (chartDate !== today) return;
+          const now = new Date();
+          const nowIdx = (now.getHours() * 60 + now.getMinutes()) / 15;
+          const xPx = x.getPixelForValue(nowIdx);
+          ctx.save();
+          ctx.strokeStyle = '#ff5555';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(xPx, y.top);
+          ctx.lineTo(xPx, y.bottom);
+          ctx.stroke();
+          ctx.restore();
+        }
+      };
+
+      new Chart(document.getElementById('rce-chart'), {
+        type: 'line',
+        plugins: [overlayPlugin],
+        data: {
+          labels,
+          datasets: [{
+            data: prices,
+            stepped: 'after',
+            borderColor: '#5b8dd9',
+            borderWidth: 2,
+            pointRadius: 0,
+            pointHitRadius: 8,
+            fill: false,
+          }]
+        },
+        options: {
+          responsive: true,
+          animation: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              backgroundColor: '#222',
+              borderColor: '#555',
+              borderWidth: 1,
+              titleColor: '#aaa',
+              bodyColor: '#fff',
+              padding: 10,
+              callbacks: {
+                title: items => items[0].label,
+                label: item => ' ' + item.raw.toFixed(2) + ' PLN/MWh',
+              }
+            }
+          },
+          scales: {
+            x: {
+              ticks: {
+                color: '#888',
+                maxRotation: 0,
+                autoSkip: false,
+                font: { size: 11 },
+                callback(val, index) {
+                  return index % 4 === 0 ? this.getLabelForValue(val) : '';
+                },
+              },
+              grid: {
+                color: ctx => ctx.index % 4 === 0 ? 'rgba(128,128,128,0.25)' : 'transparent',
+                borderDash: [3, 4],
+              },
+              border: { color: '#444' }
+            },
+            y: {
+              min: Math.min(0, minPrice),
+              ticks: {
+                color: '#888',
+                font: { size: 11 },
+                callback: v => v + ' PLN',
+              },
+              grid: {
+                color: 'rgba(128,128,128,0.2)',
+                borderDash: [3, 4],
+              },
+              border: { color: '#444' }
+            }
+          }
+        }
+      });
+    })();
+  </script>
 </body>
 
 </html>
