@@ -52,6 +52,18 @@
       const prices = data.series.map(p => p.price);
       const minPrice = Math.min(...prices);
 
+      const hourlyAvg = {};
+      prices.forEach((p, i) => {
+        const h = parseInt(labels[i].split(':')[0], 10);
+        if (!hourlyAvg[h]) hourlyAvg[h] = [];
+        hourlyAvg[h].push(p);
+      });
+      Object.keys(hourlyAvg).forEach(h => {
+        const arr = hourlyAvg[h];
+        hourlyAvg[h] = arr.reduce((a, b) => a + b, 0) / arr.length;
+      });
+      const hourlyPrices = prices.map((_, i) => hourlyAvg[parseInt(labels[i].split(':')[0], 10)]);
+
       const overlayPlugin = {
         id: 'overlay',
         afterDraw(chart) {
@@ -93,10 +105,21 @@
         data: {
           labels,
           datasets: [{
+            label: 'RCE',
             data: prices,
-            stepped: 'after',
+            stepped: 'before',
             borderColor: '#5b8dd9',
             borderWidth: 2,
+            pointRadius: 0,
+            pointHitRadius: 8,
+            fill: false,
+          }, {
+            label: '1h avg',
+            data: hourlyPrices,
+            stepped: 'before',
+            borderColor: '#f0a050',
+            borderWidth: 1.5,
+            borderDash: [5, 3],
             pointRadius: 0,
             pointHitRadius: 8,
             fill: false,
@@ -107,7 +130,10 @@
           animation: false,
           interaction: { mode: 'index', intersect: false },
           plugins: {
-            legend: { display: false },
+            legend: {
+              display: true,
+              labels: { color: '#aaa', boxWidth: 24, font: { size: 11 } }
+            },
             tooltip: {
               backgroundColor: '#222',
               borderColor: '#555',
@@ -117,7 +143,7 @@
               padding: 10,
               callbacks: {
                 title: items => items[0].label,
-                label: item => ' ' + item.raw.toFixed(2) + ' PLN/MWh',
+                label: item => ' ' + (item.raw != null ? item.raw.toFixed(2) : '—') + ' PLN/MWh',
               }
             }
           },
