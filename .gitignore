@@ -176,3 +176,4 @@ cython_debug/
 /playground/test.db
 /data*.csv
 /.idea
+.superpowers/
