@@ -35,6 +35,10 @@
     </div>
   </div>
 
+  <style>
+    #rce-chart { height: 400px; }
+    @media (max-width: 576px) { #rce-chart { height: 260px; } }
+  </style>
   <script>
     document.getElementById('date-selector').addEventListener('change', function() {
       window.location.href = '/prices?date=' + this.value;
@@ -117,22 +121,23 @@
             label: '1h avg',
             data: hourlyPrices,
             stepped: 'before',
-            borderColor: '#f0a050',
-            borderWidth: 1.5,
-            borderDash: [5, 3],
+            borderColor: 'transparent',
+            borderWidth: 0,
             pointRadius: 0,
             pointHitRadius: 8,
-            fill: false,
+            fill: 'origin',
+            backgroundColor: 'rgba(240,160,80,0.45)',
           }]
         },
         options: {
           responsive: true,
+          maintainAspectRatio: false,
           animation: false,
           interaction: { mode: 'index', intersect: false },
           plugins: {
             legend: {
               display: true,
-              labels: { color: '#aaa', boxWidth: 24, font: { size: 11 } }
+              labels: { color: '#aaa', boxWidth: 20, font: { size: 11 } }
             },
             tooltip: {
               backgroundColor: '#222',
@@ -140,7 +145,7 @@
               borderWidth: 1,
               titleColor: '#aaa',
               bodyColor: '#fff',
-              padding: 10,
+              padding: 8,
               callbacks: {
                 title: items => items[0].label,
                 label: item => ' ' + (item.raw != null ? item.raw.toFixed(2) : '—') + ' PLN/MWh',
@@ -155,7 +160,8 @@
                 autoSkip: false,
                 font: { size: 11 },
                 callback(val, index) {
-                  return index % 4 === 0 ? this.getLabelForValue(val) : '';
+                  const step = this.chart.width < 500 ? 8 : 4;
+                  return index % step === 0 ? this.getLabelForValue(val) : '';
                 },
               },
               grid: {
@@ -169,7 +175,9 @@
               ticks: {
                 color: '#888',
                 font: { size: 11 },
-                callback: v => v + ' PLN',
+                callback(v) {
+                  return this.chart.width < 500 ? v : v + ' PLN';
+                },
               },
               grid: {
                 color: 'rgba(128,128,128,0.2)',
