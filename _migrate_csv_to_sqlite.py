@@ -60,20 +60,6 @@ def _record_migration(conn: sqlite3.Connection, filename: str, row_count: int, s
     conn.commit()
 
 
-def _insert_row_without_commit(conn: sqlite3.Connection, row: dict) -> None:
-    """Like storage.insert_sample_sync, but does not commit - used inside
-    migrate_file's per-file loop so a mid-file failure can be rolled back
-    cleanly instead of leaving a partial set of committed rows that a later
-    retry would re-insert as duplicates (inverter_history has no UNIQUE
-    constraint on timestamp). storage.insert_sample_sync itself commits
-    after every row, which is correct for the live one-sample-at-a-time
-    polling loop (Task 5) but wrong for this batch, all-or-nothing import.
-    """
-    full_row = storage._row_with_epoch(row)
-    column_names = list(full_row.keys())
-    conn.execute(storage._insert_sql(column_names), [full_row[c] for c in column_names])
-
-
 def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str:
     filename = csv_path.name
     if already_migrated(conn, filename):
@@ -94,7 +80,7 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     try:
         for row in rows:
             filtered_row = {k: v for k, v in row.items() if k in valid_columns}
-            _insert_row_without_commit(conn, filtered_row)
+            storage.insert_sample_sync(conn, filtered_row, commit=False)
             inserted += 1
     except sqlite3.Error as e:
         logger.error(f"{filename}: insert failed after {inserted}/{len(rows)} rows: {e}")
