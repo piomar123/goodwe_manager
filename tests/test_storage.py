@@ -34,6 +34,35 @@ class StorageSyncTest(unittest.TestCase):
         # calling it again on the same file must not raise
         storage.init_db_sync(self.db_path, sensor_columns()).close()
 
+    def test_init_db_sync_adds_missing_columns_to_an_existing_table(self):
+        self.conn.close()
+        fd, small_db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(small_db_path)
+        try:
+            small_columns = sensor_columns()[:-1]
+            new_column_name, new_column_type = sensor_columns()[-1]
+            conn = storage.init_db_sync(small_db_path, small_columns)
+            conn.execute(
+                "INSERT INTO inverter_history (timestamp_epoch, timestamp) VALUES (?, ?)",
+                (12345, '2026-08-28 14:00:00'),
+            )
+            conn.commit()
+            conn.close()
+
+            conn = storage.init_db_sync(small_db_path, sensor_columns())
+
+            column_names = {row[1] for row in conn.execute("PRAGMA table_info(inverter_history)")}
+            self.assertIn(new_column_name, column_names)
+            row = conn.execute("SELECT timestamp_epoch, timestamp FROM inverter_history").fetchone()
+            self.assertEqual(row, (12345, '2026-08-28 14:00:00'))
+            conn.close()
+        finally:
+            for suffix in ('', '-wal', '-shm'):
+                path = small_db_path + suffix
+                if os.path.exists(path):
+                    os.remove(path)
+
     def test_insert_and_read_back_a_sample(self):
         row = _sample_row('2026-08-28 14:05:00', ppv='1234.5', battery_soc='87')
 
@@ -111,6 +140,31 @@ class StorageAsyncTest(unittest.TestCase):
 
         result = asyncio.new_event_loop().run_until_complete(scenario())
         self.assertEqual(result, 42.0)
+
+    def test_init_db_async_adds_missing_columns_to_an_existing_table(self):
+        async def scenario():
+            small_columns = sensor_columns()[:-1]
+            new_column_name, _ = sensor_columns()[-1]
+            conn = await storage.init_db_async(self.db_path, small_columns)
+            await conn.execute(
+                "INSERT INTO inverter_history (timestamp_epoch, timestamp) VALUES (?, ?)",
+                (12345, '2026-08-28 14:00:00'),
+            )
+            await conn.commit()
+            await conn.close()
+
+            conn = await storage.init_db_async(self.db_path, sensor_columns())
+            cursor = await conn.execute("PRAGMA table_info(inverter_history)")
+            column_names = {row[1] for row in await cursor.fetchall()}
+            cursor2 = await conn.execute("SELECT timestamp_epoch, timestamp FROM inverter_history")
+            row = await cursor2.fetchone()
+            await conn.close()
+            return column_names, row
+
+        column_names, row = asyncio.new_event_loop().run_until_complete(scenario())
+        new_column_name, _ = sensor_columns()[-1]
+        self.assertIn(new_column_name, column_names)
+        self.assertEqual(row, (12345, '2026-08-28 14:00:00'))
 
     def test_get_current_hour_start_sample_async(self):
         async def scenario():
