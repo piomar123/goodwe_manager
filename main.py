@@ -25,6 +25,7 @@ from goodwe.sensor import EcoModeV2
 import eco_encoder
 import forecast
 from announcer import MessageAnnouncer
+from error_logging import install_uncaught_exception_logging
 from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
 
 dotenv.load_dotenv()
@@ -555,7 +556,6 @@ def listen():
 
 def main():
     global dry_run
-    # TODO: https://stackoverflow.com/questions/6234405/logging-uncaught-exceptions-in-python
     setup_plot_style()
     matplotlib.use('agg')
     file_handler = logging.FileHandler('manager.log')
@@ -565,6 +565,7 @@ def main():
                         format='%(asctime)s - %(name)s - %(threadName)s - %(levelname)s - %(message)s',
                         handlers=[file_handler, console_handler])
     logging.getLogger('goodwe.protocol').setLevel(logging.INFO)
+    install_uncaught_exception_logging(logger)
     if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
         logger.warning("Running in dry-run mode without inverter connection")
         dry_run = True
