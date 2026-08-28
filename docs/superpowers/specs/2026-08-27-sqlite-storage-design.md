@@ -117,6 +117,29 @@ makes this idempotent, so it's safe to run:
 - once at every app startup, to catch up any hours completed while the
   service was down.
 
+**`pv_kwh` is a special case.** Unlike the other counters, `e_day` is *not*
+a lifetime cumulative total — it resets to `0` right after local midnight
+(confirmed against real device data: `e_day` was `47.9` at `23:59:59` and
+`0.0` moments after `00:00:00` the next day, while `e_total_exp` and the
+other lifetime counters kept climbing straight through). Diffing
+`MAX(e_day)` across the midnight-crossing hour the same way as the other
+metrics would produce a large *negative* `pv_kwh` for that hour (this
+hour's small since-midnight value minus the previous day's full total).
+Fix: when `hour_start` and `hour_start - 1h` fall on different calendar
+dates, `pv_kwh` for that hour is `MAX(e_day)` for the current hour alone —
+`e_day` already only counts production since that midnight, so no
+subtraction is needed. Every other hour, and every other metric, uses the
+normal diff.
+
+This "different calendar dates" check, like every other local-time
+conversion in this design (`timestamp_epoch` itself, and hour bucketing),
+depends on the host machine's system timezone actually being set to the
+inverter's local timezone (Europe/Warsaw) — the code is internally
+consistent regardless of which timezone the host uses, but only *correct*
+relative to the inverter's own midnight if the host's timezone matches it.
+This is a deployment requirement, not something verifiable from the code
+alone.
+
 ## Retention / pruning (raw samples only)
 
 `inverter_history` at 1 sample/second, ~109 columns, is ~24 GB/year
