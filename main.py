@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures
-import csv
 import io
 import json
 import logging
@@ -15,6 +14,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, Any, Mapping
 
+import aiosqlite
 import dotenv
 import flask
 import goodwe
@@ -24,10 +24,11 @@ from goodwe.sensor import EcoModeV2
 
 import eco_encoder
 import forecast
+import storage
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
 from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
-from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator
+from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
 
 dotenv.load_dotenv()
 INVERTER_IP = os.environ.get('INVERTER_IP')
@@ -53,6 +54,7 @@ ForecastData = namedtuple('ForecastData', ('angle90_in_kWh', 'angle270_in_kWh', 
 class AsyncioThread(threading.Thread):
     _asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
     _inverter: Optional[goodwe.Inverter] = None
+    _db_conn: Optional[aiosqlite.Connection] = None
     _should_stop = threading.Event()
     _calculated_values_evaluator = CalculatedValuesEvaluator()
 
@@ -150,21 +152,26 @@ class AsyncioThread(threading.Thread):
         logger.info(f'Connecting to {self._inverter_address}')
         self._inverter = await goodwe.connect(self._inverter_address, family='ET', timeout=1, retries=60)
         logger.info(f'Connected to the inverter')
-        log_file_with_current_timestamp = 'data-' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.csv'
-        with open(log_file_with_current_timestamp, mode='w', newline='') as data_file:
-            csv_writer = csv.writer(data_file, dialect='excel')
-            headers = SELECTED_SENSORS + self._calculated_values_evaluator.headers()
-            await asyncio.to_thread(csv_writer.writerow, headers)
+        self._db_conn = await storage.init_db_async(storage.DATA_DB_PATH, sensor_columns())
+        try:
+            await self._seed_hour_start_baseline()
             while True:
                 inverter_runtime = await self._inverter.read_runtime_data()
                 sensors_data = {sensor_id: str(inverter_runtime.get(sensor_id)) for sensor_id in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
-                await asyncio.to_thread(csv_writer.writerow, sensors_data_with_calculated.values())  # assuming the set keeps the insertion order
+                await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
                 announcer.announce(json.dumps(sensors_data_with_calculated))
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
                     return
+        finally:
+            await self._db_conn.close()
+
+    async def _seed_hour_start_baseline(self):
+        hour_start_epoch, hour_end_epoch = storage.current_hour_bounds(datetime.now())
+        baseline = await storage.get_current_hour_start_sample_async(self._db_conn, hour_start_epoch, hour_end_epoch)
+        self._calculated_values_evaluator.seed_hour_start(baseline)
 
     def ensure_inverter_ready(self):
         if self._asyncio_loop is None:
