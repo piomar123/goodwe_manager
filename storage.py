@@ -115,11 +115,12 @@ def _insert_sql(column_names: list) -> str:
     return f"INSERT INTO inverter_history ({columns_sql}) VALUES ({placeholders})"
 
 
-def insert_sample_sync(conn: sqlite3.Connection, row: Mapping[str, Any]) -> None:
+def insert_sample_sync(conn: sqlite3.Connection, row: Mapping[str, Any], commit: bool = True) -> None:
     full_row = _row_with_epoch(row)
     column_names = list(full_row.keys())
     conn.execute(_insert_sql(column_names), [full_row[c] for c in column_names])
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 async def insert_sample_async(conn: aiosqlite.Connection, row: Mapping[str, Any]) -> None:
