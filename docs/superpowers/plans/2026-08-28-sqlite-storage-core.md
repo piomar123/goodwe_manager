@@ -1166,6 +1166,20 @@ def _record_migration(conn: sqlite3.Connection, filename: str, row_count: int, s
     conn.commit()
 
 
+def _insert_row_without_commit(conn: sqlite3.Connection, row: dict) -> None:
+    """Like storage.insert_sample_sync, but does not commit - used inside
+    migrate_file's per-file loop so a mid-file failure can be rolled back
+    cleanly instead of leaving a partial set of committed rows that a later
+    retry would re-insert as duplicates (inverter_history has no UNIQUE
+    constraint on timestamp). storage.insert_sample_sync itself commits
+    after every row, which is correct for the live one-sample-at-a-time
+    polling loop (Task 5) but wrong for this batch, all-or-nothing import.
+    """
+    full_row = storage._row_with_epoch(row)
+    column_names = list(full_row.keys())
+    conn.execute(storage._insert_sql(column_names), [full_row[c] for c in column_names])
+
+
 def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str:
     filename = csv_path.name
     if already_migrated(conn, filename):
@@ -1186,7 +1200,7 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     try:
         for row in rows:
             filtered_row = {k: v for k, v in row.items() if k in valid_columns}
-            storage.insert_sample_sync(conn, filtered_row)
+            _insert_row_without_commit(conn, filtered_row)
             inserted += 1
     except sqlite3.Error as e:
         logger.error(f"{filename}: insert failed after {inserted}/{len(rows)} rows: {e}")
@@ -1204,20 +1218,27 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
             logger.error(f"{filename}: could not record migration failure in the manifest (database still locked)")
         return 'error'
 
+    # nothing is committed yet - the whole file's rows are still pending in
+    # this transaction, so a failed verification below can still be rolled
+    # back cleanly rather than leaving partial/incorrect data in place
     first_row_db = conn.execute(
-        "SELECT ppv FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
+        "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
         (rows[0]['timestamp'],),
     ).fetchone()
     verified = (
         inserted == len(rows)
         and first_row_db is not None
-        and str(first_row_db[0]) == str(float(rows[0].get('ppv', 0)))
+        and str(first_row_db[0]) == str(float(rows[0]['meter_e_total_exp']))
     )
-    status = 'done' if verified else 'error'
-    if not verified:
-        logger.error(f"{filename}: verification failed (inserted={inserted}/{len(rows)}, spot-check mismatch)")
-    else:
+
+    if verified:
+        conn.commit()
+        status = 'done'
         logger.info(f"{filename}: imported and verified {inserted} rows")
+    else:
+        conn.rollback()
+        status = 'error'
+        logger.error(f"{filename}: verification failed (inserted={inserted}/{len(rows)}, spot-check mismatch) - rolled back")
 
     _record_migration(conn, filename, len(rows), status)
     return status
