@@ -197,6 +197,8 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
                 metrics[target] = current[source]
             elif previous is None:
                 metrics[target] = None
+            elif current[source] is None or previous[source] is None:
+                metrics[target] = None
             else:
                 metrics[target] = current[source] - previous[source]
         conn.execute(
@@ -209,6 +211,6 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
             (hour_start, metrics['meter_export_kwh'], metrics['meter_import_kwh'], metrics['load_kwh'],
              metrics['pv_kwh'], metrics['battery_charge_kwh'], metrics['battery_discharge_kwh']),
         )
+        conn.commit()
         backfilled += 1
-    conn.commit()
     return backfilled

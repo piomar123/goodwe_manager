@@ -210,6 +210,32 @@ class BackfillHourlySummaryTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row[0], 0.3)
 
+    def test_a_null_metric_column_in_one_hour_does_not_crash_or_poison_other_metrics(self):
+        # hour 13:00 - baseline, all 6 metric-source columns set
+        self._insert('2026-08-28 13:05:00', meter_e_total_exp='100.0', meter_e_total_imp='50.0',
+                     e_load_total='10.0', e_day='5.0', e_bat_charge_total='1.0', e_bat_discharge_total='0.5')
+        # hour 14:00 - the hour under test: e_bat_charge_total is NULL for this
+        # sample (e.g. the inverter didn't return that sensor this poll), but
+        # every other metric source column is set normally.
+        self._insert('2026-08-28 14:05:00', meter_e_total_exp='103.0', meter_e_total_imp='51.0',
+                     e_load_total='14.0', e_day='9.0', e_bat_charge_total=None, e_bat_discharge_total='1.5')
+        # hour 15:00 - proves 14:00 is complete
+        self._insert('2026-08-28 15:05:00', meter_e_total_exp='110.0', meter_e_total_imp='55.0',
+                     e_load_total='20.0', e_day='12.0', e_bat_charge_total='3.0', e_bat_discharge_total='2.0')
+
+        # must not raise TypeError
+        backfilled = storage.backfill_hourly_summary(self.conn)
+
+        self.assertEqual(backfilled, 2)
+        row = self.conn.execute(
+            "SELECT meter_export_kwh, meter_import_kwh, load_kwh, pv_kwh, battery_charge_kwh, battery_discharge_kwh "
+            "FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        # only battery_charge_kwh (sourced from the NULL column) is None;
+        # every other metric still computes normally for that hour
+        self.assertEqual(row, (3.0, 1.0, 4.0, 4.0, None, 1.0))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -157,7 +157,7 @@ class AsyncioThread(threading.Thread):
             await self._seed_hour_start_baseline()
             while True:
                 inverter_runtime = await self._inverter.read_runtime_data()
-                sensors_data = {sensor_id: str(inverter_runtime.get(sensor_id)) for sensor_id in SELECTED_SENSORS}
+                sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
                 await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
                 announcer.announce(json.dumps(sensors_data_with_calculated))
