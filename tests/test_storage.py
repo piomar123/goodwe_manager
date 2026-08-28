@@ -126,5 +126,90 @@ class StorageAsyncTest(unittest.TestCase):
         self.assertEqual(result['timestamp'], '2026-08-28 14:00:03')
 
 
+class BackfillHourlySummaryTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.db_path)
+        self.conn = storage.init_db_sync(self.db_path, sensor_columns())
+
+    def tearDown(self):
+        self.conn.close()
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                os.remove(path)
+
+    def _insert(self, timestamp, **overrides):
+        storage.insert_sample_sync(self.conn, _sample_row(timestamp, **overrides))
+
+    def test_backfills_an_hour_that_has_a_prior_and_a_following_hour(self):
+        # hour 13:00 - baseline
+        self._insert('2026-08-28 13:05:00', meter_e_total_exp='100.0', meter_e_total_imp='50.0',
+                     e_load_total='10.0', e_day='5.0', e_bat_charge_total='1.0', e_bat_discharge_total='0.5')
+        # hour 14:00 - the hour under test
+        self._insert('2026-08-28 14:05:00', meter_e_total_exp='103.0', meter_e_total_imp='51.0',
+                     e_load_total='14.0', e_day='9.0', e_bat_charge_total='2.0', e_bat_discharge_total='1.5')
+        # hour 15:00 - proves 14:00 is complete
+        self._insert('2026-08-28 15:05:00', meter_e_total_exp='110.0', meter_e_total_imp='55.0',
+                     e_load_total='20.0', e_day='12.0', e_bat_charge_total='3.0', e_bat_discharge_total='2.0')
+
+        backfilled = storage.backfill_hourly_summary(self.conn)
+
+        self.assertEqual(backfilled, 2)  # hour 13:00 (NULL diffs) and hour 14:00 (real diffs)
+        row = self.conn.execute(
+            "SELECT meter_export_kwh, meter_import_kwh, load_kwh, pv_kwh, battery_charge_kwh, battery_discharge_kwh "
+            "FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        self.assertEqual(row, (3.0, 1.0, 4.0, 4.0, 1.0, 1.0))
+
+        # hour 15:00 has no following hour yet - not backfilled
+        count_for_15 = self.conn.execute(
+            "SELECT COUNT(*) FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 15:00:00'),),
+        ).fetchone()[0]
+        self.assertEqual(count_for_15, 0)
+
+    def test_hour_with_no_prior_data_gets_null_metrics_but_is_marked_processed(self):
+        self._insert('2026-08-28 14:05:00', meter_e_total_exp='103.0')
+        self._insert('2026-08-28 15:05:00', meter_e_total_exp='110.0')  # proves 14:00 complete
+
+        storage.backfill_hourly_summary(self.conn)
+
+        row = self.conn.execute(
+            "SELECT meter_export_kwh FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        self.assertIsNone(row[0])
+
+    def test_is_idempotent(self):
+        self._insert('2026-08-28 13:05:00', meter_e_total_exp='100.0')
+        self._insert('2026-08-28 14:05:00', meter_e_total_exp='103.0')
+        self._insert('2026-08-28 15:05:00', meter_e_total_exp='110.0')
+        storage.backfill_hourly_summary(self.conn)
+
+        second_run_count = storage.backfill_hourly_summary(self.conn)
+
+        self.assertEqual(second_run_count, 0)
+
+    def test_pv_kwh_does_not_go_negative_across_midnight(self):
+        # e_day resets to 0 right after local midnight (confirmed against
+        # real device data), unlike the other lifetime counters - so the
+        # hour spanning midnight must not diff e_day against the previous
+        # (different day's) value.
+        self._insert('2026-08-28 23:05:00', e_day='47.9')          # last hour of the previous day
+        self._insert('2026-08-29 00:05:00', e_day='0.3')           # the hour under test
+        self._insert('2026-08-29 01:05:00', e_day='0.5')           # proves 00:00 is complete
+
+        storage.backfill_hourly_summary(self.conn)
+
+        row = self.conn.execute(
+            "SELECT pv_kwh FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-29 00:00:00'),),
+        ).fetchone()
+        self.assertEqual(row[0], 0.3)
+
+
 if __name__ == '__main__':
     unittest.main()
