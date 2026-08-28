@@ -188,13 +188,42 @@ dependency:
 
 A one-off `_migrate_csv_to_sqlite.py` (matching the existing `_`-prefix
 convention for utility scripts):
-1. Reads all `data-*.csv` sorted by filename, skips empty/malformed files
-   (a few 0-byte files already exist in the repo).
-2. Batch-inserts rows into `inverter_history` via `executemany`.
-3. Runs `backfill_hourly_summary()` to derive the full `hourly_summary`
-   history from the imported raw data.
-4. Leaves the original CSV files on disk as a backup — no automatic
-   deletion.
+
+1. Maintains a manifest table in `data.db`:
+   ```sql
+   CREATE TABLE csv_migration_log (
+       filename TEXT PRIMARY KEY,
+       row_count INTEGER,
+       migrated_at INTEGER,
+       status TEXT  -- 'done' or 'error'
+   );
+   ```
+   Any file already marked `'done'` is skipped on a re-run. This makes the
+   script safe to run again after fixing a bug, without duplicating rows or
+   needing to re-import everything from scratch.
+2. For each remaining `data-*.csv`, sorted by filename: empty/malformed
+   files (a few 0-byte files already exist in the repo) are skipped with a
+   warning, not treated as errors. Otherwise rows are parsed and
+   batch-inserted into `inverter_history` via `executemany`.
+3. **Verification, per file**: after inserting, the row count actually
+   present in `inverter_history` for that file's timestamp range is compared
+   against the row count read from the CSV, and a handful of columns on the
+   first and last row are spot-checked against the DB. A mismatch marks the
+   file `'error'` (not `'done'`) in the manifest and logs loudly, but does
+   not abort the run — other files still get processed, and `'error'` files
+   can be investigated and re-run individually afterward.
+4. Supports `--dry-run` (same convention as `main.py`): parses and validates
+   every file and reports what would be inserted and any errors found,
+   without writing anything to the DB.
+5. Once every file is `'done'`, runs `backfill_hourly_summary()` to derive
+   the full `hourly_summary` history from the imported raw data.
+6. **Never deletes the source CSV files.** They remain on disk indefinitely
+   as the recovery path for a migration bug discovered later. Recommended
+   minimum: keep them at least as long as `inverter_history`'s own retention
+   window (180 days) past a successful, verified migration, so the CSVs stay
+   available to re-derive raw data for the same span the live DB itself
+   still covers. Deleting old CSVs afterward, if ever, is a manual decision
+   — no script automates it.
 
 ## `_calculate_income.py` rewrite
 
@@ -213,8 +242,13 @@ file-boundary-crossing logic, and no longer touches raw samples at all.
   simulated outage that crosses an hour boundary.
 - `backfill_hourly_summary()`: test against a small synthetic raw dataset
   with known expected per-hour diffs.
-- Migration script: test against a small sample CSV, checking row count and
-  value correctness after import.
+- Migration script: unit tests with small synthetic CSV fixtures covering —
+  a normal file (imported, verified, marked `'done'`); an empty/0-byte file
+  (skipped, logged, not treated as an error); a malformed file (missing
+  required columns, skipped and logged); a file already marked `'done'` in
+  the manifest (skipped on re-run, no duplicate rows inserted); and a
+  verification-mismatch case (marked `'error'`, logged, run continues with
+  the next file). `--dry-run` tested to confirm zero rows are ever written.
 - RCE cache: test the DST edge case explicitly (a date with 92 and a date
   with 100 periods should both cache correctly using the marker-table
   approach).
