@@ -58,10 +58,38 @@ def build_ddl_statements(columns: list) -> list:
     ]
 
 
+def _missing_columns(existing_column_names: Iterable[str], columns: list) -> list:
+    """Returns the (name, sql_type) pairs from `columns` that aren't already
+    present in `existing_column_names`, preserving `columns`' order.
+    """
+    existing = set(existing_column_names)
+    return [(name, sql_type) for name, sql_type in columns if name not in existing]
+
+
+def _reconcile_columns_sync(conn: sqlite3.Connection, columns: list) -> None:
+    """Adds any column present in `columns` but missing from the existing
+    inverter_history table (e.g. after SELECTED_SENSORS grows), so an
+    existing data.db doesn't start raising 'no such column' on every insert.
+    CREATE TABLE IF NOT EXISTS alone can't do this, since it's a no-op once
+    the table already exists.
+    """
+    existing = [row[1] for row in conn.execute("PRAGMA table_info(inverter_history)")]
+    for name, sql_type in _missing_columns(existing, columns):
+        conn.execute(f"ALTER TABLE inverter_history ADD COLUMN {name} {sql_type}")
+
+
+async def _reconcile_columns_async(conn: aiosqlite.Connection, columns: list) -> None:
+    cursor = await conn.execute("PRAGMA table_info(inverter_history)")
+    existing = [row[1] for row in await cursor.fetchall()]
+    for name, sql_type in _missing_columns(existing, columns):
+        await conn.execute(f"ALTER TABLE inverter_history ADD COLUMN {name} {sql_type}")
+
+
 def init_db_sync(path: str, columns: list) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     for statement in build_ddl_statements(columns):
         conn.execute(statement)
+    _reconcile_columns_sync(conn, columns)
     conn.commit()
     return conn
 
@@ -70,6 +98,7 @@ async def init_db_async(path: str, columns: list) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(path)
     for statement in build_ddl_statements(columns):
         await conn.execute(statement)
+    await _reconcile_columns_async(conn, columns)
     await conn.commit()
     return conn
 
