@@ -1075,15 +1075,21 @@ class MigrateCsvToSqliteTest(unittest.TestCase):
         blocker.execute("BEGIN EXCLUSIVE")
 
         try:
+            # the lock is held for the entire call, so even the manifest
+            # write inside migrate_file's own error handling will fail -
+            # the only guaranteed-reliable signal under lock is the return
+            # value itself, which must still be 'error', never an
+            # unhandled exception
             status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
             self.assertEqual(status, 'error')
-            log_status = self.conn.execute(
-                "SELECT status FROM csv_migration_log WHERE filename = ?", (csv_path.name,),
-            ).fetchone()
-            self.assertEqual(log_status[0], 'error')
         finally:
             blocker.rollback()
             blocker.close()
+
+        # once the lock clears, the file was never marked 'done' (the
+        # manifest write itself failed while locked), so a later re-run
+        # retries it from scratch rather than silently skipping it
+        self.assertFalse(migrate.already_migrated(self.conn, csv_path.name))
 
 
 if __name__ == '__main__':
@@ -1184,8 +1190,18 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
             inserted += 1
     except sqlite3.Error as e:
         logger.error(f"{filename}: insert failed after {inserted}/{len(rows)} rows: {e}")
-        conn.rollback()
-        _record_migration(conn, filename, len(rows), 'error')
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        try:
+            _record_migration(conn, filename, len(rows), 'error')
+        except sqlite3.Error:
+            # the database is contested enough that even recording the
+            # failure failed - migrate_file still reports 'error' to its
+            # caller rather than crashing; the file stays unmarked in the
+            # manifest, so a later re-run will retry it from scratch
+            logger.error(f"{filename}: could not record migration failure in the manifest (database still locked)")
         return 'error'
 
     first_row_db = conn.execute(
