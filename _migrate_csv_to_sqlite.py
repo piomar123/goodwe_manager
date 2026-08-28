@@ -157,7 +157,18 @@ def main():
 
     results = {}
     for csv_path in csv_paths:
-        status = migrate_file(conn, csv_path, args.dry_run)
+        try:
+            status = migrate_file(conn, csv_path, args.dry_run)
+        except Exception as e:
+            # migrate_file's own try/except only covers sqlite3.Error around
+            # the insert loop; a ValueError (garbage CSV cell) or
+            # UnicodeDecodeError (unexpected file encoding) elsewhere in it
+            # would otherwise propagate out of main() and abort every
+            # remaining file. There's no clean status to record in the
+            # csv_migration_log manifest here (migrate_file didn't complete
+            # normally), so this just counts the file as an error and moves on.
+            logger.error(f"{csv_path.name}: unexpected error, skipping: {e}")
+            status = 'error'
         results[status] = results.get(status, 0) + 1
 
     logger.info(f"Migration summary: {results}")
