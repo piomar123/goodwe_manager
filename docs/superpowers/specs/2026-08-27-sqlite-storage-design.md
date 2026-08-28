@@ -223,6 +223,81 @@ file-boundary-crossing logic, and no longer touches raw samples at all.
   is proven to have run for a given hour before that hour's raw rows are
   eligible for deletion.
 
+## Interactive history viewer
+
+A read-only page for browsing recent `inverter_history` and `hourly_summary`
+rows — a debug/monitoring view, not a dashboard (no charts here; charts are
+covered separately by the RCE and forecast pages).
+
+**One page, two tabbed sections** (`GET /history`, Bootstrap nav-tabs — the
+same `bootstrap.bundle.min.js` already loaded on other pages provides the tab
+behavior): "Raw samples" (`inverter_history`) and "Hourly summary"
+(`hourly_summary`). Each tab has its own filter controls and table, following
+the existing `prices.html`/`forecast.html` pattern of a small JS snippet
+driving a `fetch()` call rather than a full-page reload per interaction.
+
+**Data API** (JSON, mirrors the existing `/prices/rce.json` pattern):
+- `GET /history/inverter.json?start=&end=&columns=&limit=&offset=`
+- `GET /history/hourly.json?start=&end=&limit=&offset=`
+
+Both return `{rows: [...], has_more: bool}`. Rather than `SELECT COUNT(*)`
+for pagination (expensive on `inverter_history`, which can be tens of
+millions of rows within the 180-day retention window), the query fetches
+`limit + 1` rows and `has_more` is simply "did we get more than `limit`" —
+cheap regardless of table size, at the cost of not showing a total page
+count (just Prev/Next).
+
+**Column selector** (raw-samples tab only — `hourly_summary` only has 7
+columns, all shown by default, no selector needed there): the server exposes
+a fixed allow-list of "presentable" columns, not all ~109 raw sensor fields
+(many are internal/diagnostic codes not meaningful to browse). Default
+selection: `timestamp, ppv, ppv1, ppv2, pgrid, load_ptotal, battery_soc,
+pbattery1, e_day, work_mode_label`. A checkbox dropdown lets the user add any
+other allow-listed column.
+
+**Column selection persistence** — two layers, resolved in this priority
+order on page load:
+1. An explicit `?columns=` in the URL, if present — keeps shared/bookmarked
+   links reproducible regardless of the viewer's own saved preference.
+2. Otherwise, a `localStorage` value (key `history.columns`) — every change
+   to the checkboxes is saved here client-side, so a returning visitor with
+   no query string sees their last-used columns instead of the default.
+3. Otherwise, the default curated subset above.
+
+This is deliberately client-side/per-browser only (no server-side user
+preference storage) since it's a personal viewing convenience, not shared
+application state.
+
+**Date range filter**: two `<input type="date">` controls, same widget
+already used for the single-date selectors on `forecast.html`/`prices.html`,
+defaulting to "last 7 days" on first load. Also reflected in the URL query
+string, same as `columns`, for shareable/bookmarkable/refresh-safe filtered
+views.
+
+**Pagination**: Prev/Next buttons, `limit` defaulting to 100, adjustable via
+a small `<select>` (e.g. 50/100/250/500).
+
+**Mobile usability**: each table wrapped in Bootstrap's `.table-responsive`
+(available for free via the already-loaded `bootstrap.min.css` — horizontal
+scroll on narrow viewports, no extra JS needed); filter controls stack into
+full-width rows on small screens using the existing `.col-*` grid classes,
+consistent with how `forecast.html`/`prices.html` already lay out their date
+selector.
+
+**Empty-state handling**: if a query returns zero rows (e.g. right after
+startup, before the first hour has completed, or a date range with no data),
+render a "no data for this range" message in place of the table rather than
+an empty `<table>`.
+
+### Testing
+
+- Query-building logic (date range + column allow-list + `limit+1`
+  pagination) unit-tested directly against a temp SQLite DB, independent of
+  Flask.
+- Manual check: column selection persists across a page reload with no
+  query string, and an explicit `?columns=` in a shared link overrides the
+  saved preference.
+
 ## Out of scope for this design
 
 - Normalizing/typing every individual sensor column precisely (some are
