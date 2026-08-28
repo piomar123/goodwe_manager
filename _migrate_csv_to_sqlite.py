@@ -101,14 +101,28 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     # nothing is committed yet - the whole file's rows are still pending in
     # this transaction, so a failed verification below can still be rolled
     # back cleanly rather than leaving partial/incorrect data in place
+    epoch_first = storage.parse_timestamp_epoch(rows[0]['timestamp'])
+    epoch_last = storage.parse_timestamp_epoch(rows[-1]['timestamp'])
+    range_start, range_end = min(epoch_first, epoch_last), max(epoch_first, epoch_last)
+    db_row_count = conn.execute(
+        "SELECT COUNT(*) FROM inverter_history WHERE timestamp_epoch BETWEEN ? AND ?",
+        (range_start, range_end),
+    ).fetchone()[0]
+
     first_row_db = conn.execute(
         "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
         (rows[0]['timestamp'],),
     ).fetchone()
+    last_row_db = conn.execute(
+        "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
+        (rows[-1]['timestamp'],),
+    ).fetchone()
     verified = (
-        inserted == len(rows)
+        db_row_count == len(rows)
         and first_row_db is not None
         and str(first_row_db[0]) == str(float(rows[0]['meter_e_total_exp']))
+        and last_row_db is not None
+        and str(last_row_db[0]) == str(float(rows[-1]['meter_e_total_exp']))
     )
 
     if verified:
@@ -118,7 +132,10 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     else:
         conn.rollback()
         status = 'error'
-        logger.error(f"{filename}: verification failed (inserted={inserted}/{len(rows)}, spot-check mismatch) - rolled back")
+        logger.error(
+            f"{filename}: verification failed (db_row_count={db_row_count}/{len(rows)}, "
+            "spot-check mismatch) - rolled back"
+        )
 
     _record_migration(conn, filename, len(rows), status)
     return status
