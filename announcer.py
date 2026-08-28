@@ -41,7 +41,9 @@ class MessageAnnouncer:
             try:
                 listener.put_nowait(msg)
             except queue.Full:
-                # TODO: check if this works
+                # drop the oldest buffered message to make room for a stop
+                # signal, so a slow/stuck listener gets disconnected instead
+                # of blocking future announces (see tests/test_announcer.py)
                 listener.get_nowait()
                 listener.put_nowait(None)  # signal the listener to stop
                 self.listeners.remove(listener)
