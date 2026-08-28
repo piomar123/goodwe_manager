@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import storage
 from sensors import sensor_columns
@@ -156,6 +157,44 @@ class MigrateCsvToSqliteTest(unittest.TestCase):
         # manifest write itself failed while locked), so a later re-run
         # retries it from scratch rather than silently skipping it
         self.assertFalse(migrate.already_migrated(self.conn, csv_path.name))
+
+
+class MigrateMainTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp_dir, 'data.db')
+
+    def _write_csv(self, name: str, content: str) -> Path:
+        path = Path(self.tmp_dir) / name
+        path.write_text(content)
+        return path
+
+    def test_a_file_that_raises_a_non_sqlite_error_does_not_abort_the_rest_of_the_run(self):
+        # a garbage (non-numeric) value in a required numeric column raises
+        # ValueError during verification's float(...) spot-check, which is
+        # not a sqlite3.Error - main()'s per-file loop must still continue
+        # on to the next file rather than letting it propagate and abort
+        # the whole run
+        self._write_csv('data-2026-08-28_18-00-00.csv',
+                         HEADER + '2026-08-28 18:00:00,100.0,NOT_A_NUMBER,0.5,0.1\n')
+        self._write_csv('data-2026-08-28_19-00-00.csv',
+                         HEADER + '2026-08-28 19:00:00,100.0,1.0,0.5,0.1\n')
+
+        with mock.patch('sys.argv', ['_migrate_csv_to_sqlite.py', '--csv-dir', self.tmp_dir,
+                                      '--db-path', self.db_path]):
+            migrate.main()  # must not raise
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            migrate.ensure_migration_log_table(conn)
+            # the second, valid file was still processed despite the first's failure
+            log_status = conn.execute(
+                "SELECT status FROM csv_migration_log WHERE filename = ?",
+                ('data-2026-08-28_19-00-00.csv',),
+            ).fetchone()
+            self.assertEqual(log_status, ('done',))
+        finally:
+            conn.close()
 
 
 if __name__ == '__main__':
