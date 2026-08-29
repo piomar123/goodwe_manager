@@ -92,5 +92,120 @@ class DateRangeTest(unittest.TestCase):
         self.assertEqual(datetime.fromtimestamp(end_epoch), datetime(2026, 8, 29, 0, 0, 0))
 
 
+def _sample_row(timestamp: str, **overrides) -> dict:
+    row = {name: ('0' if sql_type == 'REAL' else '') for name, sql_type in sensor_columns()}
+    row['timestamp'] = timestamp
+    row.update(overrides)
+    return row
+
+
+class FetchInverterRowsTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.db_path)
+        self.conn = storage.init_db_sync(self.db_path, sensor_columns())
+        for i in range(5):
+            storage.insert_sample_sync(self.conn, _sample_row(
+                f'2026-08-27 10:0{i}:00', ppv=str(100 * i), battery_soc=str(50 + i)))
+
+    def tearDown(self):
+        self.conn.close()
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_returns_only_the_requested_columns_in_order(self):
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, has_more = history.fetch_inverter_rows(
+            self.conn, ['timestamp', 'ppv'], start, end, limit=10, offset=0)
+        self.assertEqual(list(rows[0].keys()), ['timestamp', 'ppv'])
+        self.assertFalse(has_more)
+
+    def test_orders_newest_first(self):
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, _ = history.fetch_inverter_rows(
+            self.conn, ['timestamp'], start, end, limit=10, offset=0)
+        timestamps = [r['timestamp'] for r in rows]
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+
+    def test_has_more_true_when_more_rows_exist_than_limit(self):
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, has_more = history.fetch_inverter_rows(
+            self.conn, ['timestamp'], start, end, limit=2, offset=0)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(has_more)
+
+    def test_offset_skips_rows(self):
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        first_page, _ = history.fetch_inverter_rows(
+            self.conn, ['timestamp'], start, end, limit=2, offset=0)
+        second_page, _ = history.fetch_inverter_rows(
+            self.conn, ['timestamp'], start, end, limit=2, offset=2)
+        self.assertNotEqual(first_page, second_page)
+
+    def test_date_range_excludes_rows_outside_it(self):
+        start, end = history.date_range_to_epoch(date(2026, 8, 28), date(2026, 8, 28))
+        rows, _ = history.fetch_inverter_rows(
+            self.conn, ['timestamp'], start, end, limit=10, offset=0)
+        self.assertEqual(rows, [])
+
+    def test_rejects_a_column_not_in_the_allow_list(self):
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        with self.assertRaises(ValueError):
+            history.fetch_inverter_rows(
+                self.conn, ['timestamp; DROP TABLE inverter_history'], start, end, limit=10, offset=0)
+
+
+class FetchHourlyRowsTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.db_path)
+        self.conn = storage.init_db_sync(self.db_path, sensor_columns())
+
+    def tearDown(self):
+        self.conn.close()
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                os.remove(path)
+
+    def _insert_hourly(self, hour_start_str, **overrides):
+        hour_start = storage.parse_timestamp_epoch(hour_start_str)
+        row = {'hour_start': hour_start, 'meter_export_kwh': 1.0, 'meter_import_kwh': 0.0,
+               'load_kwh': 0.5, 'pv_kwh': 1.5, 'battery_charge_kwh': 0.0, 'battery_discharge_kwh': 0.0}
+        row.update(overrides)
+        self.conn.execute(
+            "INSERT INTO hourly_summary (hour_start, meter_export_kwh, meter_import_kwh, load_kwh, "
+            "pv_kwh, battery_charge_kwh, battery_discharge_kwh) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (row['hour_start'], row['meter_export_kwh'], row['meter_import_kwh'], row['load_kwh'],
+             row['pv_kwh'], row['battery_charge_kwh'], row['battery_discharge_kwh']),
+        )
+        self.conn.commit()
+
+    def test_formats_hour_start_as_a_local_timestamp_string(self):
+        self._insert_hourly('2026-08-27 13:00:00')
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, _ = history.fetch_hourly_rows(self.conn, start, end, limit=10, offset=0)
+        self.assertEqual(rows[0]['hour_start'], '2026-08-27 13:00')
+
+    def test_returns_all_seven_columns(self):
+        self._insert_hourly('2026-08-27 13:00:00')
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, _ = history.fetch_hourly_rows(self.conn, start, end, limit=10, offset=0)
+        self.assertEqual(list(rows[0].keys()), list(history.HOURLY_COLUMNS))
+
+    def test_has_more_true_when_more_rows_exist_than_limit(self):
+        self._insert_hourly('2026-08-27 10:00:00')
+        self._insert_hourly('2026-08-27 11:00:00')
+        self._insert_hourly('2026-08-27 12:00:00')
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, has_more = history.fetch_hourly_rows(self.conn, start, end, limit=2, offset=0)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(has_more)
+
+
 if __name__ == '__main__':
     unittest.main()
