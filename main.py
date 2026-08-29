@@ -416,12 +416,14 @@ def get_forecast():
 @app.get('/history')
 def get_history_page():
     default_start, default_end = history.default_date_range(datetime.now().date())
+    start_date = history.parse_date_or_default(request.args.get('start'), default_start)
+    end_date = history.parse_date_or_default(request.args.get('end'), default_end)
     return flask.render_template(
         'history.html',
         raw_columns=history.RAW_COLUMNS,
         default_raw_columns=history.DEFAULT_RAW_COLUMNS,
-        default_start=default_start.strftime('%Y-%m-%d'),
-        default_end=default_end.strftime('%Y-%m-%d'),
+        default_start=start_date.strftime('%Y-%m-%d'),
+        default_end=end_date.strftime('%Y-%m-%d'),
     )
 
 
