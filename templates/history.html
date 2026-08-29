@@ -26,15 +26,15 @@
     <div class="tab-content">
       <div class="tab-pane fade show active" id="raw-tab" role="tabpanel">
         <div class="row mt-3 g-2 align-items-end">
-          <div class="col-6 col-md-3">
+          <div class="col-12 col-md-3">
             <label class="form-label">Start</label>
             <input id="raw-start" type="date" class="form-control form-control-sm" value="{{ default_start }}" />
           </div>
-          <div class="col-6 col-md-3">
+          <div class="col-12 col-md-3">
             <label class="form-label">End</label>
             <input id="raw-end" type="date" class="form-control form-control-sm" value="{{ default_end }}" />
           </div>
-          <div class="col-6 col-md-2">
+          <div class="col-12 col-md-2">
             <label class="form-label">Rows</label>
             <select id="raw-limit" class="form-select form-select-sm">
               <option value="50">50</option>
@@ -43,7 +43,7 @@
               <option value="500">500</option>
             </select>
           </div>
-          <div class="col-6 col-md-4">
+          <div class="col-12 col-md-4">
             <details>
               <summary class="btn btn-sm btn-outline-secondary">Columns ▾</summary>
               <div id="raw-columns" class="border rounded p-2 mt-1" style="max-height:200px;overflow-y:auto">
@@ -74,15 +74,15 @@
 
       <div class="tab-pane fade" id="hourly-tab" role="tabpanel">
         <div class="row mt-3 g-2 align-items-end">
-          <div class="col-6 col-md-3">
+          <div class="col-12 col-md-3">
             <label class="form-label">Start</label>
             <input id="hourly-start" type="date" class="form-control form-control-sm" value="{{ default_start }}" />
           </div>
-          <div class="col-6 col-md-3">
+          <div class="col-12 col-md-3">
             <label class="form-label">End</label>
             <input id="hourly-end" type="date" class="form-control form-control-sm" value="{{ default_end }}" />
           </div>
-          <div class="col-6 col-md-2">
+          <div class="col-12 col-md-2">
             <label class="form-label">Rows</label>
             <select id="hourly-limit" class="form-select form-select-sm">
               <option value="50">50</option>
@@ -119,11 +119,15 @@
   <script>
     const COLUMNS_STORAGE_KEY = 'history.columns';
 
-    function getSelectedColumns() {
+    function resolveInitialColumns() {
       const urlColumns = new URLSearchParams(window.location.search).get('columns');
       if (urlColumns) return urlColumns.split(',');
       const saved = localStorage.getItem(COLUMNS_STORAGE_KEY);
       if (saved) return JSON.parse(saved);
+      return null; // no override - let the server-rendered checkbox defaults stand
+    }
+
+    function getCheckedColumns() {
       return Array.from(document.querySelectorAll('.raw-column-checkbox'))
         .filter(cb => cb.checked)
         .map(cb => cb.value);
@@ -162,7 +166,7 @@
         params.set('limit', document.getElementById(config.limitInput).value);
         params.set('offset', String(offset));
         if (config.columnsEnabled) {
-          params.set('columns', getSelectedColumns().join(','));
+          params.set('columns', getCheckedColumns().join(','));
         }
         return params;
       }
@@ -207,7 +211,8 @@
       return { load };
     }
 
-    applySelectedColumnsToCheckboxes(getSelectedColumns());
+    const initialColumns = resolveInitialColumns();
+    if (initialColumns) applySelectedColumnsToCheckboxes(initialColumns);
 
     const rawController = makeTabController({
       startInput: 'raw-start', endInput: 'raw-end', limitInput: 'raw-limit',
