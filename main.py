@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ from goodwe.sensor import EcoModeV2
 
 import eco_encoder
 import forecast
+import history
 import storage
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
@@ -409,6 +411,69 @@ def get_forecast():
         total_kwh = forecasts[0] + forecasts[1]
         forecast_data = ForecastData(angle90_in_kWh=f"{forecasts[0]:.1f}", angle270_in_kWh=f"{forecasts[1]:.1f}", total_in_kWh=f"{total_kwh:.1f}")
         return flask.render_template('forecast.html', date=date_yyyymmdd, forecast=forecast_data)
+
+
+@app.get('/history')
+def get_history_page():
+    default_start, default_end = history.default_date_range(datetime.now().date())
+    return flask.render_template(
+        'history.html',
+        raw_columns=history.RAW_COLUMNS,
+        default_raw_columns=history.DEFAULT_RAW_COLUMNS,
+        default_start=default_start.strftime('%Y-%m-%d'),
+        default_end=default_end.strftime('%Y-%m-%d'),
+    )
+
+
+def _parse_history_range_params():
+    default_start, default_end = history.default_date_range(datetime.now().date())
+    start_date = history.parse_date_or_default(request.args.get('start'), default_start)
+    end_date = history.parse_date_or_default(request.args.get('end'), default_end)
+    start_epoch, end_epoch = history.date_range_to_epoch(start_date, end_date)
+    limit = history.resolve_limit(request.args.get('limit'))
+    offset = history.resolve_offset(request.args.get('offset'))
+    return start_date, end_date, start_epoch, end_epoch, limit, offset
+
+
+@app.get('/history/inverter.json')
+def get_history_inverter_json():
+    start_date, end_date, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
+    columns_param = request.args.get('columns')
+    requested_columns = columns_param.split(',') if columns_param else None
+    columns = history.resolve_raw_columns(requested_columns)
+    conn = sqlite3.connect(storage.DATA_DB_PATH)
+    try:
+        rows, has_more = history.fetch_inverter_rows(conn, columns, start_epoch, end_epoch, limit, offset)
+    finally:
+        conn.close()
+    return flask.jsonify({
+        'start': start_date.strftime('%Y-%m-%d'),
+        'end': end_date.strftime('%Y-%m-%d'),
+        'columns': columns,
+        'limit': limit,
+        'offset': offset,
+        'rows': rows,
+        'has_more': has_more,
+    })
+
+
+@app.get('/history/hourly.json')
+def get_history_hourly_json():
+    start_date, end_date, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
+    conn = sqlite3.connect(storage.DATA_DB_PATH)
+    try:
+        rows, has_more = history.fetch_hourly_rows(conn, start_epoch, end_epoch, limit, offset)
+    finally:
+        conn.close()
+    return flask.jsonify({
+        'start': start_date.strftime('%Y-%m-%d'),
+        'end': end_date.strftime('%Y-%m-%d'),
+        'columns': list(history.HOURLY_COLUMNS),
+        'limit': limit,
+        'offset': offset,
+        'rows': rows,
+        'has_more': has_more,
+    })
 
 
 @app.get('/listen')
