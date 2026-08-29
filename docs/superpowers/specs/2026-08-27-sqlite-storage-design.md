@@ -258,6 +258,19 @@ joined against `get_rce_15min` (hourly average, same as today's
 `query_pse_rce`, just cache-backed). Meaningfully simpler than the current
 file-boundary-crossing logic, and no longer touches raw samples at all.
 
+**Landing in two stages**, since the storage-core phase (raw samples +
+`hourly_summary`) ships before the RCE cache phase:
+1. **Storage-core phase**: `_calculate_income.py` is rewritten against
+   `hourly_summary` as above, but still calls the existing live
+   `query_pse_rce(date)` directly — `get_rce_15min` doesn't exist yet. This
+   alone fixes the script's CSV dependency (it was silently misreporting
+   or returning near-empty results for any date past the CSV corpus once
+   `main.py` stopped writing new CSVs).
+2. **RCE cache phase** (follow-up, once `get_rce_15min` exists): swap the
+   `query_pse_rce(date)` call for the cache-backed `get_rce_15min(date)` -
+   a one-line change at that point, not a redesign. Tracked here so it
+   isn't forgotten when the RCE cache phase is implemented.
+
 ## Testing
 
 - `storage.py`: unit tests for insert/query round-trip against a temp DB
