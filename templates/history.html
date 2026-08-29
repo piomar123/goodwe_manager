@@ -6,6 +6,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link href="/static/bootstrap.min.css" rel="stylesheet">
   <title>History - Energy Manager</title>
+  <style>
+    /* Bounding .table-responsive's height (rather than letting the whole
+       page scroll) gives `position: sticky` a well-defined scrolling
+       ancestor, so the header row reliably stays visible while scrolling
+       through rows - this is flaky/inconsistent across browsers when the
+       page itself is the scroll container. */
+    .table-responsive { max-height: 70vh; overflow-y: auto; }
+    .table-responsive thead th { position: sticky; top: 0; background-color: var(--bs-table-bg); z-index: 1; }
+  </style>
 </head>
 
 <body>

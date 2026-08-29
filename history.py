@@ -13,10 +13,13 @@ from typing import Iterable, Optional
 # "Interactive history viewer" section).
 RAW_COLUMNS = (
     'timestamp', 'ppv', 'ppv1', 'ppv2', 'vpv1', 'vpv2', 'ipv1', 'ipv2',
-    'pgrid', 'vgrid', 'igrid', 'fgrid', 'load_ptotal', 'house_consumption',
+    'pgrid', 'pgrid2', 'pgrid3', 'vgrid', 'vgrid2', 'vgrid3',
+    'igrid', 'igrid2', 'igrid3', 'fgrid', 'fgrid2', 'fgrid3',
+    'active_power', 'reactive_power', 'apparent_power', 'total_inverter_power',
+    'load_ptotal', 'load_p1', 'load_p2', 'load_p3', 'house_consumption',
     'battery_soc', 'pbattery1', 'vbattery1', 'ibattery1', 'battery_temperature',
     'e_day', 'e_total_exp', 'e_total_imp', 'e_load_total',
-    'meter_e_total_exp', 'meter_e_total_imp',
+    'meter_e_total_exp', 'meter_e_total_imp', 'meter_active_power_total',
     'e_bat_charge_total', 'e_bat_discharge_total',
     'work_mode_label', 'operation_mode', 'grid_in_out_label',
     'temperature', 'temperature_air', 'rssi',
@@ -100,6 +103,16 @@ def date_range_to_epoch(start_date: date, end_date: date) -> tuple:
     return start_epoch, end_epoch
 
 
+def _round_floats(row: dict) -> dict:
+    """Rounds every float value in `row` to 2 decimal places for display.
+    Diffed/summed float columns (e.g. hourly_summary's kwh totals) can
+    accumulate binary floating-point noise like 1.7799999999997453 -
+    harmless for calculation but distracting to read in a table. Leaves
+    ints and strings untouched.
+    """
+    return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in row.items()}
+
+
 def fetch_inverter_rows(conn: sqlite3.Connection, columns: list, start_epoch: int, end_epoch: int,
                         limit: int, offset: int) -> tuple:
     """Returns (rows, has_more). `columns` must already be the output of
@@ -119,7 +132,7 @@ def fetch_inverter_rows(conn: sqlite3.Connection, columns: list, start_epoch: in
     )
     fetched = cursor.fetchall()
     has_more = len(fetched) > limit
-    rows = [dict(zip(columns, row)) for row in fetched[:limit]]
+    rows = [_round_floats(dict(zip(columns, row))) for row in fetched[:limit]]
     return rows, has_more
 
 
@@ -140,7 +153,7 @@ def fetch_hourly_rows(conn: sqlite3.Connection, start_epoch: int, end_epoch: int
     has_more = len(fetched) > limit
     rows = []
     for row in fetched[:limit]:
-        row_dict = dict(zip(HOURLY_COLUMNS, row))
+        row_dict = _round_floats(dict(zip(HOURLY_COLUMNS, row)))
         row_dict['hour_start'] = datetime.fromtimestamp(row_dict['hour_start']).strftime('%Y-%m-%d %H:00')
         rows.append(row_dict)
     return rows, has_more

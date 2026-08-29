@@ -157,6 +157,22 @@ class FetchInverterRowsTest(unittest.TestCase):
             history.fetch_inverter_rows(
                 self.conn, ['timestamp; DROP TABLE inverter_history'], start, end, limit=10, offset=0)
 
+    def test_rounds_float_values_to_two_decimal_places(self):
+        storage.insert_sample_sync(self.conn, _sample_row(
+            '2026-08-27 10:05:00', ppv='1.7799999999997453'))
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, _ = history.fetch_inverter_rows(
+            self.conn, ['timestamp', 'ppv'], start, end, limit=1, offset=0)
+        self.assertEqual(rows[0]['ppv'], 1.78)
+
+    def test_does_not_round_non_numeric_columns(self):
+        storage.insert_sample_sync(self.conn, _sample_row(
+            '2026-08-27 10:05:00', work_mode_label='Normal (On-Grid)'))
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, _ = history.fetch_inverter_rows(
+            self.conn, ['timestamp', 'work_mode_label'], start, end, limit=1, offset=0)
+        self.assertEqual(rows[0]['work_mode_label'], 'Normal (On-Grid)')
+
 
 class FetchHourlyRowsTest(unittest.TestCase):
     def setUp(self):
@@ -205,6 +221,12 @@ class FetchHourlyRowsTest(unittest.TestCase):
         rows, has_more = history.fetch_hourly_rows(self.conn, start, end, limit=2, offset=0)
         self.assertEqual(len(rows), 2)
         self.assertTrue(has_more)
+
+    def test_rounds_float_values_to_two_decimal_places(self):
+        self._insert_hourly('2026-08-27 13:00:00', meter_export_kwh=1.7799999999997453)
+        start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
+        rows, _ = history.fetch_hourly_rows(self.conn, start, end, limit=10, offset=0)
+        self.assertEqual(rows[0]['meter_export_kwh'], 1.78)
 
 
 if __name__ == '__main__':
