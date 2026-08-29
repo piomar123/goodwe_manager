@@ -21,9 +21,6 @@ for the storage design. Older `data-xxxx-xx-xx_xx-xx-xx.csv` files are legacy/hi
 longer writes to them. To import historical CSV data into `data.db`, run the one-off `_migrate_csv_to_sqlite.py`
 script (safe to re-run; already-migrated files are skipped).
 
-**Note:** `_calculate_income.py` currently only reads `data-*.csv` and will not see new data written after
-the SQLite migration; its SQLite rewrite is a planned future phase, not yet done.
-
 Scripts starting from underscore `_` are not used by the main application, they are some drafts, experiments or utils.
 Dates for script input can be specified in formats: `YYYY-MM-DD` or `DD.MM.YYYY`.
 
