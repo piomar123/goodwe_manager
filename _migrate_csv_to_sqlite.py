@@ -41,14 +41,20 @@ def already_migrated(conn: sqlite3.Connection, filename: str) -> bool:
     return row is not None and row[0] == 'done'
 
 
-def read_csv_rows(csv_path: Path) -> list:
-    with open(csv_path, newline='') as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
-            return []
-        if not REQUIRED_COLUMNS.issubset(set(reader.fieldnames)):
-            return []
-        return list(reader)
+# Rows are streamed and committed in chunks of this size, rather than
+# loading a whole CSV file into memory and deferring one commit until the
+# end. On the Raspberry Pi this script actually runs on (3.7GB RAM), that
+# combination - full-file row list plus a single file-spanning transaction
+# - drove RSS to 2.3-3.3GB and exhausted swap on this codebase's largest
+# real files (~300k rows/200MB+), reproduced live during an actual
+# migration run. Committing per-chunk bounds both the row list AND
+# SQLite's in-flight transaction/WAL growth to O(_MIGRATION_CHUNK_SIZE)
+# regardless of the file's total size.
+_MIGRATION_CHUNK_SIZE = 5000
+
+
+def _validate_header(fieldnames) -> bool:
+    return fieldnames is not None and REQUIRED_COLUMNS.issubset(set(fieldnames))
 
 
 def _record_migration(conn: sqlite3.Connection, filename: str, row_count: int, status: str) -> None:
@@ -60,63 +66,78 @@ def _record_migration(conn: sqlite3.Connection, filename: str, row_count: int, s
     conn.commit()
 
 
+def _delete_rows_from(conn: sqlite3.Connection, starting_after_id: int) -> None:
+    """Removes exactly the rows this migrate_file() call itself inserted
+    (id > starting_after_id), leaving any pre-existing data in the same
+    timestamp range untouched. Used instead of conn.rollback() because
+    chunked commits mean a failure partway through no longer has a single
+    open transaction to roll back - some chunks may already be committed.
+    """
+    conn.execute("DELETE FROM inverter_history WHERE id > ?", (starting_after_id,))
+    conn.commit()
+
+
 def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str:
     filename = csv_path.name
     if already_migrated(conn, filename):
         logger.info(f"Skipping {filename}: already migrated")
         return 'skipped'
 
-    rows = read_csv_rows(csv_path)
-    if not rows:
+    valid_columns = {name for name, _ in sensor_columns()}
+
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        if not _validate_header(reader.fieldnames):
+            logger.warning(f"Skipping {filename}: empty or missing required columns")
+            return 'skipped'
+
+        if dry_run:
+            row_count = sum(1 for _ in reader)
+            if row_count == 0:
+                logger.warning(f"Skipping {filename}: empty or missing required columns")
+                return 'skipped'
+            logger.info(f"[dry-run] Would import {row_count} rows from {filename}")
+            return 'dry-run'
+
+        row_count = 0
+        first_row = None
+        last_row = None
+        chunk = []
+        try:
+            starting_max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM inverter_history").fetchone()[0]
+            for row in reader:
+                if first_row is None:
+                    first_row = row
+                last_row = row
+                chunk.append({k: v for k, v in row.items() if k in valid_columns})
+                row_count += 1
+                if len(chunk) >= _MIGRATION_CHUNK_SIZE:
+                    storage.insert_samples_batch(conn, chunk, commit=True)
+                    chunk = []
+            if chunk:
+                storage.insert_samples_batch(conn, chunk, commit=True)
+        except sqlite3.Error as e:
+            logger.error(f"{filename}: insert failed after {row_count} rows: {e}")
+            try:
+                _delete_rows_from(conn, starting_max_id)
+            except sqlite3.Error:
+                pass
+            try:
+                _record_migration(conn, filename, row_count, 'error')
+            except sqlite3.Error:
+                # the database is contested enough that even recording the
+                # failure failed - migrate_file still reports 'error' to its
+                # caller rather than crashing; the file stays unmarked in the
+                # manifest, so a later re-run will retry it from scratch
+                logger.error(f"{filename}: could not record migration failure in the manifest (database still locked)")
+            return 'error'
+
+    if row_count == 0:
         logger.warning(f"Skipping {filename}: empty or missing required columns")
         return 'skipped'
 
-    if dry_run:
-        logger.info(f"[dry-run] Would import {len(rows)} rows from {filename}")
-        return 'dry-run'
-
-    valid_columns = {name for name, _ in sensor_columns()}
-    # Deliberately NOT storage.insert_samples_batch() here, despite the
-    # per-row loop's real CPU cost (see storage.py's insert_sample_sync
-    # docstring) - migrate_file() already holds the whole file's `rows`
-    # list in memory for the verification step below, and defers a single
-    # commit until the file's end. On the Raspberry Pi this script actually
-    # runs on (3.7GB RAM), that combination plus insert_samples_batch's
-    # per-chunk parameter lists drove RSS to 2.3-3.3GB and exhausted swap on
-    # this codebase's largest real files (~300k rows/200MB+), twice,
-    # reproduced live during an actual migration run - a real OOM risk to
-    # the box's other running services. The per-row loop's smaller,
-    # continuously-garbage-collected working set is the safer choice for
-    # this hardware; revisit only alongside also bounding `rows`/verification
-    # memory (e.g. per-chunk commits + streaming verification), not in
-    # isolation.
-    inserted = 0
-    try:
-        for row in rows:
-            filtered_row = {k: v for k, v in row.items() if k in valid_columns}
-            storage.insert_sample_sync(conn, filtered_row, commit=False)
-            inserted += 1
-    except sqlite3.Error as e:
-        logger.error(f"{filename}: insert failed after {inserted}/{len(rows)} rows: {e}")
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
-        try:
-            _record_migration(conn, filename, len(rows), 'error')
-        except sqlite3.Error:
-            # the database is contested enough that even recording the
-            # failure failed - migrate_file still reports 'error' to its
-            # caller rather than crashing; the file stays unmarked in the
-            # manifest, so a later re-run will retry it from scratch
-            logger.error(f"{filename}: could not record migration failure in the manifest (database still locked)")
-        return 'error'
-
-    # nothing is committed yet - the whole file's rows are still pending in
-    # this transaction, so a failed verification below can still be rolled
-    # back cleanly rather than leaving partial/incorrect data in place
-    epoch_first = storage.parse_timestamp_epoch(rows[0]['timestamp'])
-    epoch_last = storage.parse_timestamp_epoch(rows[-1]['timestamp'])
+    epoch_first = storage.parse_timestamp_epoch(first_row['timestamp'])
+    epoch_last = storage.parse_timestamp_epoch(last_row['timestamp'])
     range_start, range_end = min(epoch_first, epoch_last), max(epoch_first, epoch_last)
     db_row_count = conn.execute(
         "SELECT COUNT(*) FROM inverter_history WHERE timestamp_epoch BETWEEN ? AND ?",
@@ -125,33 +146,32 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
 
     first_row_db = conn.execute(
         "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
-        (rows[0]['timestamp'],),
+        (first_row['timestamp'],),
     ).fetchone()
     last_row_db = conn.execute(
         "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
-        (rows[-1]['timestamp'],),
+        (last_row['timestamp'],),
     ).fetchone()
     verified = (
-        db_row_count == len(rows)
+        db_row_count == row_count
         and first_row_db is not None
-        and str(first_row_db[0]) == str(float(rows[0]['meter_e_total_exp']))
+        and str(first_row_db[0]) == str(float(first_row['meter_e_total_exp']))
         and last_row_db is not None
-        and str(last_row_db[0]) == str(float(rows[-1]['meter_e_total_exp']))
+        and str(last_row_db[0]) == str(float(last_row['meter_e_total_exp']))
     )
 
     if verified:
-        conn.commit()
         status = 'done'
-        logger.info(f"{filename}: imported and verified {inserted} rows")
+        logger.info(f"{filename}: imported and verified {row_count} rows")
     else:
-        conn.rollback()
+        _delete_rows_from(conn, starting_max_id)
         status = 'error'
         logger.error(
-            f"{filename}: verification failed (db_row_count={db_row_count}/{len(rows)}, "
-            "spot-check mismatch) - rolled back"
+            f"{filename}: verification failed (db_row_count={db_row_count}/{row_count}, "
+            "spot-check mismatch) - deleted this file's rows"
         )
 
-    _record_migration(conn, filename, len(rows), status)
+    _record_migration(conn, filename, row_count, status)
     return status
 
 
