@@ -178,6 +178,9 @@ cython_debug/
 /data.db
 /data.db-wal
 /data.db-shm
+/rce_prices.db
+/rce_prices.db-wal
+/rce_prices.db-shm
 /.idea
 .superpowers/
 /.worktrees/
