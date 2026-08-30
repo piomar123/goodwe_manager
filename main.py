@@ -50,6 +50,14 @@ dry_run = False
 EVERY_DAY = 0b1111111
 EVERY_DAY_STR = 'all'
 
+# storage.backfill_hourly_summary() is deliberately not run on every poll (a
+# crash right at the hour boundary would then mean it's never written, per
+# the design spec) - instead it runs once at startup (to catch up hours
+# completed while the service was down) and on this interval thereafter, so
+# hourly_summary keeps advancing for a service that stays up for weeks/months
+# without needing a restart.
+HOURLY_BACKFILL_INTERVAL_SECONDS = 300
+
 ForecastData = namedtuple('ForecastData', ('angle90_in_kWh', 'angle270_in_kWh', 'total_in_kWh'))
 
 
@@ -157,12 +165,17 @@ class AsyncioThread(threading.Thread):
         self._db_conn = await storage.init_db_async(storage.DATA_DB_PATH, sensor_columns())
         try:
             await self._seed_hour_start_baseline()
+            await self._backfill_hourly_summary()
+            last_backfill = time.monotonic()
             while True:
                 inverter_runtime = await self._inverter.read_runtime_data()
                 sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
                 await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
                 announcer.announce(json.dumps(sensors_data_with_calculated))
+                if time.monotonic() - last_backfill >= HOURLY_BACKFILL_INTERVAL_SECONDS:
+                    await self._backfill_hourly_summary()
+                    last_backfill = time.monotonic()
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
@@ -174,6 +187,26 @@ class AsyncioThread(threading.Thread):
         hour_start_epoch, hour_end_epoch = storage.current_hour_bounds(datetime.now())
         baseline = await storage.get_current_hour_start_sample_async(self._db_conn, hour_start_epoch, hour_end_epoch)
         self._calculated_values_evaluator.seed_hour_start(baseline)
+
+    @staticmethod
+    async def _backfill_hourly_summary():
+        """Derives any newly-completed hourly_summary rows from
+        inverter_history. Runs on a plain sqlite3 connection (not the shared
+        aiosqlite one) via a worker thread, since storage.backfill_hourly_summary
+        is synchronous and issues several queries per hour - a short-lived
+        connection here avoids sharing sqlite3's not-thread-safe-by-default
+        connection object with the asyncio loop's own aiosqlite connection.
+        """
+        def _run():
+            conn = sqlite3.connect(storage.DATA_DB_PATH)
+            try:
+                return storage.backfill_hourly_summary(conn)
+            finally:
+                conn.close()
+
+        backfilled = await asyncio.to_thread(_run)
+        if backfilled:
+            logger.info(f"Backfilled {backfilled} hourly_summary row(s)")
 
     def ensure_inverter_ready(self):
         if self._asyncio_loop is None:
