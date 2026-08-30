@@ -76,7 +76,11 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
         return 'dry-run'
 
     valid_columns = {name for name, _ in sensor_columns()}
-    filtered_rows = [{k: v for k, v in row.items() if k in valid_columns} for row in rows]
+    # a generator, not a list comprehension - `rows` itself is already a
+    # full list held for verification below, so a second fully-materialized
+    # copy here would double peak memory for no reason; insert_samples_batch
+    # consumes this lazily in bounded chunks anyway
+    filtered_rows = ({k: v for k, v in row.items() if k in valid_columns} for row in rows)
     try:
         # insert_samples_batch() (a single executemany()) rather than a
         # per-row insert_sample_sync() loop - at the row counts this script

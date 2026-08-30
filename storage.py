@@ -149,7 +149,11 @@ def insert_sample_sync(conn: sqlite3.Connection, row: Mapping[str, Any], commit:
         conn.commit()
 
 
-def insert_samples_batch(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]], commit: bool = True) -> None:
+_DEFAULT_BATCH_SIZE = 5000
+
+
+def insert_samples_batch(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]], commit: bool = True,
+                          batch_size: int = _DEFAULT_BATCH_SIZE) -> None:
     """Bulk equivalent of insert_sample_sync(), for callers inserting many
     rows at once (e.g. CSV migration) rather than one sample per call. The
     per-row path is fine for live polling (~1 row/second), but at millions
@@ -157,17 +161,32 @@ def insert_samples_batch(conn: sqlite3.Connection, rows: Iterable[Mapping[str, A
     dominates - conn.executemany() with a single precomputed SQL string
     avoids both by preparing the statement once.
 
+    Rows are grouped into chunks of `batch_size` and passed to
+    conn.executemany() one chunk at a time, rather than materializing the
+    whole `rows` iterable into one parameter list up front. A real
+    migration file can be 300k+ rows - building the entire parameter list
+    at once pushed a 3.7GB Raspberry Pi to the edge of OOM during an actual
+    migration run (RSS hit 3.3GB, swap exhausted). Chunking bounds peak
+    extra memory to O(batch_size) regardless of the input's total size.
+
     Every row must have the same set of keys (true for rows read from a
-    single CSV file's DictReader) - the column list is taken from the first
-    row only. A no-op for an empty `rows`.
+    single CSV file's DictReader) - the column list is taken from the
+    first row only. A no-op for an empty `rows`.
     """
-    rows = list(rows)
-    if not rows:
-        return
-    column_names = list(_row_with_epoch(rows[0]).keys())
-    sql = _insert_sql(column_names)
-    params = [[full_row[c] for c in column_names] for full_row in (_row_with_epoch(row) for row in rows)]
-    conn.executemany(sql, params)
+    column_names = None
+    sql = None
+    chunk = []
+    for row in rows:
+        full_row = _row_with_epoch(row)
+        if column_names is None:
+            column_names = list(full_row.keys())
+            sql = _insert_sql(column_names)
+        chunk.append([full_row[c] for c in column_names])
+        if len(chunk) >= batch_size:
+            conn.executemany(sql, chunk)
+            chunk = []
+    if chunk:
+        conn.executemany(sql, chunk)
     if commit:
         conn.commit()
 

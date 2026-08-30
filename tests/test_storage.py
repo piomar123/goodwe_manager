@@ -151,6 +151,37 @@ class StorageSyncTest(unittest.TestCase):
         count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_insert_samples_batch_chunks_large_inputs_instead_of_materializing_them_all(self):
+        # a real migration file can be 300k+ rows - insert_samples_batch
+        # must never hold more than one bounded chunk's worth of
+        # transformed rows in memory at once (see storage.py's docstring:
+        # an unbounded single executemany() pushed a 3.7GB Raspberry Pi to
+        # the edge of OOM during a real migration run)
+        rows = [_sample_row(f'2026-08-28 14:{i:02}:00') for i in range(10)]
+        call_sizes = []
+
+        class _SpyConn:
+            """sqlite3.Connection's methods are read-only C slots and can't
+            be monkeypatched directly - this thin wrapper proxies just the
+            two methods insert_samples_batch calls, recording each
+            executemany() call's batch size along the way."""
+            def __init__(self, real_conn):
+                self._real = real_conn
+
+            def executemany(self, sql, params):
+                params = list(params)
+                call_sizes.append(len(params))
+                return self._real.executemany(sql, params)
+
+            def commit(self):
+                return self._real.commit()
+
+        storage.insert_samples_batch(_SpyConn(self.conn), rows, batch_size=3)
+
+        self.assertEqual(call_sizes, [3, 3, 3, 1])
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 10)
+
     def test_insert_samples_batch_respects_commit_false(self):
         storage.insert_samples_batch(self.conn, [_sample_row('2026-08-28 14:05:00')], commit=False)
 
