@@ -136,6 +136,65 @@ class MigrateCsvToSqliteTest(unittest.TestCase):
         count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_recovers_from_a_crashed_previous_attempt_at_the_same_file(self):
+        csv_path = self._write_csv('data-2026-08-28_20-00-00.csv',
+                                   HEADER +
+                                   '2026-08-28 20:00:00,100.0,1.0,0.5,0.1\n'
+                                   '2026-08-28 20:00:01,101.0,1.1,0.5,0.2\n')
+        # simulate a crash partway through a previous attempt: a 'pending'
+        # manifest entry was written before the insert loop started, and
+        # some rows got durably committed (chunk commits) before the
+        # process died - orphaned, with no 'done'/'error' entry to show for it
+        starting_max_id = self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM inverter_history").fetchone()[0]
+        orphan_row = {name: ('0' if sql_type == 'REAL' else '') for name, sql_type in sensor_columns()}
+        orphan_row['timestamp'] = '2026-08-28 20:00:00'
+        storage.insert_sample_sync(self.conn, orphan_row, commit=True)
+        self.conn.execute(
+            "INSERT INTO csv_migration_log (filename, row_count, migrated_at, status, starting_max_id) "
+            "VALUES (?, NULL, 0, 'pending', ?)",
+            (csv_path.name, starting_max_id),
+        )
+        self.conn.commit()
+
+        status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
+
+        self.assertEqual(status, 'done')
+        # the orphaned row from the crashed attempt was cleaned up first,
+        # so only this attempt's 2 rows remain - not 3
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 2)
+        log_status = self.conn.execute(
+            "SELECT status FROM csv_migration_log WHERE filename = ?", (csv_path.name,),
+        ).fetchone()
+        self.assertEqual(log_status, ('done',))
+
+    def test_ensure_migration_log_table_adds_starting_max_id_to_an_existing_table(self):
+        small_db_path = os.path.join(self.tmp_dir, 'small.db')
+        conn = sqlite3.connect(small_db_path)
+        conn.execute("""
+            CREATE TABLE csv_migration_log (
+                filename TEXT PRIMARY KEY,
+                row_count INTEGER,
+                migrated_at INTEGER,
+                status TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO csv_migration_log (filename, row_count, migrated_at, status) VALUES (?, ?, ?, ?)",
+            ('old-file.csv', 5, 12345, 'done'),
+        )
+        conn.commit()
+
+        migrate.ensure_migration_log_table(conn)
+
+        column_names = {row[1] for row in conn.execute("PRAGMA table_info(csv_migration_log)")}
+        self.assertIn('starting_max_id', column_names)
+        row = conn.execute(
+            "SELECT filename, row_count, status FROM csv_migration_log WHERE filename = 'old-file.csv'"
+        ).fetchone()
+        self.assertEqual(row, ('old-file.csv', 5, 'done'))
+        conn.close()
+
     def test_a_locked_database_is_reported_as_an_error_not_a_crash(self):
         csv_path = self._write_csv('data-2026-08-28_15-00-00.csv',
                                    HEADER + '2026-08-28 15:00:00,100.0,1.0,0.5,0.1\n')

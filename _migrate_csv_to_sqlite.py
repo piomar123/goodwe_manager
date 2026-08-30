@@ -13,6 +13,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
+from typing import Optional
 
 import storage
 from sensors import sensor_columns
@@ -28,9 +29,13 @@ def ensure_migration_log_table(conn: sqlite3.Connection) -> None:
             filename TEXT PRIMARY KEY,
             row_count INTEGER,
             migrated_at INTEGER,
-            status TEXT
+            status TEXT,
+            starting_max_id INTEGER
         )
     """)
+    # existing data.db files predate starting_max_id (added for crash
+    # recovery - see _mark_pending()/_pending_starting_max_id() below)
+    storage._reconcile_table_columns_sync(conn, 'csv_migration_log', [('starting_max_id', 'INTEGER')])
     conn.commit()
 
 
@@ -77,6 +82,32 @@ def _delete_rows_from(conn: sqlite3.Connection, starting_after_id: int) -> None:
     conn.commit()
 
 
+def _mark_pending(conn: sqlite3.Connection, filename: str, starting_max_id: int) -> None:
+    """Records that migrate_file() is about to start committing chunks for
+    `filename`, and the id watermark to clean up from if this attempt itself
+    never reaches a final 'done'/'error' status (e.g. the process is killed
+    outright - SIGKILL/OOM/power loss - which the try/except around the
+    insert loop below can't catch). _record_migration()'s INSERT OR REPLACE
+    overwrites this with the real outcome once the attempt completes
+    normally, so a 'pending' row only survives to be seen again if this
+    exact attempt crashed.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO csv_migration_log (filename, row_count, migrated_at, status, starting_max_id) "
+        "VALUES (?, NULL, ?, 'pending', ?)",
+        (filename, int(time.time()), starting_max_id),
+    )
+    conn.commit()
+
+
+def _pending_starting_max_id(conn: sqlite3.Connection, filename: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT starting_max_id FROM csv_migration_log WHERE filename = ? AND status = 'pending'",
+        (filename,),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str:
     filename = csv_path.name
     if already_migrated(conn, filename):
@@ -99,12 +130,23 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
             logger.info(f"[dry-run] Would import {row_count} rows from {filename}")
             return 'dry-run'
 
+        # a stale 'pending' entry means a previous attempt at this exact
+        # file crashed outright (SIGKILL/OOM/power loss) after committing
+        # some chunks but before reaching a final 'done'/'error' status -
+        # clean up whatever it left behind before starting fresh, rather
+        # than appending this attempt's rows on top of orphaned ones
+        stale_starting_max_id = _pending_starting_max_id(conn, filename)
+        if stale_starting_max_id is not None:
+            logger.warning(f"{filename}: found a pending (crashed) previous attempt - cleaning up and retrying")
+            _delete_rows_from(conn, stale_starting_max_id)
+
         row_count = 0
         first_row = None
         last_row = None
         chunk = []
         try:
             starting_max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM inverter_history").fetchone()[0]
+            _mark_pending(conn, filename, starting_max_id)
             for row in reader:
                 if first_row is None:
                     first_row = row
