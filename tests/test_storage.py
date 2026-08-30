@@ -90,7 +90,9 @@ class StorageSyncTest(unittest.TestCase):
             conn = storage.init_db_sync(small_db_path, sensor_columns())
 
             column_names = {row[1] for row in conn.execute("PRAGMA table_info(hourly_summary)")}
-            for expected in ('sample_count', 'vgrid_min', 'vgrid_max', 'fgrid_min', 'fgrid_max',
+            for expected in ('sample_count',
+                              'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
+                              'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
                               'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max'):
                 self.assertIn(expected, column_names)
             row = conn.execute("SELECT hour_start, meter_export_kwh FROM hourly_summary").fetchone()
@@ -343,15 +345,22 @@ class BackfillHourlySummaryTest(unittest.TestCase):
         storage.backfill_hourly_summary(self.conn)
 
         row = self.conn.execute(
-            "SELECT sample_count, vgrid_min, vgrid_max, fgrid_min, fgrid_max, "
+            "SELECT sample_count, "
+            "vgrid_min, vgrid_max, vgrid2_min, vgrid2_max, vgrid3_min, vgrid3_max, "
+            "fgrid_min, fgrid_max, fgrid2_min, fgrid2_max, fgrid3_min, fgrid3_max, "
             "inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max "
             "FROM hourly_summary WHERE hour_start = ?",
             (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
         ).fetchone()
-        self.assertEqual(row, (2, 228.9, 231.0, 49.90, 50.05, 42.0, 45.5, 28.0, 29.5))
+        self.assertEqual(row, (
+            2,
+            229.5, 231.0, 229.0, 230.1, 228.9, 230.5,
+            49.98, 50.05, 49.90, 50.01, 49.95, 50.02,
+            42.0, 45.5, 28.0, 29.5,
+        ))
 
-    def test_quality_stats_fall_back_to_a_single_phase_when_other_phases_are_null(self):
-        # single-phase-style sample: only vgrid/fgrid populated, phases 2/3 NULL
+    def test_quality_stats_are_null_per_phase_when_that_phase_is_null(self):
+        # single-phase-style sample: only phase 1 populated, phases 2/3 NULL
         self._insert('2026-08-28 14:05:00', vgrid='230.0', vgrid2=None, vgrid3=None,
                      fgrid='50.0', fgrid2=None, fgrid3=None)
         self._insert('2026-08-28 15:05:00')  # proves 14:00 is complete
@@ -359,11 +368,12 @@ class BackfillHourlySummaryTest(unittest.TestCase):
         storage.backfill_hourly_summary(self.conn)
 
         row = self.conn.execute(
-            "SELECT vgrid_min, vgrid_max, fgrid_min, fgrid_max "
+            "SELECT vgrid_min, vgrid_max, vgrid2_min, vgrid2_max, vgrid3_min, vgrid3_max, "
+            "fgrid_min, fgrid_max, fgrid2_min, fgrid2_max, fgrid3_min, fgrid3_max "
             "FROM hourly_summary WHERE hour_start = ?",
             (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
         ).fetchone()
-        self.assertEqual(row, (230.0, 230.0, 50.0, 50.0))
+        self.assertEqual(row, (230.0, 230.0, None, None, None, None, 50.0, 50.0, None, None, None, None))
 
 
 if __name__ == '__main__':

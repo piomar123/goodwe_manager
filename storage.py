@@ -41,8 +41,16 @@ _HOURLY_SUMMARY_COLUMNS = [
     ('sample_count', 'INTEGER'),
     ('vgrid_min', 'REAL'),
     ('vgrid_max', 'REAL'),
+    ('vgrid2_min', 'REAL'),
+    ('vgrid2_max', 'REAL'),
+    ('vgrid3_min', 'REAL'),
+    ('vgrid3_max', 'REAL'),
     ('fgrid_min', 'REAL'),
     ('fgrid_max', 'REAL'),
+    ('fgrid2_min', 'REAL'),
+    ('fgrid2_max', 'REAL'),
+    ('fgrid3_min', 'REAL'),
+    ('fgrid3_max', 'REAL'),
     ('inverter_temp_min', 'REAL'),
     ('inverter_temp_max', 'REAL'),
     ('battery_temp_min', 'REAL'),
@@ -209,21 +217,20 @@ def _max_counters(conn: sqlite3.Connection, start_epoch: int, end_epoch: int) ->
 
 
 _QUALITY_STAT_COLUMNS = [
-    'sample_count', 'vgrid_min', 'vgrid_max', 'fgrid_min', 'fgrid_max',
+    'sample_count',
+    'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
+    'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
     'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
 ]
 
-# Scalar MIN/MAX(a, b, c) picks the smallest/largest of the three phase
-# readings on a single row; the outer aggregate MIN/MAX then finds the
-# extreme across all rows in the hour. COALESCE falls back to phase 1 when
-# phases 2/3 are NULL (single-phase inverters), so a bare scalar MIN/MAX
-# doesn't propagate NULL and blank out the whole hour.
+# Each phase is aggregated independently (rather than a combined
+# worst-case across phases), so a NULL phase (e.g. a single-phase
+# inverter never populating vgrid2/vgrid3) just yields NULL for that
+# phase's columns without affecting the others.
 _QUALITY_STATS_QUERY = """
     SELECT COUNT(*),
-        MIN(MIN(vgrid, COALESCE(vgrid2, vgrid), COALESCE(vgrid3, vgrid))),
-        MAX(MAX(vgrid, COALESCE(vgrid2, vgrid), COALESCE(vgrid3, vgrid))),
-        MIN(MIN(fgrid, COALESCE(fgrid2, fgrid), COALESCE(fgrid3, fgrid))),
-        MAX(MAX(fgrid, COALESCE(fgrid2, fgrid), COALESCE(fgrid3, fgrid))),
+        MIN(vgrid), MAX(vgrid), MIN(vgrid2), MAX(vgrid2), MIN(vgrid3), MAX(vgrid3),
+        MIN(fgrid), MAX(fgrid), MIN(fgrid2), MAX(fgrid2), MIN(fgrid3), MAX(fgrid3),
         MIN(temperature), MAX(temperature),
         MIN(battery_temperature), MAX(battery_temperature)
     FROM inverter_history WHERE timestamp_epoch >= ? AND timestamp_epoch < ?
@@ -285,15 +292,20 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
             INSERT OR REPLACE INTO hourly_summary
                 (hour_start, meter_export_kwh, meter_import_kwh, load_kwh, pv_kwh,
                  battery_charge_kwh, battery_discharge_kwh, sample_count,
-                 vgrid_min, vgrid_max, fgrid_min, fgrid_max,
+                 vgrid_min, vgrid_max, vgrid2_min, vgrid2_max, vgrid3_min, vgrid3_max,
+                 fgrid_min, fgrid_max, fgrid2_min, fgrid2_max, fgrid3_min, fgrid3_max,
                  inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (hour_start, metrics['meter_export_kwh'], metrics['meter_import_kwh'], metrics['load_kwh'],
              metrics['pv_kwh'], metrics['battery_charge_kwh'], metrics['battery_discharge_kwh'],
-             quality['sample_count'], quality['vgrid_min'], quality['vgrid_max'],
-             quality['fgrid_min'], quality['fgrid_max'], quality['inverter_temp_min'],
-             quality['inverter_temp_max'], quality['battery_temp_min'], quality['battery_temp_max']),
+             quality['sample_count'],
+             quality['vgrid_min'], quality['vgrid_max'], quality['vgrid2_min'], quality['vgrid2_max'],
+             quality['vgrid3_min'], quality['vgrid3_max'],
+             quality['fgrid_min'], quality['fgrid_max'], quality['fgrid2_min'], quality['fgrid2_max'],
+             quality['fgrid3_min'], quality['fgrid3_max'],
+             quality['inverter_temp_min'], quality['inverter_temp_max'],
+             quality['battery_temp_min'], quality['battery_temp_max']),
         )
         conn.commit()
         backfilled += 1

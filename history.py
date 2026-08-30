@@ -33,7 +33,8 @@ DEFAULT_RAW_COLUMNS = (
 HOURLY_COLUMNS = (
     'hour_start', 'meter_export_kwh', 'meter_import_kwh', 'load_kwh',
     'pv_kwh', 'battery_charge_kwh', 'battery_discharge_kwh', 'sample_count',
-    'vgrid_min', 'vgrid_max', 'fgrid_min', 'fgrid_max',
+    'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
+    'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
     'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
 )
 
