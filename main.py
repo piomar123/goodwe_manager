@@ -30,6 +30,7 @@ import storage
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
 from rce import parse_date, plot_rce, setup_plot_style, get_rce_15min
+from rce_prefetch import RcePrefetchThread
 from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
 
 dotenv.load_dotenv()
@@ -215,6 +216,7 @@ class AsyncioThread(threading.Thread):
 
 app = flask.Flask(__name__, static_url_path='/static')
 asyncio_thread = AsyncioThread(inverter_address=INVERTER_IP, daemon=False)
+rce_prefetch_thread = RcePrefetchThread()
 
 
 @app.route('/')
@@ -555,6 +557,7 @@ def main():
         dry_run = True
 
     asyncio_thread.start()
+    rce_prefetch_thread.start()
     # atexit.register(stop_threads)
     try:
         app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False)
@@ -563,6 +566,7 @@ def main():
     finally:
         logger.info("Finishing the application...")
         asyncio_thread.finish()
+        rce_prefetch_thread.finish()
         logger.info("Finished all threads")
 
 
