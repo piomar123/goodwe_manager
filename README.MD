@@ -11,6 +11,14 @@ https://github.com/user-attachments/assets/0824e02f-0407-40a6-8b6f-845b09fb819b
 * Run with `python main.py` (TODO: instructions for gunicorn)
 * Run with `--dry-run` parameter to disable communication with the inverter (used for testing)
 
+## Upgrading
+
+Pulling a checkout that's behind may require a one-off migration step - see
+[`CHANGELOG.md`](CHANGELOG.md) for what changed and why. Most notably: if
+you have old `data-*.csv` files from before the switch to SQLite, run
+`python _migrate_csv_to_sqlite.py` once to import them into `data.db`
+(safe to re-run; already-migrated files are skipped).
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 
@@ -18,8 +26,7 @@ and streaming data to the frontend using Server Sent Events (SSE) for real-time 
 Data is written into a SQLite database (`data.db`, `inverter_history` table) and can be processed later
 by some scripts calculating the cost savings; see `docs/superpowers/specs/2026-08-27-sqlite-storage-design.md`
 for the storage design. Older `data-xxxx-xx-xx_xx-xx-xx.csv` files are legacy/historical only - the app no
-longer writes to them. To import historical CSV data into `data.db`, run the one-off `_migrate_csv_to_sqlite.py`
-script (safe to re-run; already-migrated files are skipped).
+longer writes to them (see "Upgrading" above for importing them).
 
 Scripts starting from underscore `_` are not used by the main application, they are some drafts, experiments or utils.
 Dates for script input can be specified in formats: `YYYY-MM-DD` or `DD.MM.YYYY`.
