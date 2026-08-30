@@ -227,7 +227,13 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
             return 'error'
 
     if row_count == 0:
-        logger.warning(f"Skipping {filename}: empty or missing required columns")
+        logger.warning(f"Skipping {filename}: every row was malformed (or the file was empty/missing columns)")
+        # _mark_pending() already wrote a 'pending' row for this filename -
+        # without overwriting it here, this file would show 'pending'
+        # forever (never 'done' or 'error'), since already_migrated() only
+        # checks for 'done' - so every future run retries it, marks it
+        # 'pending' again, and hits this exact same path again
+        _record_migration(conn, filename, 0, 'skipped')
         return 'skipped'
 
     # min_epoch/max_epoch are the true extremes across every usable row,

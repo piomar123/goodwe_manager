@@ -91,6 +91,16 @@ class MigrateCsvToSqliteTest(unittest.TestCase):
         self.assertEqual(status, 'skipped')
         count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
         self.assertEqual(count, 0)
+        # _mark_pending() wrote a 'pending' row before the insert loop ran -
+        # a file with zero usable rows must still resolve that to a final
+        # status, not leave it stuck as 'pending' forever (which would make
+        # a later run treat every row inserted by *any other file* since
+        # then as this file's own orphaned leftovers, per
+        # _pending_starting_max_id()'s crash-recovery path, and delete them)
+        log_status = self.conn.execute(
+            "SELECT status FROM csv_migration_log WHERE filename = ?", (csv_path.name,),
+        ).fetchone()
+        self.assertEqual(log_status, ('skipped',))
 
     def test_verification_uses_true_min_max_not_first_last_row_order(self):
         # rows out of chronological order (e.g. a mid-file clock jump) -
