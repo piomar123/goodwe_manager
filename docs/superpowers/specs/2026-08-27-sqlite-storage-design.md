@@ -16,19 +16,24 @@ This design replaces CSV files with SQLite, adds a materialized hourly summary
 for fast historical queries, and adds a local RCE price cache with a scheduled
 next-day prefetch.
 
-## Two database files
+## Database files
 
-- **`data.db`** — `inverter_history` (raw samples) + `hourly_summary`
-  (derived). Kept together because they're written by the same code path and
-  the backfill logic needs both.
+- **`data.db`** — `hourly_summary` (derived) + `csv_migration_log`. Small
+  and never partitioned (see "Long-term storage" below) — decades of hourly
+  summaries fit comfortably in one file.
+- **`data_<year>.db`** (`data_2024.db`, `data_2025.db`, ...) — one file per
+  calendar year, each holding that year's `inverter_history` raw samples.
+  See "Long-term storage: year-partitioned files, no pruning" below for why
+  and how.
 - **`rce_prices.db`** — `rce_prices` + `rce_prices_fetched`. Split out because
   it has a completely different write pattern (occasional, from a background
-  thread or Flask request) and lifecycle (tiny, never pruned) from the
-  1-second telemetry writer. Keeping it in a separate file avoids lock
-  contention between the two, and lets either be rebuilt independently.
+  thread or Flask request) and lifecycle (tiny, unbounded growth is fine —
+  see below) from the 1-second telemetry writer. Keeping it in a separate
+  file avoids lock contention between the two, and lets either be rebuilt
+  independently.
 
-Both files are gitignored, same as `data*.csv` and `playground/test.db`
-already are.
+All `data*.db` files are gitignored, same as `data*.csv` and
+`playground/test.db` already are.
 
 ## `inverter_history` (normalized columns, not JSON blob)
 
@@ -52,8 +57,14 @@ CREATE TABLE inverter_history (
 );
 CREATE INDEX idx_inverter_history_timestamp ON inverter_history (timestamp);
 PRAGMA journal_mode = WAL;         -- readers (Flask thread) don't block the writer (asyncio thread)
-PRAGMA auto_vacuum = INCREMENTAL;  -- must be set before any table is created; enables reclaiming space after pruning
+PRAGMA auto_vacuum = INCREMENTAL;  -- must be set before any table is created; reclaims space after the occasional
+                                    -- delete (failed-migration cleanup, verification rollback) - not pruning-related,
+                                    -- since raw data is kept forever (see "Long-term storage" below)
 ```
+
+This schema is created identically in every `data_<year>.db` file (see
+"Long-term storage" below) — one `inverter_history` table per year, not one
+shared table across files.
 
 `main.py`'s `_get_inverter_data` opens one `aiosqlite` connection for the
 process lifetime (replacing the current per-run `open()`/`csv.writer`), and
@@ -101,8 +112,11 @@ CREATE TABLE hourly_summary (
 );
 ```
 
-Never pruned — this is the table that makes long-term historical analysis
-possible even after raw samples age out (see Retention below).
+Never partitioned or deleted — raw samples are kept forever too (see
+"Long-term storage" below), but `hourly_summary` staying in one small,
+un-split file is what keeps year-spanning historical analysis (e.g.
+year-over-year income comparisons) a single-table query instead of a
+`UNION ALL` across every year's `data_<year>.db`.
 
 Populated by a `backfill_hourly_summary()` function, not by live
 finalization during polling (a crash right at the hour boundary would mean
@@ -140,19 +154,48 @@ relative to the inverter's own midnight if the host's timezone matches it.
 This is a deployment requirement, not something verifiable from the code
 alone.
 
-## Retention / pruning (raw samples only)
+## Long-term storage: year-partitioned files, no pruning
 
-`inverter_history` at 1 sample/second, ~109 columns, is ~24 GB/year
-uncompressed. A daily maintenance step deletes rows older than a configurable
-window, default **180 days** (~12 GB steady-state), then runs
-`PRAGMA incremental_vacuum` to actually reclaim the freed pages (requires
-`auto_vacuum = INCREMENTAL`, set at table creation time). The
-`hourly_summary` backfill must run before pruning deletes the raw rows it
-would derive from — the daily maintenance step is: backfill, then prune.
+All historical `inverter_history` data is kept forever — there is no
+deletion/retention policy. `inverter_history` at 1 sample/second,
+~109 columns, is ~24 GB/year uncompressed, so an unpartitioned single file
+would grow without bound over the years. Instead, `inverter_history` is
+split into one SQLite file per calendar year: `data_2024.db`,
+`data_2025.db`, `data_2026.db`, and so on, each containing that year's
+slice of the table, with the identical schema in every file.
 
-`hourly_summary` and `rce_prices`/`rce_prices_fetched` are never pruned —
-both are small enough (well under a MB and a few MB per year respectively)
-that there's no growth concern.
+SQLite has no built-in automatic partitioning (no `PARTITION BY` equivalent)
+— this is built on `ATTACH DATABASE`, the actual primitive SQLite offers for
+spreading data across multiple files, plus application-level routing:
+
+- **Write path**: the live writer (`AsyncioThread`'s single long-lived
+  connection) attaches whichever calendar year is current —
+  `ATTACH DATABASE 'data_<year>.db' AS y<year>` — creating the file (via the
+  same DDL as above) the first time that year is written to, and inserts go
+  to `y<year>.inverter_history`. At each year boundary the writer attaches
+  the new year's file and switches the insert target; there's no need to
+  ever `DETACH` an old year (SQLite's attach limit is 10 by default,
+  configurable up to 125 — not a practical concern on a multi-decade
+  timeline for one file per year).
+- **Read path**: every caller that queries raw history
+  (`history.py`, `_calculate_income.py`, `storage.backfill_hourly_summary`)
+  attaches every `data_<year>.db` file that exists and queries against
+  `CREATE VIEW inverter_history AS SELECT * FROM y2024.inverter_history
+  UNION ALL SELECT * FROM y2025.inverter_history UNION ALL ...` (rebuilt
+  whenever a new year file appears), so callers keep querying
+  `inverter_history` as one logical table without knowing about the split.
+  A query bounded to a date range (the common case for `/history`, income
+  calculation, and hourly backfill) only touches the relevant underlying
+  year file or two, thanks to normal SQLite query planning against the
+  `UNION ALL` view.
+- **Migration**: `_migrate_csv_to_sqlite.py` determines each row's target
+  year from its own timestamp and attaches/creates the matching year file
+  before inserting, rather than a single `--db-path` for all of history.
+
+`hourly_summary` and `rce_prices`/`rce_prices_fetched` are never
+partitioned — both stay comfortably small (well under a MB and a few MB per
+year respectively, even across decades) since they're derived/cached data,
+not raw 1-second telemetry.
 
 ## RCE price cache (`rce_prices.db`)
 
@@ -241,12 +284,11 @@ convention for utility scripts):
 5. Once every file is `'done'`, runs `backfill_hourly_summary()` to derive
    the full `hourly_summary` history from the imported raw data.
 6. **Never deletes the source CSV files.** They remain on disk indefinitely
-   as the recovery path for a migration bug discovered later. Recommended
-   minimum: keep them at least as long as `inverter_history`'s own retention
-   window (180 days) past a successful, verified migration, so the CSVs stay
-   available to re-derive raw data for the same span the live DB itself
-   still covers. Deleting old CSVs afterward, if ever, is a manual decision
-   — no script automates it.
+   as the recovery path for a migration bug discovered later — since
+   `inverter_history` itself now keeps everything forever too (no retention
+   window), there's no natural point at which the CSVs stop being useful as
+   a backup. Deleting old CSVs, if ever, is a manual decision — no script
+   automates it.
 
 ## `_calculate_income.py` rewrite
 
@@ -288,10 +330,10 @@ file-boundary-crossing logic, and no longer touches raw samples at all.
 - RCE cache: test the DST edge case explicitly (a date with 92 and a date
   with 100 periods should both cache correctly using the marker-table
   approach).
-- Retention/pruning: test that pruning deletes only rows older than the
-  window, never touches `hourly_summary`, and that `backfill_hourly_summary`
-  is proven to have run for a given hour before that hour's raw rows are
-  eligible for deletion.
+- Year partitioning: test that a write for a given timestamp lands in the
+  correct `data_<year>.db` file (attaching/creating it as needed), and that
+  the `UNION ALL` read view correctly returns rows spanning a query range
+  that crosses a year boundary.
 
 ## Interactive history viewer
 
@@ -311,8 +353,9 @@ driving a `fetch()` call rather than a full-page reload per interaction.
 - `GET /history/hourly.json?start=&end=&limit=&offset=`
 
 Both return `{rows: [...], has_more: bool}`. Rather than `SELECT COUNT(*)`
-for pagination (expensive on `inverter_history`, which can be tens of
-millions of rows within the 180-day retention window), the query fetches
+for pagination (expensive on `inverter_history`, which grows unbounded
+forever now that there's no retention window — tens of millions of rows
+per year, across every `data_<year>.db`), the query fetches
 `limit + 1` rows and `has_more` is simply "did we get more than `limit`" —
 cheap regardless of table size, at the cost of not showing a total page
 count (just Prev/Next).
@@ -374,5 +417,9 @@ an empty `<table>`.
   diagnostic/rarely used) — the migration script and `main.py` insert code
   can carry over the same `str(...)` coercion used today and let SQLite's
   column affinity do the rest.
-- Making the retention window and prefetch schedule configurable via `.env`
-  — worth doing at implementation time, not a design-level decision.
+- Making the prefetch schedule configurable via `.env` — worth doing at
+  implementation time, not a design-level decision.
+- Detaching old year files from the long-lived write connection, or any
+  sharding finer than one file per year — not needed until the attach
+  count (max 125) becomes a real constraint, which is decades away at one
+  file per year.
