@@ -3,6 +3,7 @@ SQLite storage for inverter telemetry: raw per-sample history
 (inverter_history) and derived per-hour totals (hourly_summary).
 See docs/superpowers/specs/2026-08-27-sqlite-storage-design.md.
 """
+import json
 import sqlite3
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Optional, Tuple
@@ -55,6 +56,7 @@ _HOURLY_SUMMARY_COLUMNS = [
     ('inverter_temp_max', 'REAL'),
     ('battery_temp_min', 'REAL'),
     ('battery_temp_max', 'REAL'),
+    ('work_mode_breakdown', 'TEXT'),
 ]
 
 
@@ -247,6 +249,22 @@ def _hour_quality_stats(conn: sqlite3.Connection, start_epoch: int, end_epoch: i
     return dict(zip(_QUALITY_STAT_COLUMNS, row))
 
 
+def _hour_work_mode_breakdown(conn: sqlite3.Connection, start_epoch: int, end_epoch: int) -> Optional[str]:
+    """Returns a JSON object mapping each work_mode_label seen in the hour
+    to its sample count (e.g. '{"Normal (On-Grid)": 58, "Fault": 2}'), so a
+    brief fault doesn't get silently outvoted by a single majority-label
+    summary. None if the hour has no samples.
+    """
+    rows = conn.execute(
+        "SELECT work_mode_label, COUNT(*) FROM inverter_history "
+        "WHERE timestamp_epoch >= ? AND timestamp_epoch < ? GROUP BY work_mode_label",
+        (start_epoch, end_epoch),
+    ).fetchall()
+    if not rows:
+        return None
+    return json.dumps(dict(rows))
+
+
 def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
     """Derives hourly_summary rows from inverter_history for every hour that
     has data in the following hour (proving it's complete) and doesn't have
@@ -287,6 +305,7 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
             else:
                 metrics[target] = current[source] - previous[source]
         quality = _hour_quality_stats(conn, hour_start, hour_start + 3600)
+        work_mode_breakdown = _hour_work_mode_breakdown(conn, hour_start, hour_start + 3600)
         conn.execute(
             """
             INSERT OR REPLACE INTO hourly_summary
@@ -294,8 +313,9 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
                  battery_charge_kwh, battery_discharge_kwh, sample_count,
                  vgrid_min, vgrid_max, vgrid2_min, vgrid2_max, vgrid3_min, vgrid3_max,
                  fgrid_min, fgrid_max, fgrid2_min, fgrid2_max, fgrid3_min, fgrid3_max,
-                 inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max,
+                 work_mode_breakdown)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (hour_start, metrics['meter_export_kwh'], metrics['meter_import_kwh'], metrics['load_kwh'],
              metrics['pv_kwh'], metrics['battery_charge_kwh'], metrics['battery_discharge_kwh'],
@@ -305,7 +325,8 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
              quality['fgrid_min'], quality['fgrid_max'], quality['fgrid2_min'], quality['fgrid2_max'],
              quality['fgrid3_min'], quality['fgrid3_max'],
              quality['inverter_temp_min'], quality['inverter_temp_max'],
-             quality['battery_temp_min'], quality['battery_temp_max']),
+             quality['battery_temp_min'], quality['battery_temp_max'],
+             work_mode_breakdown),
         )
         conn.commit()
         backfilled += 1

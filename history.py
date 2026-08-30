@@ -36,6 +36,7 @@ HOURLY_COLUMNS = (
     'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
     'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
     'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
+    'work_mode_breakdown',
 )
 
 ALLOWED_LIMITS = (50, 100, 250, 500)

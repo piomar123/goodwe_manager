@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import tempfile
@@ -93,7 +94,8 @@ class StorageSyncTest(unittest.TestCase):
             for expected in ('sample_count',
                               'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
                               'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
-                              'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max'):
+                              'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
+                              'work_mode_breakdown'):
                 self.assertIn(expected, column_names)
             row = conn.execute("SELECT hour_start, meter_export_kwh FROM hourly_summary").fetchone()
             self.assertEqual(row, (12345, 1.5))
@@ -374,6 +376,20 @@ class BackfillHourlySummaryTest(unittest.TestCase):
             (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
         ).fetchone()
         self.assertEqual(row, (230.0, 230.0, None, None, None, None, 50.0, 50.0, None, None, None, None))
+
+    def test_records_work_mode_label_breakdown_as_json_sample_counts(self):
+        self._insert('2026-08-28 14:05:00', work_mode_label='Normal (On-Grid)')
+        self._insert('2026-08-28 14:15:00', work_mode_label='Normal (On-Grid)')
+        self._insert('2026-08-28 14:25:00', work_mode_label='Fault')
+        self._insert('2026-08-28 15:05:00')  # proves 14:00 is complete
+
+        storage.backfill_hourly_summary(self.conn)
+
+        row = self.conn.execute(
+            "SELECT work_mode_breakdown FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        self.assertEqual(json.loads(row[0]), {'Normal (On-Grid)': 2, 'Fault': 1})
 
 
 if __name__ == '__main__':
