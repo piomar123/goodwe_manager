@@ -29,7 +29,7 @@ import history
 import storage
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
-from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
+from rce import parse_date, plot_rce, setup_plot_style, get_rce_15min
 from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
 
 dotenv.load_dotenv()
@@ -405,7 +405,7 @@ def get_prices_json():
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     logger.debug(f'Serving RCE prices JSON for date: {date_yyyymmdd}')
-    rce = query_pse_rce_15min(date)
+    rce = get_rce_15min(date)
     return flask.jsonify({
         'date': date_yyyymmdd,
         'series': [{'time': time, 'price': price} for time, price in rce],
@@ -418,7 +418,7 @@ def get_prices_image():
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     logger.debug('Generating RCE prices images for date: {date_yyyymmdd}')
-    rce = query_pse_rce_15min(date)
+    rce = get_rce_15min(date)
     logger.debug(rce)
     fig = plot_rce(rce, date_yyyymmdd)
     output_io = io.BytesIO()
