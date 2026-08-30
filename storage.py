@@ -194,9 +194,24 @@ _HOURLY_METRIC_COLUMNS = [
 
 
 def find_hours_needing_backfill(conn: sqlite3.Connection) -> list:
+    """Every hour at or after the watermark (the last hour already
+    backfilled) is scanned for buckets, rather than the whole table, so this
+    stays cheap as inverter_history grows towards the retention window's
+    full 180 days - everything before the watermark is already backfilled
+    (with real values or documented NULLs) and will never need revisiting.
+    COALESCE(..., 0) makes a fresh/empty hourly_summary fall back to
+    scanning everything, matching the original full-table behavior for the
+    initial migration case. Uses the existing timestamp_epoch index for a
+    bounded range scan instead of a full-table DISTINCT.
+    """
     cursor = conn.execute("""
-        WITH buckets AS (
-            SELECT DISTINCT (timestamp_epoch / 3600) * 3600 AS bucket FROM inverter_history
+        WITH watermark AS (
+            SELECT COALESCE(MAX(hour_start), 0) AS start_epoch FROM hourly_summary
+        ),
+        buckets AS (
+            SELECT DISTINCT (timestamp_epoch / 3600) * 3600 AS bucket
+            FROM inverter_history, watermark
+            WHERE timestamp_epoch >= watermark.start_epoch
         )
         SELECT bucket FROM buckets b
         WHERE bucket NOT IN (SELECT hour_start FROM hourly_summary)

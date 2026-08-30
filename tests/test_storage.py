@@ -392,5 +392,52 @@ class BackfillHourlySummaryTest(unittest.TestCase):
         self.assertEqual(json.loads(row[0]), {'Normal (On-Grid)': 2, 'Fault': 1})
 
 
+class FindHoursNeedingBackfillTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.db_path)
+        self.conn = storage.init_db_sync(self.db_path, sensor_columns())
+
+    def tearDown(self):
+        self.conn.close()
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                os.remove(path)
+
+    def _insert(self, timestamp, **overrides):
+        storage.insert_sample_sync(self.conn, _sample_row(timestamp, **overrides))
+
+    def test_finds_a_multi_hour_gap_left_behind_by_a_long_service_outage(self):
+        # hour 10:00 was already backfilled a while ago (sets the watermark)
+        self._insert('2026-08-28 10:05:00')
+        self._insert('2026-08-28 11:05:00')  # proves 10:00 is complete
+        storage.backfill_hourly_summary(self.conn)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM hourly_summary").fetchone()[0], 1,
+        )
+
+        # the service was down; raw samples resume covering an untouched
+        # multi-hour span, none of which has a hourly_summary row yet
+        self._insert('2026-08-28 15:05:00')
+        self._insert('2026-08-28 16:05:00')
+        self._insert('2026-08-28 17:05:00')  # proves 16:00 is complete
+
+        needing_backfill = storage.find_hours_needing_backfill(self.conn)
+
+        self.assertEqual(needing_backfill, [
+            storage.parse_timestamp_epoch('2026-08-28 15:00:00'),
+            storage.parse_timestamp_epoch('2026-08-28 16:00:00'),
+        ])
+
+    def test_does_not_return_hours_already_backfilled(self):
+        self._insert('2026-08-28 10:05:00')
+        self._insert('2026-08-28 11:05:00')
+        storage.backfill_hourly_summary(self.conn)
+
+        self.assertEqual(storage.find_hours_needing_backfill(self.conn), [])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -50,14 +50,6 @@ dry_run = False
 EVERY_DAY = 0b1111111
 EVERY_DAY_STR = 'all'
 
-# storage.backfill_hourly_summary() is deliberately not run on every poll (a
-# crash right at the hour boundary would then mean it's never written, per
-# the design spec) - instead it runs once at startup (to catch up hours
-# completed while the service was down) and on this interval thereafter, so
-# hourly_summary keeps advancing for a service that stays up for weeks/months
-# without needing a restart.
-HOURLY_BACKFILL_INTERVAL_SECONDS = 300
-
 ForecastData = namedtuple('ForecastData', ('angle90_in_kWh', 'angle270_in_kWh', 'total_in_kWh'))
 
 
@@ -166,16 +158,21 @@ class AsyncioThread(threading.Thread):
         try:
             await self._seed_hour_start_baseline()
             await self._backfill_hourly_summary()
-            last_backfill = time.monotonic()
+            current_hour_start, _ = storage.current_hour_bounds(datetime.now())
             while True:
                 inverter_runtime = await self._inverter.read_runtime_data()
                 sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
                 await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
                 announcer.announce(json.dumps(sensors_data_with_calculated))
-                if time.monotonic() - last_backfill >= HOURLY_BACKFILL_INTERVAL_SECONDS:
+                new_hour_start, _ = storage.current_hour_bounds(datetime.now())
+                if new_hour_start != current_hour_start:
+                    # the wall clock just rolled into a new hour - the hour
+                    # that just ended now has a sample in the following
+                    # (current) hour, so it can be backfilled immediately,
+                    # rather than waiting on a fixed polling interval
+                    current_hour_start = new_hour_start
                     await self._backfill_hourly_summary()
-                    last_backfill = time.monotonic()
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
