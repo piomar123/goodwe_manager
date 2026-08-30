@@ -12,6 +12,8 @@ from matplotlib import rcParams
 from matplotlib.figure import Figure
 from matplotlib.ticker import FixedLocator
 
+import rce_storage
+
 ACCEPT_JSON_HEADER = {'Accept': 'application/json'}
 
 
@@ -66,11 +68,36 @@ def query_pse_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
     return convert_to_series_15min(data)
 
 
+def get_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
+    """Single read/write-through entry point for 15-minute RCE prices -
+    every other direct call to query_pse_rce_15min in this codebase has
+    been replaced with this function, so there's exactly one path into the
+    cache.
+
+    Cache hit (a marker row exists in rce_prices_fetched for this date):
+    reads rce_prices.db, no network call. Cache miss: calls the live
+    query_pse_rce_15min(), then INSERT OR REPLACEs the result into
+    rce_prices.db (both the price rows and the completeness marker)
+    before returning - so any live fetch, from whichever caller triggered
+    it, gets cached.
+    """
+    business_date = query_date.strftime('%Y-%m-%d')
+    conn = rce_storage.init_db()
+    try:
+        if rce_storage.is_cached(conn, business_date):
+            return rce_storage.get_cached_prices(conn, business_date)
+        series = query_pse_rce_15min(query_date)
+        rce_storage.store_prices(conn, business_date, series)
+        return series
+    finally:
+        conn.close()
+
+
 def query_pse_rce(query_date: datetime.date) -> list[tuple[str, float]]:
     """
-    Returns hourly RCE prices. To get 15-minute intervals use query_pse_rce_15min().
+    Returns hourly RCE prices. To get 15-minute intervals use get_rce_15min().
     """
-    rce_15min = query_pse_rce_15min(query_date)
+    rce_15min = get_rce_15min(query_date)
     # noinspection PyTypeChecker
     s = np.array_split(rce_15min, range(4, len(rce_15min), 4))
     return [(chunk[0][0].item(), np.mean([float(price) for _, price in chunk]).item()) for chunk in s]
@@ -94,7 +121,7 @@ def main():
 
     date_in = args.date or input("Date (or [t]oday, [y]esterday, [n]tomorrow): ")
     date = parse_date(date_in)
-    rce = query_pse_rce_15min(date)
+    rce = get_rce_15min(date)
     print(rce)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     fig = plot_rce(rce, date_yyyymmdd)
