@@ -193,7 +193,7 @@ _HOURLY_METRIC_COLUMNS = [
 ]
 
 
-def find_hours_needing_backfill(conn: sqlite3.Connection) -> list:
+def find_hours_needing_backfill(conn: sqlite3.Connection, full_rescan: bool = False) -> list:
     """Every hour at or after the watermark (the last hour already
     backfilled) is scanned for buckets, rather than the whole table, so this
     stays cheap as inverter_history grows towards the retention window's
@@ -203,11 +203,20 @@ def find_hours_needing_backfill(conn: sqlite3.Connection) -> list:
     scanning everything, matching the original full-table behavior for the
     initial migration case. Uses the existing timestamp_epoch index for a
     bounded range scan instead of a full-table DISTINCT.
+
+    full_rescan=True ignores the watermark and scans the whole table - for
+    one-off fixes where a gap sits *behind* the watermark and would
+    otherwise never be revisited: backdated data imported after the live
+    watermark already advanced past it, or a hourly_summary row manually
+    deleted to force a recompute (e.g. after an aggregation-logic change)
+    without also clearing every row after it.
     """
-    cursor = conn.execute("""
-        WITH watermark AS (
-            SELECT COALESCE(MAX(hour_start), 0) AS start_epoch FROM hourly_summary
-        ),
+    watermark_sql = (
+        "SELECT 0 AS start_epoch" if full_rescan
+        else "SELECT COALESCE(MAX(hour_start), 0) AS start_epoch FROM hourly_summary"
+    )
+    cursor = conn.execute(f"""
+        WITH watermark AS ({watermark_sql}),
         buckets AS (
             SELECT DISTINCT (timestamp_epoch / 3600) * 3600 AS bucket
             FROM inverter_history, watermark
@@ -280,7 +289,7 @@ def _hour_work_mode_breakdown(conn: sqlite3.Connection, start_epoch: int, end_ep
     return json.dumps(dict(rows))
 
 
-def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
+def backfill_hourly_summary(conn: sqlite3.Connection, full_rescan: bool = False) -> int:
     """Derives hourly_summary rows from inverter_history for every hour that
     has data in the following hour (proving it's complete) and doesn't have
     a hourly_summary row yet. If there's no data at all in the preceding
@@ -293,9 +302,13 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
     the hour whose start crosses a calendar-day boundary uses e_day's
     current-hour value alone rather than diffing against the previous
     (different day's) value.
+
+    full_rescan is passed straight through to find_hours_needing_backfill -
+    see its docstring for when a one-off full rescan is needed instead of
+    the normal watermark-bounded scan.
     """
     backfilled = 0
-    for hour_start in find_hours_needing_backfill(conn):
+    for hour_start in find_hours_needing_backfill(conn, full_rescan=full_rescan):
         current = _max_counters(conn, hour_start, hour_start + 3600)
         previous = _max_counters(conn, hour_start - 3600, hour_start)
         # fromtimestamp() (no tzinfo) uses the host's local timezone, the

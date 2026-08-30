@@ -290,6 +290,29 @@ class BackfillHourlySummaryTest(unittest.TestCase):
 
         self.assertEqual(second_run_count, 0)
 
+    def test_full_rescan_recomputes_a_manually_deleted_hour_behind_the_watermark(self):
+        self._insert('2026-08-28 09:05:00', meter_e_total_exp='99.0')  # baseline for the diff
+        self._insert('2026-08-28 10:05:00', meter_e_total_exp='100.0')
+        self._insert('2026-08-28 11:05:00', meter_e_total_exp='101.0')
+        storage.backfill_hourly_summary(self.conn)
+        self._insert('2026-08-28 14:05:00', meter_e_total_exp='110.0')
+        self._insert('2026-08-28 15:05:00', meter_e_total_exp='112.0')
+        storage.backfill_hourly_summary(self.conn)  # advances the watermark past 10:00
+        self.conn.execute(
+            "DELETE FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 10:00:00'),),
+        )
+        self.conn.commit()
+
+        backfilled = storage.backfill_hourly_summary(self.conn, full_rescan=True)
+
+        self.assertEqual(backfilled, 1)
+        row = self.conn.execute(
+            "SELECT meter_export_kwh FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 10:00:00'),),
+        ).fetchone()
+        self.assertEqual(row[0], 1.0)
+
     def test_pv_kwh_does_not_go_negative_across_midnight(self):
         # e_day resets to 0 right after local midnight (confirmed against
         # real device data), unlike the other lifetime counters - so the
@@ -437,6 +460,34 @@ class FindHoursNeedingBackfillTest(unittest.TestCase):
         storage.backfill_hourly_summary(self.conn)
 
         self.assertEqual(storage.find_hours_needing_backfill(self.conn), [])
+
+    def test_full_rescan_finds_a_gap_left_behind_the_watermark(self):
+        # hour 10:00 backfilled normally - sets the watermark ahead of it
+        self._insert('2026-08-28 10:05:00')
+        self._insert('2026-08-28 11:05:00')
+        storage.backfill_hourly_summary(self.conn)
+        # a later hour is also backfilled, moving the watermark further still
+        self._insert('2026-08-28 14:05:00')
+        self._insert('2026-08-28 15:05:00')
+        storage.backfill_hourly_summary(self.conn)
+
+        # simulate a manual fix: an old, already-processed hour's row is
+        # deleted so it can be recomputed, but nothing after it is touched -
+        # the watermark still sits at 14:00
+        self.conn.execute(
+            "DELETE FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 10:00:00'),),
+        )
+        self.conn.commit()
+
+        # the bounded (default) scan can no longer see it - it's before the watermark
+        self.assertEqual(storage.find_hours_needing_backfill(self.conn), [])
+
+        # but a full rescan still finds it
+        self.assertEqual(
+            storage.find_hours_needing_backfill(self.conn, full_rescan=True),
+            [storage.parse_timestamp_epoch('2026-08-28 10:00:00')],
+        )
 
 
 if __name__ == '__main__':
