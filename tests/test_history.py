@@ -207,7 +207,7 @@ class FetchHourlyRowsTest(unittest.TestCase):
         rows, _ = history.fetch_hourly_rows(self.conn, start, end, limit=10, offset=0)
         self.assertEqual(rows[0]['hour_start'], '2026-08-27 13:00')
 
-    def test_returns_all_seven_columns(self):
+    def test_returns_all_hourly_columns(self):
         self._insert_hourly('2026-08-27 13:00:00')
         start, end = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 27))
         rows, _ = history.fetch_hourly_rows(self.conn, start, end, limit=10, offset=0)

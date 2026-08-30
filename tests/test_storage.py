@@ -63,6 +63,45 @@ class StorageSyncTest(unittest.TestCase):
                 if os.path.exists(path):
                     os.remove(path)
 
+    def test_init_db_sync_adds_new_hourly_summary_columns_to_an_existing_table(self):
+        fd, small_db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(small_db_path)
+        try:
+            conn = sqlite3.connect(small_db_path)
+            conn.execute("""
+                CREATE TABLE hourly_summary (
+                    hour_start INTEGER PRIMARY KEY,
+                    meter_export_kwh REAL,
+                    meter_import_kwh REAL,
+                    load_kwh REAL,
+                    pv_kwh REAL,
+                    battery_charge_kwh REAL,
+                    battery_discharge_kwh REAL
+                )
+            """)
+            conn.execute(
+                "INSERT INTO hourly_summary (hour_start, meter_export_kwh) VALUES (?, ?)",
+                (12345, 1.5),
+            )
+            conn.commit()
+            conn.close()
+
+            conn = storage.init_db_sync(small_db_path, sensor_columns())
+
+            column_names = {row[1] for row in conn.execute("PRAGMA table_info(hourly_summary)")}
+            for expected in ('sample_count', 'vgrid_min', 'vgrid_max', 'fgrid_min', 'fgrid_max',
+                              'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max'):
+                self.assertIn(expected, column_names)
+            row = conn.execute("SELECT hour_start, meter_export_kwh FROM hourly_summary").fetchone()
+            self.assertEqual(row, (12345, 1.5))
+            conn.close()
+        finally:
+            for suffix in ('', '-wal', '-shm'):
+                path = small_db_path + suffix
+                if os.path.exists(path):
+                    os.remove(path)
+
     def test_insert_and_read_back_a_sample(self):
         row = _sample_row('2026-08-28 14:05:00', ppv='1234.5', battery_soc='87')
 
@@ -289,6 +328,42 @@ class BackfillHourlySummaryTest(unittest.TestCase):
         # only battery_charge_kwh (sourced from the NULL column) is None;
         # every other metric still computes normally for that hour
         self.assertEqual(row, (3.0, 1.0, 4.0, 4.0, None, 1.0))
+
+    def test_computes_sample_count_and_quality_stats_for_the_hour(self):
+        # hour 14:00 - two samples with distinct grid/temperature readings
+        self._insert('2026-08-28 14:05:00', vgrid='229.5', vgrid2='230.1', vgrid3='228.9',
+                     fgrid='49.98', fgrid2='50.01', fgrid3='49.95',
+                     temperature='42.0', battery_temperature='28.0')
+        self._insert('2026-08-28 14:35:00', vgrid='231.0', vgrid2='229.0', vgrid3='230.5',
+                     fgrid='50.05', fgrid2='49.90', fgrid3='50.02',
+                     temperature='45.5', battery_temperature='29.5')
+        # hour 15:00 - proves 14:00 is complete
+        self._insert('2026-08-28 15:05:00')
+
+        storage.backfill_hourly_summary(self.conn)
+
+        row = self.conn.execute(
+            "SELECT sample_count, vgrid_min, vgrid_max, fgrid_min, fgrid_max, "
+            "inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max "
+            "FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        self.assertEqual(row, (2, 228.9, 231.0, 49.90, 50.05, 42.0, 45.5, 28.0, 29.5))
+
+    def test_quality_stats_fall_back_to_a_single_phase_when_other_phases_are_null(self):
+        # single-phase-style sample: only vgrid/fgrid populated, phases 2/3 NULL
+        self._insert('2026-08-28 14:05:00', vgrid='230.0', vgrid2=None, vgrid3=None,
+                     fgrid='50.0', fgrid2=None, fgrid3=None)
+        self._insert('2026-08-28 15:05:00')  # proves 14:00 is complete
+
+        storage.backfill_hourly_summary(self.conn)
+
+        row = self.conn.execute(
+            "SELECT vgrid_min, vgrid_max, fgrid_min, fgrid_max "
+            "FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        self.assertEqual(row, (230.0, 230.0, 50.0, 50.0))
 
 
 if __name__ == '__main__':

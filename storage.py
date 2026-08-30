@@ -31,6 +31,25 @@ def _column_ddl(columns: Iterable[Tuple[str, str]]) -> str:
     return ',\n            '.join(f'{name} {sql_type}' for name, sql_type in columns)
 
 
+_HOURLY_SUMMARY_COLUMNS = [
+    ('meter_export_kwh', 'REAL'),
+    ('meter_import_kwh', 'REAL'),
+    ('load_kwh', 'REAL'),
+    ('pv_kwh', 'REAL'),
+    ('battery_charge_kwh', 'REAL'),
+    ('battery_discharge_kwh', 'REAL'),
+    ('sample_count', 'INTEGER'),
+    ('vgrid_min', 'REAL'),
+    ('vgrid_max', 'REAL'),
+    ('fgrid_min', 'REAL'),
+    ('fgrid_max', 'REAL'),
+    ('inverter_temp_min', 'REAL'),
+    ('inverter_temp_max', 'REAL'),
+    ('battery_temp_min', 'REAL'),
+    ('battery_temp_max', 'REAL'),
+]
+
+
 def build_ddl_statements(columns: list) -> list:
     return [
         "PRAGMA journal_mode = WAL",
@@ -44,15 +63,10 @@ def build_ddl_statements(columns: list) -> list:
         """,
         "CREATE INDEX IF NOT EXISTS idx_inverter_history_timestamp_epoch "
         "ON inverter_history (timestamp_epoch)",
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS hourly_summary (
             hour_start INTEGER PRIMARY KEY,
-            meter_export_kwh REAL,
-            meter_import_kwh REAL,
-            load_kwh REAL,
-            pv_kwh REAL,
-            battery_charge_kwh REAL,
-            battery_discharge_kwh REAL
+            {_column_ddl(_HOURLY_SUMMARY_COLUMNS)}
         )
         """,
     ]
@@ -66,30 +80,31 @@ def _missing_columns(existing_column_names: Iterable[str], columns: list) -> lis
     return [(name, sql_type) for name, sql_type in columns if name not in existing]
 
 
-def _reconcile_columns_sync(conn: sqlite3.Connection, columns: list) -> None:
-    """Adds any column present in `columns` but missing from the existing
-    inverter_history table (e.g. after SELECTED_SENSORS grows), so an
-    existing data.db doesn't start raising 'no such column' on every insert.
-    CREATE TABLE IF NOT EXISTS alone can't do this, since it's a no-op once
-    the table already exists.
+def _reconcile_table_columns_sync(conn: sqlite3.Connection, table: str, columns: list) -> None:
+    """Adds any column present in `columns` but missing from `table` (e.g.
+    after SELECTED_SENSORS grows, or hourly_summary gains a new derived
+    metric), so an existing data.db doesn't start raising 'no such column'
+    on every insert. CREATE TABLE IF NOT EXISTS alone can't do this, since
+    it's a no-op once the table already exists.
     """
-    existing = [row[1] for row in conn.execute("PRAGMA table_info(inverter_history)")]
+    existing = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
     for name, sql_type in _missing_columns(existing, columns):
-        conn.execute(f"ALTER TABLE inverter_history ADD COLUMN {name} {sql_type}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
-async def _reconcile_columns_async(conn: aiosqlite.Connection, columns: list) -> None:
-    cursor = await conn.execute("PRAGMA table_info(inverter_history)")
+async def _reconcile_table_columns_async(conn: aiosqlite.Connection, table: str, columns: list) -> None:
+    cursor = await conn.execute(f"PRAGMA table_info({table})")
     existing = [row[1] for row in await cursor.fetchall()]
     for name, sql_type in _missing_columns(existing, columns):
-        await conn.execute(f"ALTER TABLE inverter_history ADD COLUMN {name} {sql_type}")
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 def init_db_sync(path: str, columns: list) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     for statement in build_ddl_statements(columns):
         conn.execute(statement)
-    _reconcile_columns_sync(conn, columns)
+    _reconcile_table_columns_sync(conn, 'inverter_history', columns)
+    _reconcile_table_columns_sync(conn, 'hourly_summary', _HOURLY_SUMMARY_COLUMNS)
     conn.commit()
     return conn
 
@@ -98,7 +113,8 @@ async def init_db_async(path: str, columns: list) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(path)
     for statement in build_ddl_statements(columns):
         await conn.execute(statement)
-    await _reconcile_columns_async(conn, columns)
+    await _reconcile_table_columns_async(conn, 'inverter_history', columns)
+    await _reconcile_table_columns_async(conn, 'hourly_summary', _HOURLY_SUMMARY_COLUMNS)
     await conn.commit()
     return conn
 
@@ -192,6 +208,38 @@ def _max_counters(conn: sqlite3.Connection, start_epoch: int, end_epoch: int) ->
     return dict(zip(source_columns, row))
 
 
+_QUALITY_STAT_COLUMNS = [
+    'sample_count', 'vgrid_min', 'vgrid_max', 'fgrid_min', 'fgrid_max',
+    'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
+]
+
+# Scalar MIN/MAX(a, b, c) picks the smallest/largest of the three phase
+# readings on a single row; the outer aggregate MIN/MAX then finds the
+# extreme across all rows in the hour. COALESCE falls back to phase 1 when
+# phases 2/3 are NULL (single-phase inverters), so a bare scalar MIN/MAX
+# doesn't propagate NULL and blank out the whole hour.
+_QUALITY_STATS_QUERY = """
+    SELECT COUNT(*),
+        MIN(MIN(vgrid, COALESCE(vgrid2, vgrid), COALESCE(vgrid3, vgrid))),
+        MAX(MAX(vgrid, COALESCE(vgrid2, vgrid), COALESCE(vgrid3, vgrid))),
+        MIN(MIN(fgrid, COALESCE(fgrid2, fgrid), COALESCE(fgrid3, fgrid))),
+        MAX(MAX(fgrid, COALESCE(fgrid2, fgrid), COALESCE(fgrid3, fgrid))),
+        MIN(temperature), MAX(temperature),
+        MIN(battery_temperature), MAX(battery_temperature)
+    FROM inverter_history WHERE timestamp_epoch >= ? AND timestamp_epoch < ?
+"""
+
+
+def _hour_quality_stats(conn: sqlite3.Connection, start_epoch: int, end_epoch: int) -> dict:
+    """Returns sample_count plus per-hour min/max grid-quality and
+    temperature stats. Unlike _max_counters, these aren't diffed against
+    the previous hour - they're computed directly over the hour's own
+    samples, so they're available even for an hour with no usable baseline.
+    """
+    row = conn.execute(_QUALITY_STATS_QUERY, (start_epoch, end_epoch)).fetchone()
+    return dict(zip(_QUALITY_STAT_COLUMNS, row))
+
+
 def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
     """Derives hourly_summary rows from inverter_history for every hour that
     has data in the following hour (proving it's complete) and doesn't have
@@ -231,15 +279,21 @@ def backfill_hourly_summary(conn: sqlite3.Connection) -> int:
                 metrics[target] = None
             else:
                 metrics[target] = current[source] - previous[source]
+        quality = _hour_quality_stats(conn, hour_start, hour_start + 3600)
         conn.execute(
             """
             INSERT OR REPLACE INTO hourly_summary
                 (hour_start, meter_export_kwh, meter_import_kwh, load_kwh, pv_kwh,
-                 battery_charge_kwh, battery_discharge_kwh)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 battery_charge_kwh, battery_discharge_kwh, sample_count,
+                 vgrid_min, vgrid_max, fgrid_min, fgrid_max,
+                 inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (hour_start, metrics['meter_export_kwh'], metrics['meter_import_kwh'], metrics['load_kwh'],
-             metrics['pv_kwh'], metrics['battery_charge_kwh'], metrics['battery_discharge_kwh']),
+             metrics['pv_kwh'], metrics['battery_charge_kwh'], metrics['battery_discharge_kwh'],
+             quality['sample_count'], quality['vgrid_min'], quality['vgrid_max'],
+             quality['fgrid_min'], quality['fgrid_max'], quality['inverter_temp_min'],
+             quality['inverter_temp_max'], quality['battery_temp_min'], quality['battery_temp_max']),
         )
         conn.commit()
         backfilled += 1
