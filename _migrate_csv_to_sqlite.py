@@ -108,6 +108,28 @@ def _pending_starting_max_id(conn: sqlite3.Connection, filename: str) -> Optiona
     return row[0] if row else None
 
 
+def _row_epoch_if_usable(row: dict) -> Optional[int]:
+    """Returns the row's parsed timestamp_epoch if every REQUIRED_COLUMNS
+    value is present and usable, else None. A process killed mid-write
+    (SIGKILL/OOM/power loss) leaves its CSV file's last row truncated and
+    zero-padded by the filesystem, rather than a clean row - real examples
+    from this codebase's own data: a run of NUL bytes with no delimiters at
+    all (landing entirely in the 'timestamp' field, every other field
+    defaulting to None), or a line cut short mid-field (DictReader's
+    restval default fills the missing trailing fields with None too).
+    Skipping just that one row recovers everything else in the file,
+    instead of discarding an otherwise-complete file over its last line.
+    """
+    try:
+        epoch = storage.parse_timestamp_epoch(row['timestamp'])
+        float(row['meter_e_total_exp'])
+        float(row['meter_e_total_imp'])
+        float(row['e_load_total'])
+        return epoch
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str:
     filename = csv_path.name
     if already_migrated(conn, filename):
@@ -123,7 +145,17 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
             return 'skipped'
 
         if dry_run:
-            row_count = sum(1 for _ in reader)
+            row_count = 0
+            row_iter = iter(reader)
+            while True:
+                try:
+                    row = next(row_iter)
+                except StopIteration:
+                    break
+                except csv.Error:
+                    continue
+                if _row_epoch_if_usable(row) is not None:
+                    row_count += 1
             if row_count == 0:
                 logger.warning(f"Skipping {filename}: empty or missing required columns")
                 return 'skipped'
@@ -141,16 +173,36 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
             _delete_rows_from(conn, stale_starting_max_id)
 
         row_count = 0
-        first_row = None
-        last_row = None
+        min_epoch = None
+        max_epoch = None
+        min_row = None
+        max_row = None
         chunk = []
         try:
             starting_max_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM inverter_history").fetchone()[0]
             _mark_pending(conn, filename, starting_max_id)
-            for row in reader:
-                if first_row is None:
-                    first_row = row
-                last_row = row
+            # driven manually rather than `for row in reader` - a
+            # truncated/corrupted line (see _row_epoch_if_usable) can make
+            # the underlying csv module itself raise mid-iteration (e.g.
+            # "line contains NUL"), which a plain for-loop can't recover
+            # from and continue past
+            row_iter = iter(reader)
+            while True:
+                try:
+                    row = next(row_iter)
+                except StopIteration:
+                    break
+                except csv.Error as e:
+                    logger.warning(f"{filename}: skipping malformed line: {e}")
+                    continue
+                epoch = _row_epoch_if_usable(row)
+                if epoch is None:
+                    logger.warning(f"{filename}: skipping malformed row (likely a truncated trailing write)")
+                    continue
+                if min_epoch is None or epoch < min_epoch:
+                    min_epoch, min_row = epoch, row
+                if max_epoch is None or epoch > max_epoch:
+                    max_epoch, max_row = epoch, row
                 chunk.append({k: v for k, v in row.items() if k in valid_columns})
                 row_count += 1
                 if len(chunk) >= _MIGRATION_CHUNK_SIZE:
@@ -178,28 +230,30 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
         logger.warning(f"Skipping {filename}: empty or missing required columns")
         return 'skipped'
 
-    epoch_first = storage.parse_timestamp_epoch(first_row['timestamp'])
-    epoch_last = storage.parse_timestamp_epoch(last_row['timestamp'])
-    range_start, range_end = min(epoch_first, epoch_last), max(epoch_first, epoch_last)
+    # min_epoch/max_epoch are the true extremes across every usable row,
+    # not just the first/last row in file order - a mid-file clock jump
+    # (confirmed against real data from this codebase's own migration) can
+    # otherwise put an earlier or later timestamp somewhere in the middle,
+    # which a first-row/last-row range would silently miss and undercount
     db_row_count = conn.execute(
         "SELECT COUNT(*) FROM inverter_history WHERE timestamp_epoch BETWEEN ? AND ?",
-        (range_start, range_end),
+        (min_epoch, max_epoch),
     ).fetchone()[0]
 
     first_row_db = conn.execute(
         "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
-        (first_row['timestamp'],),
+        (min_row['timestamp'],),
     ).fetchone()
     last_row_db = conn.execute(
         "SELECT meter_e_total_exp FROM inverter_history WHERE timestamp = ? ORDER BY id DESC LIMIT 1",
-        (last_row['timestamp'],),
+        (max_row['timestamp'],),
     ).fetchone()
     verified = (
         db_row_count == row_count
         and first_row_db is not None
-        and str(first_row_db[0]) == str(float(first_row['meter_e_total_exp']))
+        and str(first_row_db[0]) == str(float(min_row['meter_e_total_exp']))
         and last_row_db is not None
-        and str(last_row_db[0]) == str(float(last_row['meter_e_total_exp']))
+        and str(last_row_db[0]) == str(float(max_row['meter_e_total_exp']))
     )
 
     if verified:

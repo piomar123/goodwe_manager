@@ -46,6 +46,67 @@ class MigrateCsvToSqliteTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(log_status, ('done', 2))
 
+    def test_skips_a_single_malformed_trailing_row_instead_of_the_whole_file(self):
+        # simulates a process killed mid-write: a truncated final row,
+        # zero-padded by the filesystem - null bytes with no delimiters at
+        # all, so csv.DictReader maps the whole blob to the 'timestamp'
+        # field and leaves every other field None
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   HEADER +
+                                   '2026-08-28 09:00:00,100.0,1.0,0.5,0.1\n'
+                                   '2026-08-28 09:00:01,101.0,1.1,0.5,0.2\n' +
+                                   '\x00' * 200)
+
+        status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
+
+        self.assertEqual(status, 'done')
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 2)
+        log_status = self.conn.execute(
+            "SELECT status, row_count FROM csv_migration_log WHERE filename = ?",
+            (csv_path.name,),
+        ).fetchone()
+        self.assertEqual(log_status, ('done', 2))
+
+    def test_skips_a_row_with_a_missing_required_value(self):
+        # a truncated row can also land mid-line rather than as pure nulls -
+        # fewer fields than the header, so DictReader fills the rest with
+        # None (its restval default) rather than raising
+        csv_path = self._write_csv('data-2026-08-28_09-30-00.csv',
+                                   HEADER +
+                                   '2026-08-28 09:30:00,100.0,1.0,0.5,0.1\n'
+                                   '2026-08-28 09:30:01,101.0\n')
+
+        status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
+
+        self.assertEqual(status, 'done')
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_all_rows_malformed_is_treated_as_skipped(self):
+        csv_path = self._write_csv('data-2026-08-28_09-45-00.csv', HEADER + '\x00' * 200)
+
+        status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
+
+        self.assertEqual(status, 'skipped')
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_verification_uses_true_min_max_not_first_last_row_order(self):
+        # rows out of chronological order (e.g. a mid-file clock jump) -
+        # the *last* row written is not the latest timestamp
+        csv_path = self._write_csv('data-2026-08-28_09-50-00.csv',
+                                   HEADER +
+                                   '2026-08-28 09:52:00,100.0,3.0,0.5,0.1\n'
+                                   '2026-08-28 09:50:00,101.0,1.0,0.5,0.2\n'
+                                   '2026-08-28 09:51:00,102.0,2.0,0.5,0.3\n')
+
+        status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
+
+        self.assertEqual(status, 'done')
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 3)
+
     def test_skips_an_empty_file(self):
         csv_path = self._write_csv('data-2026-08-28_11-00-00.csv', '')
 
