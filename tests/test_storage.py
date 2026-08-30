@@ -119,6 +119,49 @@ class StorageSyncTest(unittest.TestCase):
         roundtrip = datetime.fromtimestamp(result[2]).strftime('%Y-%m-%d %H:%M:%S')
         self.assertEqual(roundtrip, '2026-08-28 14:05:00')
 
+    def test_insert_samples_batch_inserts_every_row(self):
+        rows = [
+            _sample_row('2026-08-28 14:05:00', ppv='1234.5', battery_soc='87'),
+            _sample_row('2026-08-28 14:06:00', ppv='1300.0', battery_soc='88'),
+        ]
+
+        storage.insert_samples_batch(self.conn, rows)
+
+        result = self.conn.execute(
+            "SELECT ppv, battery_soc FROM inverter_history ORDER BY timestamp_epoch"
+        ).fetchall()
+        self.assertEqual(result, [(1234.5, 87.0), (1300.0, 88.0)])
+
+    def test_insert_samples_batch_computes_timestamp_epoch_per_row(self):
+        rows = [
+            _sample_row('2026-08-28 14:05:00'),
+            _sample_row('2026-08-28 15:05:00'),
+        ]
+
+        storage.insert_samples_batch(self.conn, rows)
+
+        epochs = [row[0] for row in self.conn.execute(
+            "SELECT timestamp_epoch FROM inverter_history ORDER BY timestamp_epoch"
+        ).fetchall()]
+        self.assertEqual(epochs[1] - epochs[0], 3600)
+
+    def test_insert_samples_batch_does_nothing_for_an_empty_list(self):
+        storage.insert_samples_batch(self.conn, [])
+
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_insert_samples_batch_respects_commit_false(self):
+        storage.insert_samples_batch(self.conn, [_sample_row('2026-08-28 14:05:00')], commit=False)
+
+        # a fresh connection to the same file sees nothing until a commit happens
+        other_conn = sqlite3.connect(self.db_path)
+        try:
+            count = other_conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+            self.assertEqual(count, 0)
+        finally:
+            other_conn.close()
+
     def test_get_current_hour_start_sample_returns_none_when_empty(self):
         start, end = storage.current_hour_bounds(datetime(2026, 8, 28, 14, 37, 0))
 

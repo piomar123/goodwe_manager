@@ -149,6 +149,29 @@ def insert_sample_sync(conn: sqlite3.Connection, row: Mapping[str, Any], commit:
         conn.commit()
 
 
+def insert_samples_batch(conn: sqlite3.Connection, rows: Iterable[Mapping[str, Any]], commit: bool = True) -> None:
+    """Bulk equivalent of insert_sample_sync(), for callers inserting many
+    rows at once (e.g. CSV migration) rather than one sample per call. The
+    per-row path is fine for live polling (~1 row/second), but at millions
+    of rows its per-call SQL-string rebuild and Python-level loop overhead
+    dominates - conn.executemany() with a single precomputed SQL string
+    avoids both by preparing the statement once.
+
+    Every row must have the same set of keys (true for rows read from a
+    single CSV file's DictReader) - the column list is taken from the first
+    row only. A no-op for an empty `rows`.
+    """
+    rows = list(rows)
+    if not rows:
+        return
+    column_names = list(_row_with_epoch(rows[0]).keys())
+    sql = _insert_sql(column_names)
+    params = [[full_row[c] for c in column_names] for full_row in (_row_with_epoch(row) for row in rows)]
+    conn.executemany(sql, params)
+    if commit:
+        conn.commit()
+
+
 async def insert_sample_async(conn: aiosqlite.Connection, row: Mapping[str, Any]) -> None:
     full_row = _row_with_epoch(row)
     column_names = list(full_row.keys())

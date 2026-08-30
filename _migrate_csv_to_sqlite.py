@@ -76,14 +76,17 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
         return 'dry-run'
 
     valid_columns = {name for name, _ in sensor_columns()}
-    inserted = 0
+    filtered_rows = [{k: v for k, v in row.items() if k in valid_columns} for row in rows]
     try:
-        for row in rows:
-            filtered_row = {k: v for k, v in row.items() if k in valid_columns}
-            storage.insert_sample_sync(conn, filtered_row, commit=False)
-            inserted += 1
+        # insert_samples_batch() (a single executemany()) rather than a
+        # per-row insert_sample_sync() loop - at the row counts this script
+        # deals with (real-world runs have migrated 10M+ rows), the per-row
+        # path's repeated SQL-string rebuild and Python loop overhead
+        # dominate; batching cut a real migration run from a CPU-bound
+        # multi-hour crawl to a fraction of that.
+        storage.insert_samples_batch(conn, filtered_rows, commit=False)
     except sqlite3.Error as e:
-        logger.error(f"{filename}: insert failed after {inserted}/{len(rows)} rows: {e}")
+        logger.error(f"{filename}: batch insert failed: {e}")
         try:
             conn.rollback()
         except sqlite3.Error:
@@ -128,7 +131,7 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     if verified:
         conn.commit()
         status = 'done'
-        logger.info(f"{filename}: imported and verified {inserted} rows")
+        logger.info(f"{filename}: imported and verified {len(rows)} rows")
     else:
         conn.rollback()
         status = 'error'
