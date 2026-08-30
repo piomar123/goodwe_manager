@@ -76,21 +76,28 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
         return 'dry-run'
 
     valid_columns = {name for name, _ in sensor_columns()}
-    # a generator, not a list comprehension - `rows` itself is already a
-    # full list held for verification below, so a second fully-materialized
-    # copy here would double peak memory for no reason; insert_samples_batch
-    # consumes this lazily in bounded chunks anyway
-    filtered_rows = ({k: v for k, v in row.items() if k in valid_columns} for row in rows)
+    # Deliberately NOT storage.insert_samples_batch() here, despite the
+    # per-row loop's real CPU cost (see storage.py's insert_sample_sync
+    # docstring) - migrate_file() already holds the whole file's `rows`
+    # list in memory for the verification step below, and defers a single
+    # commit until the file's end. On the Raspberry Pi this script actually
+    # runs on (3.7GB RAM), that combination plus insert_samples_batch's
+    # per-chunk parameter lists drove RSS to 2.3-3.3GB and exhausted swap on
+    # this codebase's largest real files (~300k rows/200MB+), twice,
+    # reproduced live during an actual migration run - a real OOM risk to
+    # the box's other running services. The per-row loop's smaller,
+    # continuously-garbage-collected working set is the safer choice for
+    # this hardware; revisit only alongside also bounding `rows`/verification
+    # memory (e.g. per-chunk commits + streaming verification), not in
+    # isolation.
+    inserted = 0
     try:
-        # insert_samples_batch() (a single executemany()) rather than a
-        # per-row insert_sample_sync() loop - at the row counts this script
-        # deals with (real-world runs have migrated 10M+ rows), the per-row
-        # path's repeated SQL-string rebuild and Python loop overhead
-        # dominate; batching cut a real migration run from a CPU-bound
-        # multi-hour crawl to a fraction of that.
-        storage.insert_samples_batch(conn, filtered_rows, commit=False)
+        for row in rows:
+            filtered_row = {k: v for k, v in row.items() if k in valid_columns}
+            storage.insert_sample_sync(conn, filtered_row, commit=False)
+            inserted += 1
     except sqlite3.Error as e:
-        logger.error(f"{filename}: batch insert failed: {e}")
+        logger.error(f"{filename}: insert failed after {inserted}/{len(rows)} rows: {e}")
         try:
             conn.rollback()
         except sqlite3.Error:
@@ -135,7 +142,7 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     if verified:
         conn.commit()
         status = 'done'
-        logger.info(f"{filename}: imported and verified {len(rows)} rows")
+        logger.info(f"{filename}: imported and verified {inserted} rows")
     else:
         conn.rollback()
         status = 'error'
