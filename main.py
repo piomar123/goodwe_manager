@@ -1,11 +1,11 @@
 import asyncio
 import concurrent.futures
-import csv
 import io
 import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -15,6 +15,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, Any, Mapping
 
+import aiosqlite
 import dotenv
 import flask
 import goodwe
@@ -24,8 +25,12 @@ from goodwe.sensor import EcoModeV2
 
 import eco_encoder
 import forecast
+import history
+import storage
 from announcer import MessageAnnouncer
+from error_logging import install_uncaught_exception_logging
 from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
+from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
 
 dotenv.load_dotenv()
 INVERTER_IP = os.environ.get('INVERTER_IP')
@@ -44,147 +49,14 @@ dry_run = False
 
 EVERY_DAY = 0b1111111
 EVERY_DAY_STR = 'all'
-SELECTED_SENSORS = [
-    'timestamp',
-    'ppv',
-    'ppv1',
-    'ppv2',
-    'vpv1',
-    'vpv2',
-    'ipv1',
-    'ipv2',
-    'pv1_mode_label',
-    'pv2_mode_label',
-    'function_bit',
-    'bus_voltage',
-    'nbus_voltage',
-    'operation_mode',
-    'pgrid',
-    'pgrid2',
-    'pgrid3',
-    'vgrid',
-    'igrid',
-    'fgrid',
-    'vgrid2',
-    'igrid2',
-    'fgrid2',
-    'vgrid3',
-    'igrid3',
-    'fgrid3',
-    'meter_freq',
-    'grid_mode',
-    'grid_mode_label',
-    'grid_in_out',
-    'grid_in_out_label',
-    'total_inverter_power',
-    'active_power',
-    'reactive_power',
-    'apparent_power',
-    'load_mode1',
-    'load_mode2',
-    'load_mode3',
-    'load_p1',
-    'load_p2',
-    'load_p3',
-    'load_ptotal',
-    'house_consumption',
-    'active_power1',
-    'active_power2',
-    'active_power3',
-    'active_power_total',
-    'reactive_power_total',
-    'meter_active_power1',
-    'meter_active_power2',
-    'meter_active_power3',
-    'meter_active_power_total',
-    'meter_reactive_power1',
-    'meter_reactive_power2',
-    'meter_reactive_power3',
-    'meter_reactive_power_total',
-    'meter_apparent_power1',
-    'meter_apparent_power2',
-    'meter_apparent_power3',
-    'meter_apparent_power_total',
-    'meter_power_factor1',
-    'meter_power_factor2',
-    'meter_power_factor3',
-    'meter_power_factor',
-    'meter_type',
-    'backup_p1',
-    'backup_p2',
-    'backup_p3',
-    'backup_ptotal',
-    'backup_v1',
-    'backup_v2',
-    'backup_v3',
-    'backup_i1',
-    'backup_i2',
-    'backup_i3',
-    'backup_f1',
-    'backup_f2',
-    'backup_f3',
-    'ups_load',
-    'temperature_air',
-    'temperature',
-    'vbattery1',
-    'ibattery1',
-    'pbattery1',
-    'battery_mode_label',
-    'battery_temperature',
-    'battery_soc',
-    'battery_charge_limit',
-    'battery_discharge_limit',
-    'battery_error',
-    'battery_warning',
-    'warning_code',
-    'diagnose_result_label',
-    'error_codes',
-    'errors',
-    'e_total_exp',
-    'e_total_imp',
-    'e_day',  # today PV production
-    'e_load_total',
-    'meter_e_total_exp',
-    'meter_e_total_imp',
-    'e_bat_charge_total',
-    'e_bat_discharge_total',
-    'work_mode_label',
-    'rssi',
-]
 
 ForecastData = namedtuple('ForecastData', ('angle90_in_kWh', 'angle270_in_kWh', 'total_in_kWh'))
-
-
-class CalculatedValuesEvaluator:
-    _hour_start_sensors = None
-
-    def calculate_values(self, sensors_data: Mapping[str, Any]) -> dict[str, Any]:
-        if self._hour_start_sensors is None or sensors_data['timestamp'][:13] != self._hour_start_sensors['timestamp'][
-                                                                                 :13]:
-            self._hour_start_sensors = sensors_data
-        calculated_values = {
-            '_hour_start_timestamp': self._hour_start_sensors['timestamp'],
-            '_hourly_meter_export': f"{float(sensors_data['meter_e_total_exp']) - float(self._hour_start_sensors['meter_e_total_exp']):.2f}",
-            '_hourly_meter_import': f"{float(sensors_data['meter_e_total_imp']) - float(self._hour_start_sensors['meter_e_total_imp']):.2f}",
-            '_hourly_load': f"{float(sensors_data['e_load_total']) - float(self._hour_start_sensors['e_load_total']):.1f}",
-        }
-        self._verify_header(calculated_values)
-        return calculated_values
-
-    @staticmethod
-    def headers():
-        return ['_hour_start_timestamp', '_hourly_meter_export', '_hourly_meter_import', '_hourly_load']
-
-    def _verify_header(self, calculated_values):
-        for header, key in zip(self.headers(), calculated_values.keys()):
-            if header != key:
-                raise AssertionError(f"Implementation error: headers do not correspond to set keys: {key} != {header}, "
-                                     f"{self.headers()} != {calculated_values.keys()}")
 
 
 class AsyncioThread(threading.Thread):
     _asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
     _inverter: Optional[goodwe.Inverter] = None
+    _db_conn: Optional[aiosqlite.Connection] = None
     _should_stop = threading.Event()
     _calculated_values_evaluator = CalculatedValuesEvaluator()
 
@@ -282,21 +154,56 @@ class AsyncioThread(threading.Thread):
         logger.info(f'Connecting to {self._inverter_address}')
         self._inverter = await goodwe.connect(self._inverter_address, family='ET', timeout=1, retries=60)
         logger.info(f'Connected to the inverter')
-        log_file_with_current_timestamp = 'data-' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.csv'
-        with open(log_file_with_current_timestamp, mode='w', newline='') as data_file:
-            csv_writer = csv.writer(data_file, dialect='excel')
-            headers = SELECTED_SENSORS + self._calculated_values_evaluator.headers()
-            await asyncio.to_thread(csv_writer.writerow, headers)
+        self._db_conn = await storage.init_db_async(storage.DATA_DB_PATH, sensor_columns())
+        try:
+            await self._seed_hour_start_baseline()
+            await self._backfill_hourly_summary()
+            current_hour_start, _ = storage.current_hour_bounds(datetime.now())
             while True:
                 inverter_runtime = await self._inverter.read_runtime_data()
-                sensors_data = {sensor_id: str(inverter_runtime.get(sensor_id)) for sensor_id in SELECTED_SENSORS}
+                sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
-                await asyncio.to_thread(csv_writer.writerow, sensors_data_with_calculated.values())  # assuming the set keeps the insertion order
+                await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
                 announcer.announce(json.dumps(sensors_data_with_calculated))
+                new_hour_start, _ = storage.current_hour_bounds(datetime.now())
+                if new_hour_start != current_hour_start:
+                    # the wall clock just rolled into a new hour - the hour
+                    # that just ended now has a sample in the following
+                    # (current) hour, so it can be backfilled immediately,
+                    # rather than waiting on a fixed polling interval
+                    current_hour_start = new_hour_start
+                    await self._backfill_hourly_summary()
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
                     return
+        finally:
+            await self._db_conn.close()
+
+    async def _seed_hour_start_baseline(self):
+        hour_start_epoch, hour_end_epoch = storage.current_hour_bounds(datetime.now())
+        baseline = await storage.get_current_hour_start_sample_async(self._db_conn, hour_start_epoch, hour_end_epoch)
+        self._calculated_values_evaluator.seed_hour_start(baseline)
+
+    @staticmethod
+    async def _backfill_hourly_summary():
+        """Derives any newly-completed hourly_summary rows from
+        inverter_history. Runs on a plain sqlite3 connection (not the shared
+        aiosqlite one) via a worker thread, since storage.backfill_hourly_summary
+        is synchronous and issues several queries per hour - a short-lived
+        connection here avoids sharing sqlite3's not-thread-safe-by-default
+        connection object with the asyncio loop's own aiosqlite connection.
+        """
+        def _run():
+            conn = sqlite3.connect(storage.DATA_DB_PATH)
+            try:
+                return storage.backfill_hourly_summary(conn)
+            finally:
+                conn.close()
+
+        backfilled = await asyncio.to_thread(_run)
+        if backfilled:
+            logger.info(f"Backfilled {backfilled} hourly_summary row(s)")
 
     def ensure_inverter_ready(self):
         if self._asyncio_loop is None:
@@ -536,6 +443,71 @@ def get_forecast():
         return flask.render_template('forecast.html', date=date_yyyymmdd, forecast=forecast_data)
 
 
+@app.get('/history')
+def get_history_page():
+    default_start, default_end = history.default_date_range(datetime.now().date())
+    start_date = history.parse_date_or_default(request.args.get('start'), default_start)
+    end_date = history.parse_date_or_default(request.args.get('end'), default_end)
+    return flask.render_template(
+        'history.html',
+        raw_columns=history.RAW_COLUMNS,
+        default_raw_columns=history.DEFAULT_RAW_COLUMNS,
+        default_start=start_date.strftime('%Y-%m-%d'),
+        default_end=end_date.strftime('%Y-%m-%d'),
+    )
+
+
+def _parse_history_range_params():
+    default_start, default_end = history.default_date_range(datetime.now().date())
+    start_date = history.parse_date_or_default(request.args.get('start'), default_start)
+    end_date = history.parse_date_or_default(request.args.get('end'), default_end)
+    start_epoch, end_epoch = history.date_range_to_epoch(start_date, end_date)
+    limit = history.resolve_limit(request.args.get('limit'))
+    offset = history.resolve_offset(request.args.get('offset'))
+    return start_date, end_date, start_epoch, end_epoch, limit, offset
+
+
+@app.get('/history/inverter.json')
+def get_history_inverter_json():
+    start_date, end_date, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
+    columns_param = request.args.get('columns')
+    requested_columns = columns_param.split(',') if columns_param else None
+    columns = history.resolve_raw_columns(requested_columns)
+    conn = sqlite3.connect(storage.DATA_DB_PATH)
+    try:
+        rows, has_more = history.fetch_inverter_rows(conn, columns, start_epoch, end_epoch, limit, offset)
+    finally:
+        conn.close()
+    return flask.jsonify({
+        'start': start_date.strftime('%Y-%m-%d'),
+        'end': end_date.strftime('%Y-%m-%d'),
+        'columns': columns,
+        'limit': limit,
+        'offset': offset,
+        'rows': rows,
+        'has_more': has_more,
+    })
+
+
+@app.get('/history/hourly.json')
+def get_history_hourly_json():
+    start_date, end_date, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
+    conn = sqlite3.connect(storage.DATA_DB_PATH)
+    try:
+        rows, has_more = history.fetch_hourly_rows(conn, start_epoch, end_epoch, limit, offset)
+    finally:
+        conn.close()
+    return flask.jsonify({
+        'start': start_date.strftime('%Y-%m-%d'),
+        'end': end_date.strftime('%Y-%m-%d'),
+        'columns': list(history.HOURLY_COLUMNS),
+        'limit': limit,
+        'offset': offset,
+        'rows': rows,
+        'has_more': has_more,
+    })
+
+
 @app.get('/listen')
 def listen():
     def stream_messages(remote_addr):
@@ -555,7 +527,6 @@ def listen():
 
 def main():
     global dry_run
-    # TODO: https://stackoverflow.com/questions/6234405/logging-uncaught-exceptions-in-python
     setup_plot_style()
     matplotlib.use('agg')
     file_handler = logging.FileHandler('manager.log')
@@ -565,6 +536,7 @@ def main():
                         format='%(asctime)s - %(name)s - %(threadName)s - %(levelname)s - %(message)s',
                         handlers=[file_handler, console_handler])
     logging.getLogger('goodwe.protocol').setLevel(logging.INFO)
+    install_uncaught_exception_logging(logger)
     if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
         logger.warning("Running in dry-run mode without inverter connection")
         dry_run = True

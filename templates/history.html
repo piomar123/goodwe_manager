@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="/static/bootstrap.min.css" rel="stylesheet">
+  <title>History - Energy Manager</title>
+  <style>
+    /* Bounding .table-responsive's height (rather than letting the whole
+       page scroll) gives `position: sticky` a well-defined scrolling
+       ancestor, so the header row reliably stays visible while scrolling
+       through rows - this is flaky/inconsistent across browsers when the
+       page itself is the scroll container. */
+    .table-responsive { max-height: 70vh; overflow-y: auto; }
+    .table-responsive thead th { position: sticky; top: 0; background-color: var(--bs-table-bg); z-index: 1; }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1>History</h1>
+
+    <ul class="nav nav-tabs" id="history-tabs" role="tablist">
+      <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="raw-tab-btn" data-bs-toggle="tab" data-bs-target="#raw-tab"
+          type="button" role="tab">Raw samples</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" id="hourly-tab-btn" data-bs-toggle="tab" data-bs-target="#hourly-tab"
+          type="button" role="tab">Hourly summary</button>
+      </li>
+    </ul>
+
+    <div class="tab-content">
+      <div class="tab-pane fade show active" id="raw-tab" role="tabpanel">
+        <div class="row mt-3 g-2 align-items-end">
+          <div class="col-12 col-md-3">
+            <label class="form-label">Start</label>
+            <input id="raw-start" type="date" class="form-control form-control-sm" value="{{ default_start }}" />
+          </div>
+          <div class="col-12 col-md-3">
+            <label class="form-label">End</label>
+            <input id="raw-end" type="date" class="form-control form-control-sm" value="{{ default_end }}" />
+          </div>
+          <div class="col-12 col-md-2">
+            <label class="form-label">Rows</label>
+            <select id="raw-limit" class="form-select form-select-sm">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="250">250</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+          <div class="col-12 col-md-4">
+            <details>
+              <summary class="btn btn-sm btn-outline-secondary">Columns ▾</summary>
+              <div id="raw-columns" class="border rounded p-2 mt-1" style="max-height:200px;overflow-y:auto">
+                {% for column in raw_columns %}
+                <div class="form-check">
+                  <input class="form-check-input raw-column-checkbox" type="checkbox" value="{{ column }}"
+                    id="col-{{ column }}" {% if column in default_raw_columns %}checked{% endif %} />
+                  <label class="form-check-label" for="col-{{ column }}">{{ column }}</label>
+                </div>
+                {% endfor %}
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="table-responsive mt-3">
+          <table class="table table-sm table-striped">
+            <thead id="raw-thead"></thead>
+            <tbody id="raw-tbody"></tbody>
+          </table>
+        </div>
+        <p id="raw-empty" class="text-muted d-none">No data for this range.</p>
+        <div class="d-flex gap-2">
+          <button id="raw-prev" class="btn btn-sm btn-outline-primary">&lt; Prev</button>
+          <button id="raw-next" class="btn btn-sm btn-outline-primary">Next &gt;</button>
+        </div>
+      </div>
+
+      <div class="tab-pane fade" id="hourly-tab" role="tabpanel">
+        <div class="row mt-3 g-2 align-items-end">
+          <div class="col-12 col-md-3">
+            <label class="form-label">Start</label>
+            <input id="hourly-start" type="date" class="form-control form-control-sm" value="{{ default_start }}" />
+          </div>
+          <div class="col-12 col-md-3">
+            <label class="form-label">End</label>
+            <input id="hourly-end" type="date" class="form-control form-control-sm" value="{{ default_end }}" />
+          </div>
+          <div class="col-12 col-md-2">
+            <label class="form-label">Rows</label>
+            <select id="hourly-limit" class="form-select form-select-sm">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="250">250</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-responsive mt-3">
+          <table class="table table-sm table-striped">
+            <thead id="hourly-thead"></thead>
+            <tbody id="hourly-tbody"></tbody>
+          </table>
+        </div>
+        <p id="hourly-empty" class="text-muted d-none">No data for this range.</p>
+        <div class="d-flex gap-2">
+          <button id="hourly-prev" class="btn btn-sm btn-outline-primary">&lt; Prev</button>
+          <button id="hourly-next" class="btn btn-sm btn-outline-primary">Next &gt;</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row mt-3">
+      <div class="col">
+        <a href="/" class="btn btn-primary">&lt; Back</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+  <script>
+    const COLUMNS_STORAGE_KEY = 'history.columns';
+
+    function resolveInitialColumns() {
+      const urlColumns = new URLSearchParams(window.location.search).get('columns');
+      if (urlColumns) return urlColumns.split(',');
+      const saved = localStorage.getItem(COLUMNS_STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+      return null; // no override - let the server-rendered checkbox defaults stand
+    }
+
+    function getCheckedColumns() {
+      return Array.from(document.querySelectorAll('.raw-column-checkbox'))
+        .filter(cb => cb.checked)
+        .map(cb => cb.value);
+    }
+
+    function applySelectedColumnsToCheckboxes(columns) {
+      const columnSet = new Set(columns);
+      document.querySelectorAll('.raw-column-checkbox').forEach(cb => {
+        cb.checked = columnSet.has(cb.value);
+      });
+    }
+
+    function renderTable(theadId, tbodyId, emptyId, columns, rows) {
+      const thead = document.getElementById(theadId);
+      const tbody = document.getElementById(tbodyId);
+      const empty = document.getElementById(emptyId);
+      thead.innerHTML = '<tr>' + columns.map(c => `<th>${c}</th>`).join('') + '</tr>';
+      if (rows.length === 0) {
+        tbody.innerHTML = '';
+        empty.classList.remove('d-none');
+        return;
+      }
+      empty.classList.add('d-none');
+      tbody.innerHTML = rows.map(row =>
+        '<tr>' + columns.map(c => `<td>${row[c] === null || row[c] === undefined ? '' : row[c]}</td>`).join('') + '</tr>'
+      ).join('');
+    }
+
+    function makeTabController(config) {
+      let offset = 0;
+
+      function buildParams() {
+        const params = new URLSearchParams();
+        params.set('start', document.getElementById(config.startInput).value);
+        params.set('end', document.getElementById(config.endInput).value);
+        params.set('limit', document.getElementById(config.limitInput).value);
+        params.set('offset', String(offset));
+        if (config.columnsEnabled) {
+          params.set('columns', getCheckedColumns().join(','));
+        }
+        return params;
+      }
+
+      async function load() {
+        const params = buildParams();
+        const resp = await fetch(config.endpoint + '?' + params.toString());
+        const data = await resp.json();
+        renderTable(config.theadId, config.tbodyId, config.emptyId, data.columns, data.rows);
+        document.getElementById(config.prevBtn).disabled = offset === 0;
+        document.getElementById(config.nextBtn).disabled = !data.has_more;
+
+        if (config.columnsEnabled) {
+          applySelectedColumnsToCheckboxes(data.columns);
+          localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify(data.columns));
+        }
+
+        const shareParams = new URLSearchParams(window.location.search);
+        shareParams.set('start', data.start);
+        shareParams.set('end', data.end);
+        if (config.columnsEnabled) shareParams.set('columns', data.columns.join(','));
+        window.history.replaceState(null, '', '?' + shareParams.toString());
+      }
+
+      document.getElementById(config.startInput).addEventListener('change', () => { offset = 0; load(); });
+      document.getElementById(config.endInput).addEventListener('change', () => { offset = 0; load(); });
+      document.getElementById(config.limitInput).addEventListener('change', () => { offset = 0; load(); });
+      document.getElementById(config.prevBtn).addEventListener('click', () => {
+        offset = Math.max(0, offset - parseInt(document.getElementById(config.limitInput).value, 10));
+        load();
+      });
+      document.getElementById(config.nextBtn).addEventListener('click', () => {
+        offset += parseInt(document.getElementById(config.limitInput).value, 10);
+        load();
+      });
+      if (config.columnsEnabled) {
+        document.querySelectorAll('.raw-column-checkbox').forEach(cb => {
+          cb.addEventListener('change', () => { offset = 0; load(); });
+        });
+      }
+
+      return { load };
+    }
+
+    const initialColumns = resolveInitialColumns();
+    if (initialColumns) applySelectedColumnsToCheckboxes(initialColumns);
+
+    const rawController = makeTabController({
+      startInput: 'raw-start', endInput: 'raw-end', limitInput: 'raw-limit',
+      prevBtn: 'raw-prev', nextBtn: 'raw-next',
+      theadId: 'raw-thead', tbodyId: 'raw-tbody', emptyId: 'raw-empty',
+      endpoint: '/history/inverter.json', columnsEnabled: true,
+    });
+    const hourlyController = makeTabController({
+      startInput: 'hourly-start', endInput: 'hourly-end', limitInput: 'hourly-limit',
+      prevBtn: 'hourly-prev', nextBtn: 'hourly-next',
+      theadId: 'hourly-thead', tbodyId: 'hourly-tbody', emptyId: 'hourly-empty',
+      endpoint: '/history/hourly.json', columnsEnabled: false,
+    });
+
+    rawController.load();
+    document.getElementById('hourly-tab-btn').addEventListener('shown.bs.tab', () => hourlyController.load(), { once: true });
+  </script>
+</body>
+
+</html>

@@ -175,5 +175,9 @@ cython_debug/
 
 /playground/test.db
 /data*.csv
+/data.db
+/data.db-wal
+/data.db-shm
 /.idea
 .superpowers/
+/.worktrees/
