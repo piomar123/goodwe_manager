@@ -22,6 +22,23 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = {'timestamp', 'meter_e_total_exp', 'meter_e_total_imp', 'e_load_total'}
 
+# A wrong-but-well-formed date parses fine and has every required value
+# present - confirmed live: an inverter clock glitch produced 5815 real-
+# looking rows dated "2002", 22 years before this project existed, that
+# slipped silently into production because they landed on otherwise-empty
+# timestamp slots (nothing existed there to flag a duplicate/clash
+# against). This bounds what parse_timestamp_epoch() will accept as
+# plausible, independent of whether anything else already occupies that
+# slot. The lower bound is comfortably before this project's first real
+# data (August 2024); the upper bound tracks "now" at call time (see
+# _is_plausible_epoch) rather than a fixed date, so it never needs updating.
+_EARLIEST_PLAUSIBLE_EPOCH = storage.parse_timestamp_epoch('2020-01-01 00:00:00')
+_FUTURE_TOLERANCE_SECONDS = 86400  # allows for minor clock skew, not a hardcoded "latest" date
+
+
+def _is_plausible_epoch(epoch: int) -> bool:
+    return _EARLIEST_PLAUSIBLE_EPOCH <= epoch <= int(time.time()) + _FUTURE_TOLERANCE_SECONDS
+
 
 def ensure_migration_log_table(conn: sqlite3.Connection) -> None:
     conn.execute("""
@@ -119,12 +136,19 @@ def _row_epoch_if_usable(row: dict) -> Optional[int]:
     restval default fills the missing trailing fields with None too).
     Skipping just that one row recovers everything else in the file,
     instead of discarding an otherwise-complete file over its last line.
+
+    Also rejects a row whose timestamp parses fine but is implausible (see
+    _is_plausible_epoch) - a wrong-but-well-formed date wouldn't otherwise
+    be caught by anything here, and reconcile_file()'s duplicate/clash
+    check can't catch it either if it lands on an empty timestamp slot.
     """
     try:
         epoch = storage.parse_timestamp_epoch(row['timestamp'])
         float(row['meter_e_total_exp'])
         float(row['meter_e_total_imp'])
         float(row['e_load_total'])
+        if not _is_plausible_epoch(epoch):
+            return None
         return epoch
     except (ValueError, TypeError, KeyError):
         return None
@@ -231,7 +255,7 @@ def reconcile_file(conn: sqlite3.Connection, csv_path: Path, chunk_size: int = 5
                 continue
             epoch = _row_epoch_if_usable(row)
             if epoch is None:
-                logger.warning(f"{filename}: skipping malformed row (likely a truncated trailing write)")
+                logger.warning(f"{filename}: skipping malformed row (truncated trailing write, or an implausible timestamp)")
                 continue
             chunk.append((epoch, row))
             if len(chunk) >= chunk_size:
@@ -322,7 +346,7 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
                     continue
                 epoch = _row_epoch_if_usable(row)
                 if epoch is None:
-                    logger.warning(f"{filename}: skipping malformed row (likely a truncated trailing write)")
+                    logger.warning(f"{filename}: skipping malformed row (truncated trailing write, or an implausible timestamp)")
                     continue
                 if min_epoch is None or epoch < min_epoch:
                     min_epoch, min_row = epoch, row

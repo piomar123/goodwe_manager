@@ -83,6 +83,28 @@ class MigrateCsvToSqliteTest(unittest.TestCase):
         count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_skips_a_row_with_an_implausible_timestamp(self):
+        # a wrong-but-well-formed date (confirmed live: a clock glitch
+        # landed several thousand real-looking rows on "2002-07-06", 22
+        # years before this project existed) parses fine and has every
+        # required value present - only a plausibility check on the date
+        # itself catches it. This matters most for rows landing on an
+        # otherwise-empty timestamp slot, where reconcile_file()'s
+        # duplicate/clash detection has nothing to compare against and
+        # would silently insert it as "new" data.
+        csv_path = self._write_csv('data-2026-08-28_09-50-00.csv',
+                                   HEADER +
+                                   '2002-07-06 16:00:24,5115.0,1.0,0.5,0.1\n'
+                                   '2026-08-28 09:50:00,100.0,1.0,0.5,0.1\n')
+
+        status = migrate.migrate_file(self.conn, csv_path, dry_run=False)
+
+        self.assertEqual(status, 'done')
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 1)
+        row = self.conn.execute("SELECT timestamp FROM inverter_history").fetchone()
+        self.assertEqual(row[0], '2026-08-28 09:50:00')
+
     def test_all_rows_malformed_is_treated_as_skipped(self):
         csv_path = self._write_csv('data-2026-08-28_09-45-00.csv', HEADER + '\x00' * 200)
 
@@ -444,6 +466,23 @@ class ReconcileFileTest(unittest.TestCase):
         self.assertEqual(result['inserted'], 1)
         count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_never_inserts_a_row_with_an_implausible_timestamp_even_onto_an_empty_slot(self):
+        # the exact scenario that let 5815 real, clock-glitched rows dated
+        # "2002" slip silently into production: reconcile_file()'s
+        # duplicate/clash check has nothing to compare against when the
+        # slot is empty, so only a plausibility check on the timestamp
+        # itself catches it
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER + '2002-07-06 16:00:24,5115.0,1.0,0.5,0.1,0.1\n')
+
+        result = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(result['inserted'], 0)
+        self.assertEqual(result['duplicate'], 0)
+        self.assertEqual(result['clashes'], [])
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_is_idempotent_across_repeated_runs(self):
         csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
