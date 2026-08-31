@@ -2,7 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import storage
 import history
@@ -90,6 +90,33 @@ class DateRangeTest(unittest.TestCase):
         self.assertEqual(datetime.fromtimestamp(start_epoch), datetime(2026, 8, 27, 0, 0, 0))
         # end is exclusive: start of the day AFTER end_date
         self.assertEqual(datetime.fromtimestamp(end_epoch), datetime(2026, 8, 29, 0, 0, 0))
+
+    def test_parse_time_or_default_parses_hh_mm(self):
+        result = history.parse_time_or_default('14:30', default=time(0, 0))
+        self.assertEqual(result, time(14, 30))
+
+    def test_parse_time_or_default_falls_back_on_none(self):
+        result = history.parse_time_or_default(None, default=time(9, 15))
+        self.assertEqual(result, time(9, 15))
+
+    def test_parse_time_or_default_falls_back_on_garbage(self):
+        result = history.parse_time_or_default('not-a-time', default=time(9, 15))
+        self.assertEqual(result, time(9, 15))
+
+    def test_date_range_to_epoch_narrows_to_a_time_of_day_when_given(self):
+        start_epoch, end_epoch = history.date_range_to_epoch(
+            date(2026, 8, 27), date(2026, 8, 27),
+            start_time=time(8, 0), end_time=time(14, 0),
+        )
+        self.assertEqual(datetime.fromtimestamp(start_epoch), datetime(2026, 8, 27, 8, 0, 0))
+        # end_time is exclusive too, consistent with the whole-day convention
+        self.assertEqual(datetime.fromtimestamp(end_epoch), datetime(2026, 8, 27, 14, 0, 0))
+
+    def test_date_range_to_epoch_defaults_to_full_days_without_times(self):
+        with_times = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 28),
+                                                  start_time=None, end_time=None)
+        without_times = history.date_range_to_epoch(date(2026, 8, 27), date(2026, 8, 28))
+        self.assertEqual(with_times, without_times)
 
 
 def _sample_row(timestamp: str, **overrides) -> dict:

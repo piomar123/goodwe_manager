@@ -95,7 +95,7 @@ class StorageSyncTest(unittest.TestCase):
                               'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
                               'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
                               'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
-                              'work_mode_breakdown'):
+                              'battery_soc_min', 'battery_soc_max', 'work_mode_breakdown'):
                 self.assertIn(expected, column_names)
             row = conn.execute("SELECT hour_start, meter_export_kwh FROM hourly_summary").fetchone()
             self.assertEqual(row, (12345, 1.5))
@@ -457,6 +457,19 @@ class BackfillHourlySummaryTest(unittest.TestCase):
             49.98, 50.05, 49.90, 50.01, 49.95, 50.02,
             42.0, 45.5, 28.0, 29.5,
         ))
+
+    def test_computes_battery_soc_min_max_for_the_hour(self):
+        self._insert('2026-08-28 14:05:00', battery_soc='42')
+        self._insert('2026-08-28 14:35:00', battery_soc='58')
+        self._insert('2026-08-28 15:05:00')  # proves 14:00 is complete
+
+        storage.backfill_hourly_summary(self.conn)
+
+        row = self.conn.execute(
+            "SELECT battery_soc_min, battery_soc_max FROM hourly_summary WHERE hour_start = ?",
+            (storage.parse_timestamp_epoch('2026-08-28 14:00:00'),),
+        ).fetchone()
+        self.assertEqual(row, (42.0, 58.0))
 
     def test_quality_stats_are_null_per_phase_when_that_phase_is_null(self):
         # single-phase-style sample: only phase 1 populated, phases 2/3 NULL

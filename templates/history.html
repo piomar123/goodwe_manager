@@ -37,11 +37,17 @@
         <div class="row mt-3 g-2 align-items-end">
           <div class="col-12 col-md-3">
             <label class="form-label">Start</label>
-            <input id="raw-start" type="date" class="form-control form-control-sm" value="{{ default_start }}" />
+            <div class="d-flex gap-1">
+              <input id="raw-start" type="date" class="form-control form-control-sm" value="{{ default_start }}" />
+              <input id="raw-start-time" type="time" class="form-control form-control-sm" value="{{ default_start_time }}" title="Optional: narrow to a time of day" />
+            </div>
           </div>
           <div class="col-12 col-md-3">
             <label class="form-label">End</label>
-            <input id="raw-end" type="date" class="form-control form-control-sm" value="{{ default_end }}" />
+            <div class="d-flex gap-1">
+              <input id="raw-end" type="date" class="form-control form-control-sm" value="{{ default_end }}" />
+              <input id="raw-end-time" type="time" class="form-control form-control-sm" value="{{ default_end_time }}" title="Optional: narrow to a time of day" />
+            </div>
           </div>
           <div class="col-12 col-md-2">
             <label class="form-label">Rows</label>
@@ -177,6 +183,12 @@
         if (config.columnsEnabled) {
           params.set('columns', getCheckedColumns().join(','));
         }
+        if (config.timeInputsEnabled) {
+          const startTime = document.getElementById(config.startTimeInput).value;
+          const endTime = document.getElementById(config.endTimeInput).value;
+          if (startTime) params.set('start_time', startTime);
+          if (endTime) params.set('end_time', endTime);
+        }
         return params;
       }
 
@@ -197,6 +209,10 @@
         shareParams.set('start', data.start);
         shareParams.set('end', data.end);
         if (config.columnsEnabled) shareParams.set('columns', data.columns.join(','));
+        if (config.timeInputsEnabled) {
+          if (data.start_time) shareParams.set('start_time', data.start_time); else shareParams.delete('start_time');
+          if (data.end_time) shareParams.set('end_time', data.end_time); else shareParams.delete('end_time');
+        }
         window.history.replaceState(null, '', '?' + shareParams.toString());
       }
 
@@ -212,9 +228,17 @@
         load();
       });
       if (config.columnsEnabled) {
+        // deliberately does NOT reset offset - changing which columns are
+        // displayed doesn't change which rows match the current filter, so
+        // staying on the same page (rather than jumping back to the start)
+        // is the expected behavior here, unlike a real filter change above
         document.querySelectorAll('.raw-column-checkbox').forEach(cb => {
-          cb.addEventListener('change', () => { offset = 0; load(); });
+          cb.addEventListener('change', () => { load(); });
         });
+      }
+      if (config.timeInputsEnabled) {
+        document.getElementById(config.startTimeInput).addEventListener('change', () => { offset = 0; load(); });
+        document.getElementById(config.endTimeInput).addEventListener('change', () => { offset = 0; load(); });
       }
 
       return { load };
@@ -225,6 +249,7 @@
 
     const rawController = makeTabController({
       startInput: 'raw-start', endInput: 'raw-end', limitInput: 'raw-limit',
+      startTimeInput: 'raw-start-time', endTimeInput: 'raw-end-time', timeInputsEnabled: true,
       prevBtn: 'raw-prev', nextBtn: 'raw-next',
       theadId: 'raw-thead', tbodyId: 'raw-tbody', emptyId: 'raw-empty',
       endpoint: '/history/inverter.json', columnsEnabled: true,
