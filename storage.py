@@ -56,6 +56,8 @@ _HOURLY_SUMMARY_COLUMNS = [
     ('inverter_temp_max', 'REAL'),
     ('battery_temp_min', 'REAL'),
     ('battery_temp_max', 'REAL'),
+    ('battery_soc_min', 'REAL'),
+    ('battery_soc_max', 'REAL'),
     ('work_mode_breakdown', 'TEXT'),
 ]
 
@@ -289,6 +291,7 @@ _QUALITY_STAT_COLUMNS = [
     'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
     'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
     'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
+    'battery_soc_min', 'battery_soc_max',
 ]
 
 # Each phase is aggregated independently (rather than a combined
@@ -300,7 +303,8 @@ _QUALITY_STATS_QUERY = """
         MIN(vgrid), MAX(vgrid), MIN(vgrid2), MAX(vgrid2), MIN(vgrid3), MAX(vgrid3),
         MIN(fgrid), MAX(fgrid), MIN(fgrid2), MAX(fgrid2), MIN(fgrid3), MAX(fgrid3),
         MIN(temperature), MAX(temperature),
-        MIN(battery_temperature), MAX(battery_temperature)
+        MIN(battery_temperature), MAX(battery_temperature),
+        MIN(battery_soc), MAX(battery_soc)
     FROM inverter_history WHERE timestamp_epoch >= ? AND timestamp_epoch < ?
 """
 
@@ -384,8 +388,8 @@ def backfill_hourly_summary(conn: sqlite3.Connection, full_rescan: bool = False)
                  vgrid_min, vgrid_max, vgrid2_min, vgrid2_max, vgrid3_min, vgrid3_max,
                  fgrid_min, fgrid_max, fgrid2_min, fgrid2_max, fgrid3_min, fgrid3_max,
                  inverter_temp_min, inverter_temp_max, battery_temp_min, battery_temp_max,
-                 work_mode_breakdown)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 battery_soc_min, battery_soc_max, work_mode_breakdown)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (hour_start, metrics['meter_export_kwh'], metrics['meter_import_kwh'], metrics['load_kwh'],
              metrics['pv_kwh'], metrics['battery_charge_kwh'], metrics['battery_discharge_kwh'],
@@ -396,6 +400,7 @@ def backfill_hourly_summary(conn: sqlite3.Connection, full_rescan: bool = False)
              quality['fgrid3_min'], quality['fgrid3_max'],
              quality['inverter_temp_min'], quality['inverter_temp_max'],
              quality['battery_temp_min'], quality['battery_temp_max'],
+             quality['battery_soc_min'], quality['battery_soc_max'],
              work_mode_breakdown),
         )
         conn.commit()

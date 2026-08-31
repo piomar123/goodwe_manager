@@ -4,7 +4,7 @@ docs/superpowers/plans/2026-08-29-history-viewer.md about why main.py can't
 be imported by the test suite.
 """
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Iterable, Optional
 
 # Allow-list of "presentable" inverter_history columns, in display order.
@@ -36,7 +36,7 @@ HOURLY_COLUMNS = (
     'vgrid_min', 'vgrid_max', 'vgrid2_min', 'vgrid2_max', 'vgrid3_min', 'vgrid3_max',
     'fgrid_min', 'fgrid_max', 'fgrid2_min', 'fgrid2_max', 'fgrid3_min', 'fgrid3_max',
     'inverter_temp_min', 'inverter_temp_max', 'battery_temp_min', 'battery_temp_max',
-    'work_mode_breakdown',
+    'battery_soc_min', 'battery_soc_max', 'work_mode_breakdown',
 )
 
 ALLOWED_LIMITS = (50, 100, 250, 500)
@@ -92,18 +92,38 @@ def default_date_range(today: date) -> tuple:
     return today - timedelta(days=6), today
 
 
-def date_range_to_epoch(start_date: date, end_date: date) -> tuple:
-    """(start_epoch, end_epoch) where end_epoch is EXCLUSIVE - the start of
-    the day after end_date - so callers can use `>= start AND < end`
-    consistently with storage.py's hour-bucket convention. Both computed in
-    naive local time via datetime(...).timestamp(), the same convention
-    storage.py's parse_timestamp_epoch()/backfill_hourly_summary() use, so
-    this requires the same host-timezone constraint (see Global
-    Constraints).
+def parse_time_or_default(value: Optional[str], default: time) -> time:
+    if not value:
+        return default
+    try:
+        return datetime.strptime(value, '%H:%M').time()
+    except ValueError:
+        return default
+
+
+def date_range_to_epoch(start_date: date, end_date: date,
+                         start_time: Optional[time] = None, end_time: Optional[time] = None) -> tuple:
+    """(start_epoch, end_epoch) where end_epoch is EXCLUSIVE - so callers
+    can use `>= start AND < end` consistently with storage.py's hour-bucket
+    convention. Both computed in naive local time via datetime(...).timestamp(),
+    the same convention storage.py's parse_timestamp_epoch()/
+    backfill_hourly_summary() use, so this requires the same host-timezone
+    constraint (see Global Constraints).
+
+    start_time/end_time optionally narrow the range to a time-of-day window
+    within start_date/end_date, rather than the whole day - e.g. only the
+    raw-samples tab exposes this in the UI, since hourly_summary is already
+    bucketed at hour granularity. Omitting either (the default) preserves
+    the original whole-day behavior: start_time defaults to midnight,
+    end_time defaults to the start of the day AFTER end_date (so end_date
+    itself is fully included).
     """
-    start_epoch = int(datetime(start_date.year, start_date.month, start_date.day).timestamp())
-    end_of_range = end_date + timedelta(days=1)
-    end_epoch = int(datetime(end_of_range.year, end_of_range.month, end_of_range.day).timestamp())
+    start_epoch = int(datetime.combine(start_date, start_time or time(0, 0)).timestamp())
+    if end_time is None:
+        end_of_range = end_date + timedelta(days=1)
+        end_epoch = int(datetime(end_of_range.year, end_of_range.month, end_of_range.day).timestamp())
+    else:
+        end_epoch = int(datetime.combine(end_date, end_time).timestamp())
     return start_epoch, end_epoch
 
 

@@ -448,12 +448,16 @@ def get_history_page():
     default_start, default_end = history.default_date_range(datetime.now().date())
     start_date = history.parse_date_or_default(request.args.get('start'), default_start)
     end_date = history.parse_date_or_default(request.args.get('end'), default_end)
+    start_time = history.parse_time_or_default(request.args.get('start_time'), None)
+    end_time = history.parse_time_or_default(request.args.get('end_time'), None)
     return flask.render_template(
         'history.html',
         raw_columns=history.RAW_COLUMNS,
         default_raw_columns=history.DEFAULT_RAW_COLUMNS,
         default_start=start_date.strftime('%Y-%m-%d'),
         default_end=end_date.strftime('%Y-%m-%d'),
+        default_start_time=start_time.strftime('%H:%M') if start_time else '',
+        default_end_time=end_time.strftime('%H:%M') if end_time else '',
     )
 
 
@@ -461,15 +465,22 @@ def _parse_history_range_params():
     default_start, default_end = history.default_date_range(datetime.now().date())
     start_date = history.parse_date_or_default(request.args.get('start'), default_start)
     end_date = history.parse_date_or_default(request.args.get('end'), default_end)
-    start_epoch, end_epoch = history.date_range_to_epoch(start_date, end_date)
+    # start_time/end_time are optional (only the raw-samples tab's UI sends
+    # them - hourly_summary is already bucketed at hour granularity, so
+    # narrowing it further by time-of-day wouldn't mean anything extra) -
+    # a missing or unparseable value falls back to None, which preserves
+    # date_range_to_epoch()'s original whole-day behavior
+    start_time = history.parse_time_or_default(request.args.get('start_time'), None)
+    end_time = history.parse_time_or_default(request.args.get('end_time'), None)
+    start_epoch, end_epoch = history.date_range_to_epoch(start_date, end_date, start_time, end_time)
     limit = history.resolve_limit(request.args.get('limit'))
     offset = history.resolve_offset(request.args.get('offset'))
-    return start_date, end_date, start_epoch, end_epoch, limit, offset
+    return start_date, end_date, start_time, end_time, start_epoch, end_epoch, limit, offset
 
 
 @app.get('/history/inverter.json')
 def get_history_inverter_json():
-    start_date, end_date, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
+    start_date, end_date, start_time, end_time, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
     columns_param = request.args.get('columns')
     requested_columns = columns_param.split(',') if columns_param else None
     columns = history.resolve_raw_columns(requested_columns)
@@ -481,6 +492,8 @@ def get_history_inverter_json():
     return flask.jsonify({
         'start': start_date.strftime('%Y-%m-%d'),
         'end': end_date.strftime('%Y-%m-%d'),
+        'start_time': start_time.strftime('%H:%M') if start_time else None,
+        'end_time': end_time.strftime('%H:%M') if end_time else None,
         'columns': columns,
         'limit': limit,
         'offset': offset,
@@ -491,7 +504,7 @@ def get_history_inverter_json():
 
 @app.get('/history/hourly.json')
 def get_history_hourly_json():
-    start_date, end_date, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
+    start_date, end_date, _start_time, _end_time, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
     conn = sqlite3.connect(storage.DATA_DB_PATH)
     try:
         rows, has_more = history.fetch_hourly_rows(conn, start_epoch, end_epoch, limit, offset)
