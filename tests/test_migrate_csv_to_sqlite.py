@@ -328,5 +328,190 @@ class MigrateMainTest(unittest.TestCase):
             conn.close()
 
 
+RECONCILE_HEADER = 'timestamp,ppv,meter_e_total_exp,meter_e_total_imp,e_day,e_load_total\n'
+
+
+class ReconcileFileTest(unittest.TestCase):
+    """reconcile_file() is the per-row recovery path for files that already
+    failed migrate_file()'s whole-file verification - see the design
+    rationale in its docstring. Unlike migrate_file(), it never rejects an
+    entire file over one row.
+    """
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp_dir, 'data.db')
+        self.conn = storage.init_db_sync(self.db_path, sensor_columns())
+        migrate.ensure_migration_log_table(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _write_csv(self, name: str, content: str) -> Path:
+        path = Path(self.tmp_dir) / name
+        path.write_text(content)
+        return path
+
+    def test_inserts_rows_whose_timestamp_does_not_exist_yet(self):
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER +
+                                   '2026-08-28 09:00:00,100.0,1.0,0.5,2.0,0.1\n'
+                                   '2026-08-28 09:00:01,101.0,1.1,0.5,2.1,0.2\n')
+
+        result = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(result['status'], 'recovered')
+        self.assertEqual(result['inserted'], 2)
+        self.assertEqual(result['duplicate'], 0)
+        self.assertEqual(result['clashes'], [])
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 2)
+
+    def test_skips_a_row_that_exactly_matches_an_existing_one(self):
+        storage.insert_sample_sync(self.conn, {
+            'timestamp': '2026-08-28 09:00:00', 'ppv': '100.0', 'meter_e_total_exp': '1.0',
+            'meter_e_total_imp': '0.5', 'e_day': '2.0', 'e_load_total': '0.1',
+        })
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER + '2026-08-28 09:00:00,100.0,1.0,0.5,2.0,0.1\n')
+
+        result = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(result['inserted'], 0)
+        self.assertEqual(result['duplicate'], 1)
+        self.assertEqual(result['clashes'], [])
+        # not duplicated - still exactly one row for that timestamp
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_never_overwrites_a_clashing_row_and_reports_it(self):
+        # existing DB row: mid-day (e_day=47.1)
+        storage.insert_sample_sync(self.conn, {
+            'timestamp': '2026-08-28 09:00:00', 'ppv': '0.0', 'meter_e_total_exp': '6199.02',
+            'meter_e_total_imp': '10848.56', 'e_day': '47.1', 'e_load_total': '18316.2',
+        })
+        # file's row for the same timestamp: claims start-of-day (e_day=0.0) -
+        # a clock-glitch-style clash, not a duplicate
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER +
+                                   '2026-08-28 09:00:00,5377,6441.89,10854.44,0.0,18449.3\n')
+
+        result = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(result['inserted'], 0)
+        self.assertEqual(result['duplicate'], 0)
+        self.assertEqual(len(result['clashes']), 1)
+        self.assertEqual(result['clashes'][0]['timestamp'], '2026-08-28 09:00:00')
+        # the existing (correct) DB row is untouched - never overwritten
+        row = self.conn.execute(
+            "SELECT ppv, e_day FROM inverter_history WHERE timestamp = ?",
+            ('2026-08-28 09:00:00',),
+        ).fetchone()
+        self.assertEqual(row, (0.0, 47.1))
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 1)  # no second row inserted for the clash either
+
+    def test_mixed_batch_of_new_duplicate_and_clashing_rows(self):
+        storage.insert_sample_sync(self.conn, {
+            'timestamp': '2026-08-28 09:00:00', 'ppv': '100.0', 'meter_e_total_exp': '1.0',
+            'meter_e_total_imp': '0.5', 'e_day': '2.0', 'e_load_total': '0.1',
+        })
+        storage.insert_sample_sync(self.conn, {
+            'timestamp': '2026-08-28 09:00:02', 'ppv': '999.0', 'meter_e_total_exp': '9.0',
+            'meter_e_total_imp': '0.5', 'e_day': '9.0', 'e_load_total': '0.1',
+        })
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER +
+                                   '2026-08-28 09:00:00,100.0,1.0,0.5,2.0,0.1\n'   # exact duplicate
+                                   '2026-08-28 09:00:01,101.0,1.1,0.5,2.1,0.2\n'   # new
+                                   '2026-08-28 09:00:02,1.0,1.0,0.5,1.0,0.1\n')    # clash
+
+        result = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(result['inserted'], 1)
+        self.assertEqual(result['duplicate'], 1)
+        self.assertEqual(len(result['clashes']), 1)
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 3)  # 2 pre-existing + 1 newly inserted
+
+    def test_recovers_from_a_file_with_a_truncated_trailing_row_too(self):
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER +
+                                   '2026-08-28 09:00:00,100.0,1.0,0.5,2.0,0.1\n' +
+                                   '\x00' * 200)
+
+        result = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(result['inserted'], 1)
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_is_idempotent_across_repeated_runs(self):
+        csv_path = self._write_csv('data-2026-08-28_09-00-00.csv',
+                                   RECONCILE_HEADER +
+                                   '2026-08-28 09:00:00,100.0,1.0,0.5,2.0,0.1\n'
+                                   '2026-08-28 09:00:01,101.0,1.1,0.5,2.1,0.2\n')
+
+        first = migrate.reconcile_file(self.conn, csv_path)
+        second = migrate.reconcile_file(self.conn, csv_path)
+
+        self.assertEqual(first['inserted'], 2)
+        self.assertEqual(second['inserted'], 0)
+        self.assertEqual(second['duplicate'], 2)
+        count = self.conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+        self.assertEqual(count, 2)  # re-running never duplicates rows
+
+
+class RecoverMainTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp_dir, 'data.db')
+        self.conn = storage.init_db_sync(self.db_path, sensor_columns())
+        migrate.ensure_migration_log_table(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _write_csv(self, name: str, content: str) -> Path:
+        path = Path(self.tmp_dir) / name
+        path.write_text(content)
+        return path
+
+    def test_recovers_only_error_status_files_and_marks_them_done(self):
+        # a 'done' file must be left alone - --recover only targets 'error'
+        self._write_csv('data-2026-08-28_08-00-00.csv',
+                        RECONCILE_HEADER + '2026-08-28 08:00:00,1.0,1.0,0.5,1.0,0.1\n')
+        self.conn.execute(
+            "INSERT INTO csv_migration_log (filename, row_count, migrated_at, status) VALUES (?, 1, 0, 'done')",
+            ('data-2026-08-28_08-00-00.csv',),
+        )
+        # an 'error' file with genuinely new (non-conflicting) data
+        self._write_csv('data-2026-08-28_09-00-00.csv',
+                        RECONCILE_HEADER + '2026-08-28 09:00:00,100.0,1.0,0.5,2.0,0.1\n')
+        self.conn.execute(
+            "INSERT INTO csv_migration_log (filename, row_count, migrated_at, status) VALUES (?, 1, 0, 'error')",
+            ('data-2026-08-28_09-00-00.csv',),
+        )
+        self.conn.commit()
+        self.conn.close()
+
+        with mock.patch('sys.argv', ['_migrate_csv_to_sqlite.py', '--recover', '--csv-dir', self.tmp_dir,
+                                      '--db-path', self.db_path]):
+            migrate.main()  # must not raise
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # the 'done' file's data was never touched - only 1 row total,
+            # not 2, since the 'error' file's own row was never migrated
+            # before recovery ran
+            count = conn.execute("SELECT COUNT(*) FROM inverter_history").fetchone()[0]
+            self.assertEqual(count, 1)
+            statuses = dict(conn.execute("SELECT filename, status FROM csv_migration_log").fetchall())
+            self.assertEqual(statuses['data-2026-08-28_08-00-00.csv'], 'done')
+            self.assertEqual(statuses['data-2026-08-28_09-00-00.csv'], 'done')
+        finally:
+            conn.close()
+        self.conn = sqlite3.connect(self.db_path)  # tearDown expects self.conn open
+
+
 if __name__ == '__main__':
     unittest.main()

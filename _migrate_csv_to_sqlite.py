@@ -130,6 +130,131 @@ def _row_epoch_if_usable(row: dict) -> Optional[int]:
         return None
 
 
+# Columns compared to decide whether a row already in inverter_history at
+# the same timestamp is a harmless duplicate or a genuine clash. Chosen
+# from REQUIRED_COLUMNS plus e_day - between them, an instantaneous reading
+# (ppv) and several cumulative counters (meter_e_total_exp/imp, e_day,
+# e_load_total) reliably distinguish "same physical sample recorded twice"
+# from "different point in the inverter's own timeline mislabeled onto the
+# same wall-clock second" (confirmed against real data - see the migration
+# analysis this recovery path exists for).
+RECONCILE_COMPARE_COLUMNS = ['ppv', 'meter_e_total_exp', 'meter_e_total_imp', 'e_day', 'e_load_total']
+
+
+def _values_match(row: dict, db_values: tuple) -> bool:
+    file_values = tuple(row.get(c) for c in RECONCILE_COMPARE_COLUMNS)
+    try:
+        file_norm = tuple(str(float(v)) if v not in (None, '') else None for v in file_values)
+    except (ValueError, TypeError):
+        return False  # an unparseable compare value is never a silent match
+    db_norm = tuple(str(v) if v is not None else None for v in db_values)
+    return file_norm == db_norm
+
+
+def _reconcile_chunk(conn: sqlite3.Connection, chunk: list, valid_columns: set, filename: str) -> dict:
+    """chunk: list of (epoch, row) pairs. Looks up existing DB values only
+    for this chunk's own epochs (IN(...), not a BETWEEN range) - a file
+    spanning many days can have a DB-side range containing millions of
+    unrelated rows from every other file in that span; a range fetch would
+    load all of them into memory regardless of this chunk's actual size.
+    """
+    epochs = [epoch for epoch, _ in chunk]
+    placeholders = ', '.join('?' for _ in epochs)
+    select_cols = ', '.join(RECONCILE_COMPARE_COLUMNS)
+    existing = {
+        epoch: values for epoch, *values in conn.execute(
+            f"SELECT timestamp_epoch, {select_cols} FROM inverter_history WHERE timestamp_epoch IN ({placeholders})",
+            epochs,
+        )
+    }
+
+    to_insert = []
+    duplicate = 0
+    clashes = []
+    for epoch, row in chunk:
+        db_values = existing.get(epoch)
+        if db_values is None:
+            to_insert.append({k: v for k, v in row.items() if k in valid_columns})
+        elif _values_match(row, db_values):
+            duplicate += 1
+        else:
+            clashes.append({
+                'timestamp': row['timestamp'],
+                'file_values': {c: row.get(c) for c in RECONCILE_COMPARE_COLUMNS},
+                'db_values': dict(zip(RECONCILE_COMPARE_COLUMNS, db_values)),
+            })
+
+    if to_insert:
+        storage.insert_samples_batch(conn, to_insert, commit=True)
+    return {'inserted': len(to_insert), 'duplicate': duplicate, 'clashes': clashes}
+
+
+def reconcile_file(conn: sqlite3.Connection, csv_path: Path, chunk_size: int = 500) -> dict:
+    """Per-row recovery for a file that already failed migrate_file()'s
+    whole-file verification. Unlike migrate_file(), a single bad or
+    ambiguous row never costs the rest of the file: each row is decided
+    independently -
+      - inserted, if its timestamp doesn't exist in inverter_history yet
+      - skipped as a harmless duplicate, if it exists with identical values
+      - skipped and reported as a clash, if it exists with DIFFERENT
+        values - existing DB data is NEVER overwritten, so a clash can only
+        ever mean losing this file's version of that one row, never
+        corrupting what's already there.
+
+    Naturally safe to interrupt and re-run: every row's fate is decided by
+    its own current DB state, not a whole-file transaction, so a partial
+    run just leaves already-processed rows looking like duplicates on the
+    next attempt - no separate crash-recovery bookkeeping needed (contrast
+    with migrate_file()'s 'pending' manifest state).
+
+    Returns {'status': 'recovered'|'skipped', 'inserted': int,
+    'duplicate': int, 'clashes': [{'timestamp', 'file_values', 'db_values'}]}.
+    """
+    filename = csv_path.name
+    valid_columns = {name for name, _ in sensor_columns()}
+    totals = {'inserted': 0, 'duplicate': 0, 'clashes': []}
+
+    with open(csv_path, newline='') as f:
+        reader = csv.DictReader(f)
+        if not _validate_header(reader.fieldnames):
+            return {'status': 'skipped', **totals}
+
+        chunk = []
+        row_iter = iter(reader)
+        while True:
+            try:
+                row = next(row_iter)
+            except StopIteration:
+                break
+            except csv.Error as e:
+                logger.warning(f"{filename}: skipping malformed line: {e}")
+                continue
+            epoch = _row_epoch_if_usable(row)
+            if epoch is None:
+                logger.warning(f"{filename}: skipping malformed row (likely a truncated trailing write)")
+                continue
+            chunk.append((epoch, row))
+            if len(chunk) >= chunk_size:
+                result = _reconcile_chunk(conn, chunk, valid_columns, filename)
+                totals['inserted'] += result['inserted']
+                totals['duplicate'] += result['duplicate']
+                totals['clashes'].extend(result['clashes'])
+                chunk = []
+        if chunk:
+            result = _reconcile_chunk(conn, chunk, valid_columns, filename)
+            totals['inserted'] += result['inserted']
+            totals['duplicate'] += result['duplicate']
+            totals['clashes'].extend(result['clashes'])
+
+    for clash in totals['clashes']:
+        logger.warning(
+            f"{filename}: clash at {clash['timestamp']} - kept existing DB value "
+            f"(file had {clash['file_values']}, DB has {clash['db_values']})"
+        )
+
+    return {'status': 'recovered', **totals}
+
+
 def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str:
     filename = csv_path.name
     if already_migrated(conn, filename):
@@ -277,16 +402,68 @@ def migrate_file(conn: sqlite3.Connection, csv_path: Path, dry_run: bool) -> str
     return status
 
 
+def _run_recovery(conn: sqlite3.Connection, csv_dir: str) -> None:
+    """--recover mode: per-row reconcile()s every file currently marked
+    'error' in the manifest, instead of a normal whole-directory migration
+    pass. A recovered file is marked 'done' (not a separate status) so
+    already_migrated() correctly skips it on any future normal run -
+    otherwise a plain migrate_file() re-run would immediately re-reject it
+    with the same whole-file verification mismatch and undo the recovery.
+    """
+    error_filenames = [
+        row[0] for row in conn.execute(
+            "SELECT filename FROM csv_migration_log WHERE status = 'error' ORDER BY filename"
+        ).fetchall()
+    ]
+    logger.info(f"Recovering {len(error_filenames)} error-status file(s) from {csv_dir}")
+
+    total_inserted = total_duplicate = total_clashes = 0
+    for filename in error_filenames:
+        csv_path = Path(csv_dir) / filename
+        if not csv_path.exists():
+            logger.error(f"{filename}: not found in {csv_dir}, skipping")
+            continue
+        try:
+            result = reconcile_file(conn, csv_path)
+        except Exception as e:
+            logger.error(f"{filename}: unexpected error during recovery, skipping: {e}")
+            continue
+        if result['status'] == 'skipped':
+            logger.warning(f"{filename}: header invalid, skipped")
+            continue
+        _record_migration(conn, filename, result['inserted'], 'done')
+        total_inserted += result['inserted']
+        total_duplicate += result['duplicate']
+        total_clashes += len(result['clashes'])
+        logger.info(
+            f"{filename}: inserted={result['inserted']} duplicate={result['duplicate']} "
+            f"clashes={len(result['clashes'])}"
+        )
+
+    logger.info(
+        f"Recovery summary: inserted={total_inserted} duplicate={total_duplicate} "
+        f"clashes={total_clashes} (clashes never overwrite existing data - see per-file logs above)"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Migrate legacy data-*.csv files into data.db")
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--csv-dir', default='.')
     parser.add_argument('--db-path', default=storage.DATA_DB_PATH)
+    parser.add_argument('--recover', action='store_true',
+                         help="Per-row-reconcile files currently marked 'error' in the manifest, "
+                              "instead of a normal migration pass - see reconcile_file()")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     conn = storage.init_db_sync(args.db_path, sensor_columns())
     ensure_migration_log_table(conn)
+
+    if args.recover:
+        _run_recovery(conn, args.csv_dir)
+        conn.close()
+        return
 
     csv_paths = sorted(Path(args.csv_dir).glob('data-*.csv'))
     logger.info(f"Found {len(csv_paths)} CSV files in {args.csv_dir}")
