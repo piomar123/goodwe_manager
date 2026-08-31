@@ -150,17 +150,29 @@ def plot_rce(series, date) -> Figure:
     fig = plt.figure(f"RCE {date}", figsize=(14, 8))
     axes = fig.gca()
     axes.plot([row[0] for row in series], [row[1] for row in series], '-', drawstyle='steps-post', label=f"RCE")
-    axes.set_xlim(0, 24*4)
+    # series has one point per quarter-hour plus the appended '24:00' -
+    # normally 24*4+1 = 97, but a DST fall-back day has 100 periods (101
+    # points) and a spring-forward day has 92 (93 points). Matplotlib
+    # plots the string x-values on a categorical axis (each label gets
+    # the next sequential integer position), so hardcoding xlim/ticks to
+    # 24*4 would clip the last ~hour of a fall-back day's chart off the
+    # visible axes and leave a dead stretch on a spring-forward day's.
+    last_index = len(series) - 1
+    axes.set_xlim(0, last_index)
     min_price = min(row[1] for row in series)
     axes.set_ylim(min(min_price, 0), None)
     # plt.legend()
     if date == datetime.today().strftime('%Y-%m-%d'):
         now = datetime.now().time()
         hour_float = now.hour + now.minute / 60.
+        # Note: this still assumes position == hour*4, which is only true
+        # up to the DST transition point on a fall-back/spring-forward
+        # day - the 'now' marker can be off by about an hour for the
+        # remainder of those two days per year.
         axes.axvline(x=hour_float*4, color='red')
     axes.axhline(y=0, color='gray', linestyle=':')
     axes.grid(color='gray', linestyle=':')
-    axes.xaxis.set_major_locator(FixedLocator([i for i in range(0, 24*4+1, 4)]))
+    axes.xaxis.set_major_locator(FixedLocator(list(range(0, last_index+1, 4))))
     fig.subplots_adjust(top=0.95, bottom=0.1, left=0.1, right=0.95)
     return fig
 

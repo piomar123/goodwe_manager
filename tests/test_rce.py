@@ -4,6 +4,9 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
+import matplotlib
+matplotlib.use('Agg')
+
 import rce
 import rce_storage
 
@@ -89,6 +92,34 @@ class ConvertToSeries15MinTest(unittest.TestCase):
             [label for label, _ in rce.convert_to_series_15min(response_data)],
             ['02:45', '03:00', '02a:15', '02a:30', '02a:45', '03a:00', '24:00'],
         )
+
+
+class PlotRceTest(unittest.TestCase):
+    def test_xlim_matches_normal_day_length(self):
+        series = [(f'{h:02}:{m:02}', 1.0) for h in range(24) for m in (0, 15, 30, 45)]
+        series.append(('24:00', 1.0))
+        fig = rce.plot_rce(series, '2026-06-01')
+        self.assertEqual(fig.gca().get_xlim(), (0.0, len(series) - 1))
+
+    def test_dst_fall_back_day_is_not_clipped_by_xlim(self):
+        # 100 periods (25-hour day) plus the appended '24:00' = 101 points -
+        # xlim must stretch to cover all of them, not stay hardcoded at 96,
+        # or the last ~hour of the chart is invisible.
+        series = [(f'{h:02}:{m:02}', 1.0) for h in range(24) for m in (0, 15, 30, 45)]
+        series += [('02a:15', 1.0), ('02a:30', 1.0), ('02a:45', 1.0), ('03a:00', 1.0)]
+        series.append(('24:00', 1.0))
+        fig = rce.plot_rce(series, '2026-10-25')
+        axes = fig.gca()
+        self.assertEqual(axes.get_xlim(), (0.0, len(series) - 1))
+        last_plotted_position = len(axes.get_lines()[0].get_xdata()) - 1
+        self.assertLessEqual(last_plotted_position, axes.get_xlim()[1])
+
+    def test_dst_spring_forward_day_xlim_matches_shorter_series(self):
+        # 92 periods (23-hour day) plus the appended '24:00' = 93 points.
+        series = [(f'{h:02}:{m:02}', 1.0) for h in range(23) for m in (0, 15, 30, 45)]
+        series.append(('24:00', 1.0))
+        fig = rce.plot_rce(series, '2026-03-29')
+        self.assertEqual(fig.gca().get_xlim(), (0.0, len(series) - 1))
 
 
 if __name__ == '__main__':
