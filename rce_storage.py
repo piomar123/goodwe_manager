@@ -18,6 +18,7 @@ def init_db(path: Optional[str] = None) -> sqlite3.Connection:
     default-path callers pick up the patched value.
     """
     conn = sqlite3.connect(path or RCE_DB_PATH)
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS rce_prices (
             business_date TEXT NOT NULL,

@@ -59,5 +59,37 @@ class GetRce15MinTest(unittest.TestCase):
         mock_fetch.assert_called_once_with(date(2026, 1, 3))
 
 
+class ConvertToSeries15MinTest(unittest.TestCase):
+    def test_normal_periods_keep_the_start_time(self):
+        response_data = {'value': [
+            {'period': '00:00 - 00:15', 'rce_pln': 1.0},
+            {'period': '00:15 - 00:30', 'rce_pln': 2.0},
+        ]}
+        self.assertEqual(
+            rce.convert_to_series_15min(response_data),
+            [('00:00', 1.0), ('00:15', 2.0), ('24:00', 2.0)],
+        )
+
+    def test_dst_fall_back_repeated_hour_periods_are_not_truncated(self):
+        # Real PSE response shape for the DST fall-back repeated hour
+        # (confirmed against the live API for business_date 2025-10-26):
+        # PSE disambiguates the repeat with an 'a' suffix, e.g.
+        # "02a:15 - 02a:30". That label is 6 characters, not the usual 5
+        # ("00:00 - 00:15"), so a fixed [0:5] slice would truncate
+        # "02a:15" down to "02a:1" - split on the ' - ' delimiter instead.
+        response_data = {'value': [
+            {'period': '02:45 - 03:00', 'rce_pln': 36.23},
+            {'period': '03:00 - 02a:15', 'rce_pln': 44.46},
+            {'period': '02a:15 - 02a:30', 'rce_pln': 48.15},
+            {'period': '02a:30 - 02a:45', 'rce_pln': 48.31},
+            {'period': '02a:45 - 03a:00', 'rce_pln': 43.46},
+            {'period': '03a:00 - 03:15', 'rce_pln': 40.0},
+        ]}
+        self.assertEqual(
+            [label for label, _ in rce.convert_to_series_15min(response_data)],
+            ['02:45', '03:00', '02a:15', '02a:30', '02a:45', '03a:00', '24:00'],
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

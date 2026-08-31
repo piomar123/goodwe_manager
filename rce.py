@@ -129,7 +129,12 @@ def main():
 
 
 def convert_to_series_15min(response_data):
-    series = [(entry['period'][0:5], entry['rce_pln']) for entry in response_data['value']]
+    # Split on the ' - ' delimiter rather than slicing entry['period'][0:5]:
+    # on a DST fall-back day PSE disambiguates the repeated hour with an
+    # 'a' suffix (e.g. period "02a:15 - 02a:30"), which is 6 characters
+    # long, not the usual 5 ("00:00 - 00:15") - a fixed [0:5] slice would
+    # truncate "02a:15" down to "02a:1".
+    series = [(entry['period'].split(' - ')[0], entry['rce_pln']) for entry in response_data['value']]
     series.append(('24:00', series[-1][1]))
     return series
 

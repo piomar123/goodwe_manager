@@ -62,13 +62,17 @@ class RceStorageTest(unittest.TestCase):
         # fall-back day: 100 quarter-hour periods instead of the usual 96
         # (a normal day's 96, plus one repeated hour's worth of 4 quarters).
         # The repeated hour uses synthetic non-colliding labels ('23:46'..
-        # '23:49', sorting between '23:45' and '24:00') since real PSE
-        # period-label text for the repeated hour isn't specified by this
-        # design - this test only exercises the storage layer's ability to
-        # hold a 100-period business_date under the (business_date, period)
-        # primary key and get_cached_prices' ORDER BY period returning rows
-        # in the same order they were stored, not real PSE collision
-        # behavior for that hour.
+        # '23:49', sorting between '23:45' and '24:00') as a stand-in;
+        # confirmed against the live PSE API for business_date 2025-10-26
+        # that real period labels for the repeated hour don't collide
+        # either - PSE disambiguates them with an 'a' suffix (e.g.
+        # "02a:15"), so the (business_date, period) primary key holds all
+        # 100 rows without overwriting. See
+        # ConvertToSeries15MinTest.test_dst_fall_back_repeated_hour_periods_are_not_truncated
+        # in test_rce.py for the real label shapes. This test only
+        # exercises the storage layer's ability to hold a 100-period
+        # business_date and get_cached_prices' ORDER BY period returning
+        # rows in the same order they were stored.
         series = [(f'{h:02}:{m:02}', float(h * 4 + m // 15)) for h in range(24) for m in (0, 15, 30, 45)]
         series += [(f'23:{46 + i}', 99.0) for i in range(4)]
         series.append(('24:00', series[-1][1]))
