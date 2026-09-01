@@ -13,8 +13,8 @@
     <h1>Inverter runtime data</h1>
     <div class="row">
       <div class="col">
+        <div><span data-inverter="timestamp"></span></div>
         <div>
-          <span data-inverter="timestamp"></span>
           <span id="age-badge" class="badge"></span>
           <span id="read-badge" class="badge"></span>
           <span id="delivery-badge" class="badge"></span>
@@ -127,15 +127,15 @@
     // a slow inverter read and a slow delivery hop are different problems
     // with different normal ranges, so lumping them under one color hid
     // which one was actually the cause. text-dark is set explicitly on the
-    // warning color: Bootstrap badges default to white text, and white text
-    // on the light-yellow bg-warning background under this dark background
-    // page is nearly unreadable.
+    // success/warning colors: Bootstrap badges default to white text, and
+    // white text on their light green/yellow backgrounds is nearly
+    // unreadable.
     function setBadge(el, text, value, warnAt, dangerAt) {
       el.textContent = text;
       const color = value === null ? 'bg-secondary'
         : value > dangerAt ? 'bg-danger'
         : value > warnAt ? 'bg-warning text-dark'
-        : 'bg-success';
+        : 'bg-success text-dark';
       el.className = 'badge ' + color;
     }
 
