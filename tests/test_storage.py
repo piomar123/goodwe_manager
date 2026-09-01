@@ -255,7 +255,7 @@ class StorageAsyncTest(unittest.TestCase):
             finally:
                 await conn.close()
 
-        result = asyncio.new_event_loop().run_until_complete(scenario())
+        result = asyncio.run(scenario())
         self.assertEqual(result, 42.0)
 
     def test_init_db_async_adds_missing_columns_to_an_existing_table(self):
@@ -278,7 +278,7 @@ class StorageAsyncTest(unittest.TestCase):
             await conn.close()
             return column_names, row
 
-        column_names, row = asyncio.new_event_loop().run_until_complete(scenario())
+        column_names, row = asyncio.run(scenario())
         new_column_name, _ = sensor_columns()[-1]
         self.assertIn(new_column_name, column_names)
         self.assertEqual(row, (12345, '2026-08-28 14:00:00'))
@@ -293,7 +293,7 @@ class StorageAsyncTest(unittest.TestCase):
             finally:
                 await conn.close()
 
-        result = asyncio.new_event_loop().run_until_complete(scenario())
+        result = asyncio.run(scenario())
         self.assertEqual(result['timestamp'], '2026-08-28 14:00:03')
 
 
