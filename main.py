@@ -161,11 +161,24 @@ class AsyncioThread(threading.Thread):
             await self._backfill_hourly_summary()
             current_hour_start, _ = storage.current_hour_bounds(datetime.now())
             while True:
+                read_start = time.time()
                 inverter_runtime = await self._inverter.read_runtime_data()
+                read_done = time.time()
                 sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
                 await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
-                announcer.announce(json.dumps(sensors_data_with_calculated))
+                # Freshness/lag fields for the UI only - deliberately not
+                # persisted (would need a schema/migration change), just
+                # attached to the SSE payload. `_read_duration_seconds` isolates
+                # how long the inverter itself took to answer (the wifi link
+                # to it is the likely culprit for slow updates), separately
+                # from `_server_received_at`, which the client uses to measure
+                # its own delivery/render lag on top of that.
+                announce_payload = sensors_data_with_calculated | {
+                    '_read_duration_seconds': round(read_done - read_start, 3),
+                    '_server_received_at': read_done,
+                }
+                announcer.announce(json.dumps(announce_payload))
                 new_hour_start, _ = storage.current_hour_bounds(datetime.now())
                 if new_hour_start != current_hour_start:
                     # the wall clock just rolled into a new hour - the hour
