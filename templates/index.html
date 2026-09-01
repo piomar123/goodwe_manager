@@ -14,6 +14,11 @@
     <div class="row">
       <div class="col">
         <div><span data-inverter="timestamp"></span></div>
+        <div>
+          <span id="age-badge" class="badge" data-bs-toggle="tooltip" title="Time since the last SSE update arrived in this browser. Keeps ticking even if the connection stalls - a growing number here means updates have actually stopped, not just slowed down."></span>
+          <span id="read-badge" class="badge" data-bs-toggle="tooltip" title="How long the server's read_runtime_data() call to the inverter itself took. Poor wifi to the inverter is the most likely cause of a high value here."></span>
+          <span id="delivery-badge" class="badge" data-bs-toggle="tooltip" title="Extra delay delivering an update from the server to this browser, on top of the best-case delivery seen recently (clock-skew corrected, so it's a relative delay, not an absolute one)."></span>
+        </div>
         <div>PV: <span data-inverter="ppv"></span>W</div>
         <div>Battery: <span data-inverter="pbattery1"></span>W, <span data-inverter="battery_soc"></span>%, <span data-inverter="vbattery1"></span>V</div>
         <div>Load: <span data-inverter="load_ptotal"></span>W (<span data-inverter="load_p1"></span> / <span data-inverter="load_p2"></span> / <span data-inverter="load_p3"></span> W)</div>
@@ -46,7 +51,48 @@
 
   <script>
     var eventTarget = document.getElementById('event-target');
+    var ageBadge = document.getElementById('age-badge');
+    var readBadge = document.getElementById('read-badge');
+    var deliveryBadge = document.getElementById('delivery-badge');
     var eventSource = new EventSource('/listen');
+
+    // Two independent lag sources, tracked separately:
+    //  - readDurationSeconds: how long the inverter itself took to answer
+    //    read_runtime_data() (poor wifi to the inverter shows up here).
+    //  - deliveryLagSeconds: server -> browser SSE delivery lag, measured
+    //    once per message from the server's own send time.
+    // On top of those, lastMessageReceivedAt is checked on a ticking timer
+    // (not just on message arrival) so a stalled backend loop - connection
+    // still open, but no new messages - is visible too, not just a slow one.
+    var lastMessageReceivedAt = null;
+    var lastReadDurationSeconds = null;
+    var lastDeliveryLagSeconds = null;
+
+    // The browser's clock and the server's clock are generally NOT in sync
+    // (viewing from a phone/laptop rather than the box running main.py) -
+    // a raw `client_receive_time - server_send_time` is dominated by that
+    // fixed clock skew, which can be way bigger than the real network delay
+    // and even come out negative. Since every message takes the same LAN
+    // path, the skew is a constant offset added to every raw delta, so
+    // subtracting the smallest delta seen in a recent window cancels it out
+    // and leaves just the delay relative to the best-case delivery - no
+    // separate clock-sync round trip needed. The window is reset
+    // periodically so a real skew/route change (or the calibration
+    // unluckily locking onto a stale minimum) doesn't stick forever.
+    var CALIBRATION_WINDOW_MS = 5 * 60 * 1000;
+    var deliveryCalibration = { minSeconds: null, windowStartedAt: 0 };
+
+    function calibratedDeliveryLag(rawDeltaSeconds) {
+      const now = Date.now();
+      if (deliveryCalibration.minSeconds === null || now - deliveryCalibration.windowStartedAt > CALIBRATION_WINDOW_MS) {
+        deliveryCalibration.minSeconds = rawDeltaSeconds;
+        deliveryCalibration.windowStartedAt = now;
+      } else {
+        deliveryCalibration.minSeconds = Math.min(deliveryCalibration.minSeconds, rawDeltaSeconds);
+      }
+      return rawDeltaSeconds - deliveryCalibration.minSeconds;
+    }
+
     eventSource.onmessage = function (e) {
       let data = JSON.parse(e.data);
       document.querySelectorAll("[data-inverter]").forEach(el => {
@@ -54,10 +100,94 @@
         el.innerHTML = data[key];
       });
       eventTarget.innerHTML = Object.entries(data).map(([k, v]) => `${k}: ${v}<br>`).join('');
+
+      lastMessageReceivedAt = Date.now();
+      lastReadDurationSeconds = data['_read_duration_seconds'];
+      if (data['_server_received_at']) {
+        const rawDelta = (lastMessageReceivedAt / 1000) - data['_server_received_at'];
+        lastDeliveryLagSeconds = calibratedDeliveryLag(rawDelta);
+      }
+      updateFreshnessBadges();
+      // Restart the ticking timer in phase with the message that just
+      // arrived, rather than letting it free-run - otherwise its 1s ticks
+      // drift out of sync with actual arrivals and "data age" would count
+      // up in fractional-looking jumps (e.g. 0.3s, 1.3s, ...) instead of
+      // clean whole seconds.
+      clearInterval(freshnessTimer);
+      freshnessTimer = setInterval(updateFreshnessBadges, 1000);
     };
+
+    eventSource.onerror = function () {
+      // Stop the ticking timer and clear the freshness state it reads -
+      // otherwise the still-running freshnessTimer fires within 1s and
+      // overwrites this "disconnected" badge with a fresh-looking one
+      // recomputed from the stale pre-disconnect values.
+      clearInterval(freshnessTimer);
+      lastMessageReceivedAt = null;
+      lastReadDurationSeconds = null;
+      lastDeliveryLagSeconds = null;
+      [ageBadge, readBadge, deliveryBadge].forEach(b => b.textContent = '');
+      ageBadge.textContent = 'disconnected';
+      ageBadge.className = 'badge bg-danger';
+    };
+
+    // Each badge is colored against its own thresholds, not a shared one -
+    // a slow inverter read and a slow delivery hop are different problems
+    // with different normal ranges, so lumping them under one color hid
+    // which one was actually the cause. text-dark is set explicitly on the
+    // success/warning colors: Bootstrap badges default to white text, and
+    // white text on their light green/yellow backgrounds is nearly
+    // unreadable.
+    function setBadge(el, text, value, warnAt, dangerAt) {
+      el.textContent = text;
+      const color = value === null ? 'bg-secondary'
+        : value > dangerAt ? 'bg-danger'
+        : value > warnAt ? 'bg-warning text-dark'
+        : 'bg-success text-dark';
+      el.className = 'badge ' + color;
+    }
+
+    function updateFreshnessBadges() {
+      if (lastMessageReceivedAt === null) return;
+      // Normal cadence is ~1 message/second; a few seconds of silence can
+      // just be normal jitter, but past ~5s something is actually stuck.
+      const ageSeconds = Math.round((Date.now() - lastMessageReceivedAt) / 1000);
+      setBadge(ageBadge, `age: ${ageSeconds}s`, ageSeconds, 5, 10);
+      // read_runtime_data() over wifi to the inverter: the historical
+      // average gap is ~2s, so a couple of seconds here is unremarkable -
+      // it's the multi-second stalls (wifi hiccups) that matter.
+      setBadge(readBadge, lastReadDurationSeconds === null ? 'read: -' : `read: ${lastReadDurationSeconds.toFixed(1)}s`,
+        lastReadDurationSeconds, 2, 5);
+      // Delivery lag is already calibrated relative to the best-case
+      // delivery (see calibratedDeliveryLag), so even small values here are
+      // meaningful - thresholds are tighter than the other two.
+      setBadge(deliveryBadge, lastDeliveryLagSeconds === null ? 'delivery: -' : `delivery: ${lastDeliveryLagSeconds.toFixed(1)}s`,
+        lastDeliveryLagSeconds, 0.5, 2);
+    }
+
+    var freshnessTimer = setInterval(updateFreshnessBadges, 1000);
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+  <script>
+    // Plain `title` attributes only show on hover, which touch devices
+    // don't have - Bootstrap's tooltip component handles tap too, as long
+    // as 'click' is included as a trigger alongside the default hover/focus.
+    // 'click' only toggles the tapped badge though - it has no built-in way
+    // to dismiss by tapping elsewhere, which is the natural way to close
+    // something on mobile - so that's added by hand below.
+    var tooltipTriggers = document.querySelectorAll('[data-bs-toggle="tooltip"]');
+    tooltipTriggers.forEach(el => new bootstrap.Tooltip(el, { trigger: 'hover focus click' }));
+
+    document.addEventListener('click', function (e) {
+      tooltipTriggers.forEach(el => {
+        if (!el.contains(e.target)) {
+          const tooltip = bootstrap.Tooltip.getInstance(el);
+          if (tooltip) tooltip.hide();
+        }
+      });
+    });
+  </script>
 </body>
 
 </html>
