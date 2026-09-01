@@ -29,7 +29,8 @@ import history
 import storage
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
-from rce import parse_date, plot_rce, setup_plot_style, query_pse_rce_15min
+from rce import parse_date, plot_rce, setup_plot_style, get_rce_15min
+from rce_prefetch import RcePrefetchThread
 from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
 
 dotenv.load_dotenv()
@@ -215,6 +216,7 @@ class AsyncioThread(threading.Thread):
 
 app = flask.Flask(__name__, static_url_path='/static')
 asyncio_thread = AsyncioThread(inverter_address=INVERTER_IP, daemon=False)
+rce_prefetch_thread = RcePrefetchThread()
 
 
 @app.route('/')
@@ -405,7 +407,7 @@ def get_prices_json():
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     logger.debug(f'Serving RCE prices JSON for date: {date_yyyymmdd}')
-    rce = query_pse_rce_15min(date)
+    rce = get_rce_15min(date)
     return flask.jsonify({
         'date': date_yyyymmdd,
         'series': [{'time': time, 'price': price} for time, price in rce],
@@ -418,7 +420,7 @@ def get_prices_image():
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     logger.debug('Generating RCE prices images for date: {date_yyyymmdd}')
-    rce = query_pse_rce_15min(date)
+    rce = get_rce_15min(date)
     logger.debug(rce)
     fig = plot_rce(rce, date_yyyymmdd)
     output_io = io.BytesIO()
@@ -555,6 +557,7 @@ def main():
         dry_run = True
 
     asyncio_thread.start()
+    rce_prefetch_thread.start()
     # atexit.register(stop_threads)
     try:
         app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False)
@@ -563,6 +566,7 @@ def main():
     finally:
         logger.info("Finishing the application...")
         asyncio_thread.finish()
+        rce_prefetch_thread.finish()
         logger.info("Finished all threads")
 
 

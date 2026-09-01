@@ -12,6 +12,8 @@ from matplotlib import rcParams
 from matplotlib.figure import Figure
 from matplotlib.ticker import FixedLocator
 
+import rce_storage
+
 ACCEPT_JSON_HEADER = {'Accept': 'application/json'}
 
 
@@ -66,11 +68,36 @@ def query_pse_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
     return convert_to_series_15min(data)
 
 
+def get_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
+    """Single read/write-through entry point for 15-minute RCE prices -
+    every other direct call to query_pse_rce_15min in this codebase has
+    been replaced with this function, so there's exactly one path into the
+    cache.
+
+    Cache hit (a marker row exists in rce_prices_fetched for this date):
+    reads rce_prices.db, no network call. Cache miss: calls the live
+    query_pse_rce_15min(), then INSERT OR REPLACEs the result into
+    rce_prices.db (both the price rows and the completeness marker)
+    before returning - so any live fetch, from whichever caller triggered
+    it, gets cached.
+    """
+    business_date = query_date.strftime('%Y-%m-%d')
+    conn = rce_storage.init_db()
+    try:
+        if rce_storage.is_cached(conn, business_date):
+            return rce_storage.get_cached_prices(conn, business_date)
+        series = query_pse_rce_15min(query_date)
+        rce_storage.store_prices(conn, business_date, series)
+        return series
+    finally:
+        conn.close()
+
+
 def query_pse_rce(query_date: datetime.date) -> list[tuple[str, float]]:
     """
-    Returns hourly RCE prices. To get 15-minute intervals use query_pse_rce_15min().
+    Returns hourly RCE prices. To get 15-minute intervals use get_rce_15min().
     """
-    rce_15min = query_pse_rce_15min(query_date)
+    rce_15min = get_rce_15min(query_date)
     # noinspection PyTypeChecker
     s = np.array_split(rce_15min, range(4, len(rce_15min), 4))
     return [(chunk[0][0].item(), np.mean([float(price) for _, price in chunk]).item()) for chunk in s]
@@ -94,7 +121,7 @@ def main():
 
     date_in = args.date or input("Date (or [t]oday, [y]esterday, [n]tomorrow): ")
     date = parse_date(date_in)
-    rce = query_pse_rce_15min(date)
+    rce = get_rce_15min(date)
     print(rce)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     fig = plot_rce(rce, date_yyyymmdd)
@@ -102,7 +129,12 @@ def main():
 
 
 def convert_to_series_15min(response_data):
-    series = [(entry['period'][0:5], entry['rce_pln']) for entry in response_data['value']]
+    # Split on the ' - ' delimiter rather than slicing entry['period'][0:5]:
+    # on a DST fall-back day PSE disambiguates the repeated hour with an
+    # 'a' suffix (e.g. period "02a:15 - 02a:30"), which is 6 characters
+    # long, not the usual 5 ("00:00 - 00:15") - a fixed [0:5] slice would
+    # truncate "02a:15" down to "02a:1".
+    series = [(entry['period'].split(' - ')[0], entry['rce_pln']) for entry in response_data['value']]
     series.append(('24:00', series[-1][1]))
     return series
 
@@ -118,17 +150,29 @@ def plot_rce(series, date) -> Figure:
     fig = plt.figure(f"RCE {date}", figsize=(14, 8))
     axes = fig.gca()
     axes.plot([row[0] for row in series], [row[1] for row in series], '-', drawstyle='steps-post', label=f"RCE")
-    axes.set_xlim(0, 24*4)
+    # series has one point per quarter-hour plus the appended '24:00' -
+    # normally 24*4+1 = 97, but a DST fall-back day has 100 periods (101
+    # points) and a spring-forward day has 92 (93 points). Matplotlib
+    # plots the string x-values on a categorical axis (each label gets
+    # the next sequential integer position), so hardcoding xlim/ticks to
+    # 24*4 would clip the last ~hour of a fall-back day's chart off the
+    # visible axes and leave a dead stretch on a spring-forward day's.
+    last_index = len(series) - 1
+    axes.set_xlim(0, last_index)
     min_price = min(row[1] for row in series)
     axes.set_ylim(min(min_price, 0), None)
     # plt.legend()
     if date == datetime.today().strftime('%Y-%m-%d'):
         now = datetime.now().time()
         hour_float = now.hour + now.minute / 60.
+        # Note: this still assumes position == hour*4, which is only true
+        # up to the DST transition point on a fall-back/spring-forward
+        # day - the 'now' marker can be off by about an hour for the
+        # remainder of those two days per year.
         axes.axvline(x=hour_float*4, color='red')
     axes.axhline(y=0, color='gray', linestyle=':')
     axes.grid(color='gray', linestyle=':')
-    axes.xaxis.set_major_locator(FixedLocator([i for i in range(0, 24*4+1, 4)]))
+    axes.xaxis.set_major_locator(FixedLocator(list(range(0, last_index+1, 4))))
     fig.subplots_adjust(top=0.95, bottom=0.1, left=0.1, right=0.95)
     return fig
 
