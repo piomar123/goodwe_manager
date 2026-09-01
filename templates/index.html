@@ -15,9 +15,9 @@
       <div class="col">
         <div><span data-inverter="timestamp"></span></div>
         <div>
-          <span id="age-badge" class="badge"></span>
-          <span id="read-badge" class="badge"></span>
-          <span id="delivery-badge" class="badge"></span>
+          <span id="age-badge" class="badge" data-bs-toggle="tooltip" title="Time since the last SSE update arrived in this browser. Keeps ticking even if the connection stalls - a growing number here means updates have actually stopped, not just slowed down."></span>
+          <span id="read-badge" class="badge" data-bs-toggle="tooltip" title="How long the server's read_runtime_data() call to the inverter itself took. Poor wifi to the inverter is the most likely cause of a high value here."></span>
+          <span id="delivery-badge" class="badge" data-bs-toggle="tooltip" title="Extra delay delivering an update from the server to this browser, on top of the best-case delivery seen recently (clock-skew corrected, so it's a relative delay, not an absolute one)."></span>
         </div>
         <div>PV: <span data-inverter="ppv"></span>W</div>
         <div>Battery: <span data-inverter="pbattery1"></span>W, <span data-inverter="battery_soc"></span>%, <span data-inverter="vbattery1"></span>V</div>
@@ -161,6 +161,25 @@
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+  <script>
+    // Plain `title` attributes only show on hover, which touch devices
+    // don't have - Bootstrap's tooltip component handles tap too, as long
+    // as 'click' is included as a trigger alongside the default hover/focus.
+    // 'click' only toggles the tapped badge though - it has no built-in way
+    // to dismiss by tapping elsewhere, which is the natural way to close
+    // something on mobile - so that's added by hand below.
+    var tooltipTriggers = document.querySelectorAll('[data-bs-toggle="tooltip"]');
+    tooltipTriggers.forEach(el => new bootstrap.Tooltip(el, { trigger: 'hover focus click' }));
+
+    document.addEventListener('click', function (e) {
+      tooltipTriggers.forEach(el => {
+        if (!el.contains(e.target)) {
+          const tooltip = bootstrap.Tooltip.getInstance(el);
+          if (tooltip) tooltip.hide();
+        }
+      });
+    });
+  </script>
 </body>
 
 </html>
