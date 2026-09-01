@@ -118,6 +118,14 @@
     };
 
     eventSource.onerror = function () {
+      // Stop the ticking timer and clear the freshness state it reads -
+      // otherwise the still-running freshnessTimer fires within 1s and
+      // overwrites this "disconnected" badge with a fresh-looking one
+      // recomputed from the stale pre-disconnect values.
+      clearInterval(freshnessTimer);
+      lastMessageReceivedAt = null;
+      lastReadDurationSeconds = null;
+      lastDeliveryLagSeconds = null;
       [ageBadge, readBadge, deliveryBadge].forEach(b => b.textContent = '');
       ageBadge.textContent = 'disconnected';
       ageBadge.className = 'badge bg-danger';

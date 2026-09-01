@@ -161,9 +161,10 @@ class AsyncioThread(threading.Thread):
             await self._backfill_hourly_summary()
             current_hour_start, _ = storage.current_hour_bounds(datetime.now())
             while True:
-                read_start = time.time()
+                read_start = time.monotonic()
                 inverter_runtime = await self._inverter.read_runtime_data()
-                read_done = time.time()
+                read_done = time.monotonic()
+                server_received_at = time.time()
                 sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
                 await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
@@ -176,7 +177,7 @@ class AsyncioThread(threading.Thread):
                 # its own delivery/render lag on top of that.
                 announce_payload = sensors_data_with_calculated | {
                     '_read_duration_seconds': round(read_done - read_start, 3),
-                    '_server_received_at': read_done,
+                    '_server_received_at': server_received_at,
                 }
                 announcer.announce(json.dumps(announce_payload))
                 new_hour_start, _ = storage.current_hour_bounds(datetime.now())
