@@ -47,6 +47,7 @@
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="/static/chart-theme.js"></script>
   <script>
     (async function () {
       const chartDate = '{{ date }}';
@@ -135,17 +136,9 @@
           animation: false,
           interaction: { mode: 'index', intersect: false },
           plugins: {
-            legend: {
-              display: true,
-              labels: { color: '#aaa', boxWidth: 20, font: { size: 11 } }
-            },
+            legend: ChartTheme.legend,
             tooltip: {
-              backgroundColor: '#222',
-              borderColor: '#555',
-              borderWidth: 1,
-              titleColor: '#aaa',
-              bodyColor: '#fff',
-              padding: 8,
+              ...ChartTheme.tooltip,
               callbacks: {
                 title: items => items[0].label,
                 label: item => ' ' + (item.raw != null ? item.raw.toFixed(2) : '—') + ' PLN/MWh',
@@ -155,35 +148,32 @@
           scales: {
             x: {
               ticks: {
-                color: '#888',
+                color: ChartTheme.axisTickColor,
                 maxRotation: 0,
                 autoSkip: false,
                 font: { size: 11 },
-                callback(val, index) {
-                  const step = this.chart.width < 500 ? 8 : 4;
-                  return index % step === 0 ? this.getLabelForValue(val) : '';
-                },
+                callback: ChartTheme.thinTicksCallback(4, 8),
               },
               grid: {
                 color: ctx => ctx.index % 4 === 0 ? 'rgba(128,128,128,0.25)' : 'transparent',
-                borderDash: [3, 4],
+                borderDash: ChartTheme.gridDash,
               },
-              border: { color: '#444' }
+              border: { color: ChartTheme.axisBorderColor }
             },
             y: {
               min: Math.min(0, minPrice),
               ticks: {
-                color: '#888',
+                color: ChartTheme.axisTickColor,
                 font: { size: 11 },
                 callback(v) {
                   return this.chart.width < 500 ? v : v + ' PLN';
                 },
               },
               grid: {
-                color: 'rgba(128,128,128,0.2)',
-                borderDash: [3, 4],
+                color: ChartTheme.gridColor,
+                borderDash: ChartTheme.gridDash,
               },
-              border: { color: '#444' }
+              border: { color: ChartTheme.axisBorderColor }
             }
           }
         }
