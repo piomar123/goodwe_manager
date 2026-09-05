@@ -27,7 +27,7 @@ const ChartTheme = {
   // (deliberately avoids red/green, which read as "alert" colors against a
   // dark background). Falls back to a muted HSL rotation past the curated
   // colors so it never repeats or runs out, however many series there are.
-  seriesPalette: ['#e6e6f0', '#ffbf66', '#8f7fc9', '#5fb8b0'],
+  seriesPalette: ['#6472a6', '#a57d42', '#8f7fc9', '#5fb8b0'],
   seriesColor(index) {
     if (index < this.seriesPalette.length) return this.seriesPalette[index];
     const hue = (index * 137.508) % 360; // golden-angle spacing

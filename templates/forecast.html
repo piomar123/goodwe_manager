@@ -40,7 +40,7 @@
     </div>
     <div class="row mt-3">
       <div class="col">
-        <div id="forecast-table-scroll" style="max-height: 480px; overflow-y: auto;">
+        <div id="forecast-table-scroll">
           <table class="table table-sm table-dark table-striped" id="forecast-table">
             <thead id="forecast-table-head"></thead>
             <tbody id="forecast-table-body"></tbody>
@@ -61,9 +61,10 @@
   <style>
     #forecast-chart { height: 400px; }
     @media (max-width: 576px) { #forecast-chart { height: 260px; } }
-    /* Sticky header within the scrollable table area - needs its own
-       opaque background (matching Bootstrap's table-dark bg) since a
-       sticky element is otherwise transparent and rows would show through. */
+    /* Sticky header that sticks to the *page's* scroll (no more fixed-height
+       inner scroll box) - needs its own opaque background (matching
+       Bootstrap's table-dark bg) since a sticky element is otherwise
+       transparent and rows would show through as they scroll under it. */
     #forecast-table thead th { position: sticky; top: 0; background-color: #212529; z-index: 1; }
   </style>
   <script>
