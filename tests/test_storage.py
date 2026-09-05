@@ -404,6 +404,34 @@ class BackfillHourlySummaryTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row[0], 0.3)
 
+    def test_pv_kwh_handles_a_stale_pre_reset_sample_still_inside_the_midnight_hour(self):
+        # Real-world case (see git history): the reset doesn't always land
+        # neatly at the start of the 00:00 hour bucket - here a single
+        # straggler sample is logged *inside* that bucket still showing
+        # yesterday's final e_day value, moments before the actual reset.
+        # A version keyed off the calendar-day boundary alone would take
+        # MAX(e_day) for the whole 00:00 hour (47.9, the stale straggler)
+        # as "today's production so far", wrongly attributing all of
+        # yesterday's total to a single midnight hour - and then 01:00's
+        # normal diff would go sharply negative against that same stale
+        # value. Keying off the value actually dropping gets both hours
+        # right regardless of exactly where in the hour the reset lands.
+        self._insert('2026-08-28 23:05:00', e_day='47.9')  # last hour of the previous day
+        self._insert('2026-08-29 00:00:00', e_day='47.9')  # stale straggler, still pre-reset
+        self._insert('2026-08-29 00:00:03', e_day='0.0')   # genuine reset, moments later
+        self._insert('2026-08-29 01:05:00', e_day='0.0')   # proves 00:00 is complete
+        self._insert('2026-08-29 02:05:00', e_day='0.1')   # proves 01:00 is complete
+
+        storage.backfill_hourly_summary(self.conn)
+
+        rows = dict(self.conn.execute(
+            "SELECT hour_start, pv_kwh FROM hourly_summary WHERE hour_start IN (?, ?)",
+            (storage.parse_timestamp_epoch('2026-08-29 00:00:00'),
+             storage.parse_timestamp_epoch('2026-08-29 01:00:00')),
+        ).fetchall())
+        self.assertEqual(rows[storage.parse_timestamp_epoch('2026-08-29 00:00:00')], 0.0)
+        self.assertEqual(rows[storage.parse_timestamp_epoch('2026-08-29 01:00:00')], 0.0)
+
     def test_a_null_metric_column_in_one_hour_does_not_crash_or_poison_other_metrics(self):
         # hour 13:00 - baseline, all 6 metric-source columns set
         self._insert('2026-08-28 13:05:00', meter_e_total_exp='100.0', meter_e_total_imp='50.0',
