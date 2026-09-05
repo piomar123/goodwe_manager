@@ -95,7 +95,7 @@
       const actualValues = data.hours.map(h => h.actual_total_kwh); // null where no measured data yet - the real values, used for the table/tooltip
       const currentHourIndex = data.current_hour ? data.hours.findIndex(h => h.time === data.current_hour) : -1;
       const partialKwh = data.current_hour_actual_partial_kwh; // how much the in-progress hour has produced so far (not a full hour's worth)
-      const actualLineColor = '#2fe0c8'; // calm but bright teal - reads clearly as "measured" against the blue/amber forecast bars without screaming
+      const actualLineColor = '#22cc66'; // pure green - reads clearly as "measured" against the near-white/amber forecast bars
       const trailingHourColor = '#8f7fc9'; // calm purple (matches ChartTheme's own palette) for the current, still-partial hour - distinct from the teal/blue/amber used elsewhere in this chart
 
       // Fill in the current-hour slot for rendering continuity: with 'before'
@@ -192,7 +192,7 @@
           order: -1, // draw on top of the stacked bars
           borderWidth: 1.5,
           fill: 'origin',
-          backgroundColor: ChartTheme.withAlpha(actualLineColor, 0.2),
+          backgroundColor: ChartTheme.withAlpha(actualLineColor, 0.4),
         };
       }
 
@@ -252,7 +252,7 @@
           const yPx = y.getPixelForValue(value);
           ctx.save();
           const yBase = y.getPixelForValue(0);
-          ctx.fillStyle = ChartTheme.withAlpha(trailingHourColor, 0.2);
+          ctx.fillStyle = ChartTheme.withAlpha(trailingHourColor, 0.4);
           ctx.fillRect(x0, yPx, x1 - x0, yBase - yPx);
           ctx.strokeStyle = trailingHourColor;
           ctx.lineWidth = 2;
