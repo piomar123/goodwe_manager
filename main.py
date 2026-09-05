@@ -443,20 +443,140 @@ def get_prices_image():
     return flask.Response(output_io.getvalue(), mimetype='image/png')
 
 
+# Short-lived cache so a /forecast page view and the hourly-chart's AJAX call
+# (which happens moments later, for the same date) don't each re-scrape
+# meteosource.com from scratch - one scrape per orientation per date is enough.
+# Keyed by date string; holds (fetched_at_monotonic, hours) tuples.
+_FORECAST_CACHE_TTL_SECONDS = 300
+_forecast_cache = {}
+_forecast_cache_lock = threading.Lock()
+
+
+def _get_hourly_forecast_cached(date_yyyymmdd):
+    now = time.monotonic()
+    with _forecast_cache_lock:
+        cached = _forecast_cache.get(date_yyyymmdd)
+        if cached and now - cached[0] < _FORECAST_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    orientations = PV_ORIENTATIONS
+    with ThreadPoolExecutor(max_workers=len(orientations)) as executor:
+        hourly_futures = [executor.submit(forecast.fetch_pv_production_forecast_hourly_kwh, date_yyyymmdd, orientation) for orientation in orientations]
+        hourly_by_orientation = [future.result() for future in hourly_futures]
+
+    # Combine the per-orientation series into one row per timestamp, assuming
+    # (as fetch_pv_production_forecast_hourly_kwh does today) that every
+    # orientation returns entries for the same set of hourly timestamps.
+    by_timestamp = {}
+    for orientation, series in zip(orientations, hourly_by_orientation):
+        for timestamp_ms, kwh in series:
+            by_timestamp.setdefault(timestamp_ms, {})[orientation] = kwh
+
+    hours = []
+    for timestamp_ms in sorted(by_timestamp):
+        per_orientation = by_timestamp[timestamp_ms]
+        missing = [o for o in orientations if o not in per_orientation]
+        if missing:
+            logger.warning(f"Forecast for {date_yyyymmdd} at {timestamp_ms}: missing orientations {missing}, treating as 0 kWh")
+        total = sum(per_orientation.values())
+        hours.append({
+            # utcfromtimestamp, not fromtimestamp - forecast.py's epoch
+            # values already encode the local hour directly despite looking
+            # like true UTC epoch; converting via the system's real UTC
+            # offset here made every forecast turn up ~2h later than real
+            # production. See forecast.py's
+            # _fetch_pv_production_forecast_local_day_raw docstring.
+            'time': datetime.utcfromtimestamp(timestamp_ms / 1000).strftime('%H:%M'),
+            'by_orientation': {str(o): round(per_orientation.get(o, 0), 2) for o in orientations},
+            'total_kwh': round(total, 2),
+        })
+
+    with _forecast_cache_lock:
+        _forecast_cache[date_yyyymmdd] = (now, hours)
+    return hours
+
+
 @app.get('/forecast')
 def get_forecast():
     date_param = request.args.get('date', default='t')
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
     logger.debug(f"Fetching forecast for {date_yyyymmdd}")
-    orientations = PV_ORIENTATIONS
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        forecast_futures = [executor.submit(forecast.fetch_pv_production_forecast_kwh, date_yyyymmdd, orientation) for orientation in orientations]
-        forecasts = [future.result() for future in forecast_futures]
-        logger.debug(f"Forecasts: {forecasts} kWh")
-        total_kwh = forecasts[0] + forecasts[1]
-        forecast_data = ForecastData(angle90_in_kWh=f"{forecasts[0]:.1f}", angle270_in_kWh=f"{forecasts[1]:.1f}", total_in_kWh=f"{total_kwh:.1f}")
-        return flask.render_template('forecast.html', date=date_yyyymmdd, forecast=forecast_data)
+    hours = _get_hourly_forecast_cached(date_yyyymmdd)
+    forecasts = [sum(hour['by_orientation'][str(o)] for hour in hours) for o in PV_ORIENTATIONS]
+    logger.debug(f"Forecasts: {forecasts} kWh")
+    total_kwh = sum(forecasts)
+    forecast_data = ForecastData(angle90_in_kWh=f"{forecasts[0]:.1f}", angle270_in_kWh=f"{forecasts[1]:.1f}", total_in_kWh=f"{total_kwh:.1f}")
+    return flask.render_template('forecast.html', date=date_yyyymmdd, forecast=forecast_data)
+
+
+def _get_actual_hourly_pv_kwh(date_yyyymmdd):
+    """Actual measured PV production per hour for `date_yyyymmdd`, read from
+    the inverter's own hourly_summary table (pv_kwh column) - the only
+    figure reliable enough to compare against the forecast, since telemetry
+    doesn't track production per string/orientation. Returns {'HH:00': kwh}
+    for hours that have a recorded sample; hours with no data yet (e.g.
+    later today, or a future date) are simply absent from the dict.
+    Queried fresh on every call (unlike the scraped forecast) since it's a
+    cheap local SQLite read and the data changes hour to hour.
+    """
+    day = datetime.strptime(date_yyyymmdd, '%Y-%m-%d').date()
+    start_epoch, end_epoch = history.date_range_to_epoch(day, day)
+    try:
+        conn = sqlite3.connect(storage.DATA_DB_PATH)
+        try:
+            rows, _ = history.fetch_hourly_rows(conn, start_epoch, end_epoch, limit=24, offset=0)
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        # Optional/supplementary data - e.g. a fresh checkout (--dry-run,
+        # never connected to the inverter) has no hourly_summary table yet.
+        # Fail soft: the forecast chart itself doesn't depend on this.
+        logger.warning(f"Couldn't read actual hourly PV production for {date_yyyymmdd}: {e}")
+        return {}
+    return {row['hour_start'][-5:]: row['pv_kwh'] for row in rows if row['pv_kwh'] is not None}
+
+
+def _get_actual_pv_kwh_so_far_this_hour(now):
+    """Live, partial-hour counterpart to _get_actual_hourly_pv_kwh: how much
+    the currently in-progress hour has produced so far (not yet a full
+    hour's worth, unlike hourly_summary's completed-hour rows). None if
+    unavailable (fresh DB, no samples yet this hour, etc.) - fails soft for
+    the same reasons _get_actual_hourly_pv_kwh does.
+    """
+    hour_start_epoch, _ = storage.current_hour_bounds(now)
+    try:
+        conn = sqlite3.connect(storage.DATA_DB_PATH)
+        try:
+            value = storage.get_pv_kwh_so_far(conn, hour_start_epoch, int(now.timestamp()))
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning(f"Couldn't read this hour's partial PV production: {e}")
+        return None
+    return round(value, 2) if value is not None else None
+
+
+@app.get('/forecast/hourly.json')
+def get_forecast_hourly_json():
+    date_param = request.args.get('date', default='t')
+    date = parse_date(date_param)
+    date_yyyymmdd = date.strftime('%Y-%m-%d')
+    logger.debug(f"Fetching hourly forecast for {date_yyyymmdd}")
+    hours = _get_hourly_forecast_cached(date_yyyymmdd)
+    actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd)
+    now = datetime.now()
+    for hour in hours:
+        actual = actual_by_hour.get(hour['time'])
+        hour['actual_total_kwh'] = round(actual, 2) if actual is not None else None
+    is_today = date_yyyymmdd == now.strftime('%Y-%m-%d')
+    return flask.jsonify({
+        'date': date_yyyymmdd,
+        'orientations': PV_ORIENTATIONS,
+        'hours': hours,
+        'current_hour': now.strftime('%H:00') if is_today else None,
+        'current_hour_actual_partial_kwh': _get_actual_pv_kwh_so_far_this_hour(now) if is_today else None,
+    })
 
 
 @app.get('/history')

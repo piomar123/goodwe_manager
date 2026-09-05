@@ -28,6 +28,38 @@
         </p>
       </div>
     </div>
+    <div class="row mb-2 g-2 align-items-end">
+      <div class="col-auto">
+        <label for="actual-style" class="form-label small text-muted mb-0">Actual production style</label>
+        <select id="actual-style" class="form-select form-select-sm">
+          <option value="capbars">Cap bars (aligned)</option>
+          <option value="dots">Dots</option>
+          <option value="aligned-step">Aligned step line</option>
+          <option value="aligned-area" selected>Aligned area</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <div id="forecast-chart-error" class="alert alert-warning d-none" role="alert">
+          Couldn't load the hourly forecast. Try reloading the page.
+        </div>
+        <div style="background:#111;border-radius:6px;padding:12px">
+          <canvas id="forecast-chart"></canvas>
+        </div>
+      </div>
+    </div>
+    <div class="row mt-3">
+      <div class="col">
+        <div id="forecast-table-scroll" style="max-height: 480px; overflow-y: auto;">
+          <table class="table table-sm table-dark table-striped" id="forecast-table">
+            <thead id="forecast-table-head"></thead>
+            <tbody id="forecast-table-body"></tbody>
+          </table>
+        </div>
+        <div id="forecast-table-empty" class="text-muted d-none">No data.</div>
+      </div>
+    </div>
     <div class="row">
       <div class="col">
         <a href="/" class="btn btn-primary">< Back</a>
@@ -37,6 +69,14 @@
     </div>
   </div>
 
+  <style>
+    #forecast-chart { height: 400px; }
+    @media (max-width: 576px) { #forecast-chart { height: 260px; } }
+    /* Sticky header within the scrollable table area - needs its own
+       opaque background (matching Bootstrap's table-dark bg) since a
+       sticky element is otherwise transparent and rows would show through. */
+    #forecast-table thead th { position: sticky; top: 0; background-color: #212529; z-index: 1; }
+  </style>
   <script>
     document.getElementById('date-selector').addEventListener('change', function() {
       window.location.href = '/forecast?date=' + this.value;
@@ -44,6 +84,373 @@
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"
     integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="/static/chart-theme.js"></script>
+  <script src="/static/table.js"></script>
+  <script>
+    (async function () {
+      const chartDate = '{{ date }}';
+      let data;
+      try {
+        const resp = await fetch('/forecast/hourly.json?date=' + chartDate);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        data = await resp.json();
+      } catch (err) {
+        console.error('Failed to load hourly forecast:', err);
+        document.getElementById('forecast-chart-error').classList.remove('d-none');
+        return;
+      }
+
+      const orientations = data.orientations; // e.g. [90, 270], drives the forecast bar series
+      const labels = data.hours.map(h => h.time);
+      const hourCount = data.hours.length; // one entry per hour of the day, so also this chart's category count
+      const actualValues = data.hours.map(h => h.actual_total_kwh); // null where no measured data yet - the real values, used for the table/tooltip
+      const currentHourIndex = data.current_hour ? data.hours.findIndex(h => h.time === data.current_hour) : -1;
+      const partialKwh = data.current_hour_actual_partial_kwh; // how much the in-progress hour has produced so far (not a full hour's worth)
+      const actualLineColor = '#2fe0c8'; // calm but bright teal - reads clearly as "measured" against the blue/amber forecast bars without screaming
+      const trailingHourColor = '#8f7fc9'; // calm purple (matches ChartTheme's own palette) for the current, still-partial hour - distinct from the teal/blue/amber used elsewhere in this chart
+
+      function colorForIndex(idx) {
+        return idx === currentHourIndex ? trailingHourColor : actualLineColor;
+      }
+
+      // Fill in the current-hour slot for rendering continuity: with 'before'
+      // stepped mode (used by the aligned-* styles), a segment holds its
+      // *starting* point's value flat until the next point's x, so the last
+      // real value - having no next point, since the current hour is still
+      // null - never gets a segment drawn out to the current-hour boundary.
+      // Give the line something real to step to there - the live partial
+      // reading, if there is one (colored separately, since it's not a
+      // complete hour); otherwise fall back to cloning the last real value
+      // just to close the visual gap. Either way this is never shown in the
+      // tooltip or the table's Actual column as if it were actual_total_kwh -
+      // see fadeTrailingSegment/rows below.
+      const chartActualValues = actualValues.slice();
+      if (currentHourIndex > 0 && chartActualValues[currentHourIndex] == null) {
+        if (partialKwh != null) {
+          chartActualValues[currentHourIndex] = partialKwh;
+        } else if (chartActualValues[currentHourIndex - 1] != null) {
+          chartActualValues[currentHourIndex] = chartActualValues[currentHourIndex - 1];
+        }
+      }
+
+      const columns = ['Hour', 'Forecast', 'Actual', 'Forecast cumul.', 'Actual cumul.'];
+      let cumForecastKwh = 0;
+      let cumActualKwh = 0;
+      const rows = data.hours.map((h, idx) => {
+        const row = { Hour: h.time, Forecast: h.total_kwh.toFixed(2) };
+        cumForecastKwh += h.total_kwh;
+        row['Forecast cumul.'] = cumForecastKwh.toFixed(2);
+        if (h.actual_total_kwh != null) {
+          cumActualKwh += h.actual_total_kwh;
+          row['Actual'] = h.actual_total_kwh.toFixed(2);
+          row['Actual cumul.'] = cumActualKwh.toFixed(2);
+        } else if (idx === currentHourIndex && partialKwh != null) {
+          row['Actual'] = `${partialKwh.toFixed(2)} (so far)`;
+          row['Actual cumul.'] = `${(cumActualKwh + partialKwh).toFixed(2)} (so far)`;
+        } else {
+          // Not a completed hour and not the live partial one either - no
+          // meaningful "actual production through this hour" figure yet
+          // (covers future hours, and any hour past-due but still missing
+          // data, e.g. no inverter connection).
+          row['Actual'] = '—';
+          row['Actual cumul.'] = '—';
+        }
+        return row;
+      });
+      renderTable('forecast-table-head', 'forecast-table-body', 'forecast-table-empty', columns, rows);
+
+      // Four interchangeable looks for the actual-production overlay - pick
+      // one via the "Actual production style" selector above the chart.
+      // Bars on a category axis are centered on their tick, but a stepped
+      // line's flat run sits *between* ticks - so no stepped mode can ever
+      // make a line-based overlay land exactly on top of its forecast bar
+      // while both share that axis. Two different fixes for that, offered
+      // side by side to compare:
+      //  - capbars/dots stay on the existing category axis (matching
+      //    prices.html/history.html) but avoid interpolation entirely -
+      //    capbars draws Actual as a second, fully-overlapping bar (a
+      //    top-border-only "cap" per hour) which is trivially aligned since
+      //    it's centered on the same tick as its forecast bar; dots places a
+      //    single point per hour, also exactly on the tick.
+      //  - aligned-step/aligned-area switch to a real numeric (linear) x
+      //    axis so forecast bars can be centered at hour+0.5 (spanning
+      //    [hour, hour+1)) while the line's points sit at the interval's
+      //    left edge (hour) - 'before' stepping then holds flat across
+      //    exactly that same [hour, hour+1) span, so the two genuinely
+      //    overlap instead of just looking close.
+      // Either way, the current (still-partial) hour is drawn in a distinct
+      // color rather than faded/dashed - a plain color swap reads much more
+      // clearly than a faint dashed line did.
+
+      function forecastBarDatasetsCategory() {
+        return orientations.map((o, i) => ({
+          label: o + '°',
+          data: data.hours.map(h => h.by_orientation[o]),
+          backgroundColor: ChartTheme.seriesColor(i),
+          stack: 'forecast',
+        }));
+      }
+
+      function capBarsDataset() {
+        return {
+          type: 'bar',
+          label: 'Actual',
+          data: chartActualValues,
+          stack: 'actual', // separate stack from 'forecast' - not additive
+          grouped: false, // ...and not placed beside it either - fully overlap the same slot
+          backgroundColor: 'transparent',
+          borderColor: ctx => colorForIndex(ctx.dataIndex),
+          borderWidth: ctx => ({ top: ctx.dataIndex === currentHourIndex ? 4 : 3, left: 0, right: 0, bottom: 0 }),
+          order: -1,
+        };
+      }
+
+      function dotsDataset() {
+        return {
+          type: 'line',
+          label: 'Actual',
+          data: chartActualValues,
+          showLine: false,
+          spanGaps: false,
+          pointRadius: ctx => ctx.dataIndex === currentHourIndex ? 5 : 4,
+          pointBackgroundColor: ctx => colorForIndex(ctx.dataIndex),
+          pointBorderColor: '#222',
+          pointBorderWidth: 1,
+          order: -1,
+        };
+      }
+
+      function forecastBarDatasetsAligned() {
+        return orientations.map((o, i) => ({
+          label: o + '°',
+          data: data.hours.map((h, idx) => ({ x: idx + 0.5, y: h.by_orientation[o] })),
+          backgroundColor: ChartTheme.seriesColor(i),
+          stack: 'forecast',
+          barPercentage: 1.0,
+          categoryPercentage: 1.0,
+        }));
+      }
+
+      function alignedLineDataset(fill) {
+        const base = {
+          type: 'line',
+          label: 'Actual',
+          // With 'before' stepping, the segment ending at currentHourIndex
+          // draws flat at the *previous*, already-complete hour's real value
+          // across that whole segment before stepping down right at the
+          // boundary - so coloring that whole segment amber (as an earlier
+          // version did, keyed on its p1DataIndex) mislabeled a full hour of
+          // real data as "current/partial". The current hour's own amber
+          // span is drawn separately by currentHourStepExtensionPlugin,
+          // covering only its own [hour, hour+1) - this stays a plain,
+          // single-colored line.
+          data: chartActualValues.map((v, idx) => ({ x: idx, y: v })),
+          borderColor: actualLineColor,
+          spanGaps: false, // don't bridge the gap where there's no measured data yet
+          stepped: 'before',
+          pointRadius: 0,
+          order: -1, // draw on top of the stacked bars
+        };
+        if (fill) {
+          return { ...base, borderWidth: 1.5, fill: 'origin', backgroundColor: ChartTheme.withAlpha(actualLineColor, 0.2) };
+        }
+        return { ...base, borderWidth: 2, fill: false };
+      }
+
+      let chart = null;
+
+      // The vertical "now" marker - only drawn when viewing today. Styled
+      // and positioned to match the RCE prices chart's now-line: red, solid,
+      // and swept to the actual current minute rather than just snapping to
+      // the current hour's tick.
+      const nowLinePlugin = {
+        id: 'nowLine',
+        afterDatasetsDraw(c) {
+          if (currentHourIndex < 0) return;
+          const { ctx, scales: { x, y } } = c;
+          const now = new Date();
+          const hourFraction = (now.getMinutes() + now.getSeconds() / 60) / 60;
+          // aligned mode's ticks are hour *starts* (hour 8's tick = 08:00),
+          // so the sweep runs from that tick straight to the next one.
+          // capbars/dots keep the old category axis, where ticks are hour
+          // *centers* (hour 8's tick sits at 08:00's bar's middle) - shift
+          // back half an hour so the sweep still runs tick-to-tick instead
+          // of landing half an hour off centered on the wrong point.
+          const aligned = x.type === 'linear';
+          const nowIdx = currentHourIndex + hourFraction - (aligned ? 0 : 0.5);
+          const xPx = x.getPixelForValue(nowIdx);
+          ctx.save();
+          ctx.strokeStyle = '#ff5555'; // matches the RCE prices chart's now-line
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(xPx, y.top);
+          ctx.lineTo(xPx, y.bottom);
+          ctx.stroke();
+          ctx.restore();
+        }
+      };
+
+      // aligned-step/aligned-area only: 'before' stepping needs a point at
+      // hour+1 to hold a segment flat across that hour's span - which is
+      // exactly what the current, still-in-progress hour doesn't have (its
+      // point is the last one; there's nothing after it to step to). Without
+      // this, the current hour's own value never gets a visible flat run of
+      // its own - just the tail end of the *previous* hour's segment
+      // dropping to a single point, which reads as barely more than a
+      // vertical tick. Draw the missing flat run (and, for the area style,
+      // its fill) manually across the current hour's own [hour, hour+1)
+      // span instead of adding a real data point, which would shift every
+      // dataset's index alignment out of sync for tooltips/interaction.
+      const currentHourStepExtensionPlugin = {
+        id: 'currentHourStepExtension',
+        afterDatasetsDraw(c) {
+          const style = document.getElementById('actual-style').value;
+          if (style !== 'aligned-step' && style !== 'aligned-area') return;
+          if (currentHourIndex < 0) return;
+          const value = chartActualValues[currentHourIndex];
+          if (value == null) return;
+          const { ctx, scales: { x, y } } = c;
+          const x0 = x.getPixelForValue(currentHourIndex);
+          const x1 = x.getPixelForValue(currentHourIndex + 1);
+          const yPx = y.getPixelForValue(value);
+          ctx.save();
+          if (style === 'aligned-area') {
+            const yBase = y.getPixelForValue(0);
+            ctx.fillStyle = ChartTheme.withAlpha(trailingHourColor, 0.2);
+            ctx.fillRect(x0, yPx, x1 - x0, yBase - yPx);
+          }
+          ctx.strokeStyle = trailingHourColor;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(x0, yPx);
+          ctx.lineTo(x1, yPx);
+          ctx.stroke();
+          ctx.restore();
+        }
+      };
+
+      function buildChart() {
+        const style = document.getElementById('actual-style').value;
+        const aligned = style === 'aligned-step' || style === 'aligned-area';
+        if (chart) chart.destroy();
+
+        const datasets = aligned
+          ? [...forecastBarDatasetsAligned(), alignedLineDataset(style === 'aligned-area')]
+          : [...forecastBarDatasetsCategory(), style === 'capbars' ? capBarsDataset() : dotsDataset()];
+
+        // capbars/dots keep the existing category axis (one tick per hour,
+        // bars centered on it); aligned-* switch to a real numeric axis so
+        // forecast bars (centered at hour+0.5) and the line (points at the
+        // interval's left edge, hour) can genuinely share the same
+        // [hour, hour+1) span instead of just looking close - see the
+        // dataset-builder comments above for why that split is necessary.
+        const xScale = aligned ? {
+          type: 'linear',
+          stacked: true,
+          min: 0,
+          max: hourCount,
+          afterBuildTicks: axis => { axis.ticks = data.hours.map((h, idx) => ({ value: idx })); },
+          ticks: {
+            color: ChartTheme.axisTickColor,
+            maxRotation: 0,
+            autoSkip: false,
+            font: { size: 11 },
+            callback(value) {
+              const step = this.chart.width < 500 ? 4 : 2;
+              const idx = Math.round(value);
+              return idx % step === 0 && data.hours[idx] ? data.hours[idx].time : '';
+            },
+          },
+          grid: { display: false },
+          border: { color: ChartTheme.axisBorderColor }
+        } : {
+          type: 'category',
+          stacked: true,
+          ticks: {
+            color: ChartTheme.axisTickColor,
+            maxRotation: 0,
+            autoSkip: false,
+            font: { size: 11 },
+            callback: ChartTheme.thinTicksCallback(2, 4),
+          },
+          grid: { display: false },
+          border: { color: ChartTheme.axisBorderColor }
+        };
+
+        chart = new Chart(document.getElementById('forecast-chart'), {
+          type: 'bar',
+          plugins: [currentHourStepExtensionPlugin, nowLinePlugin],
+          data: aligned ? { datasets } : { labels, datasets },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: ChartTheme.legend,
+              tooltip: {
+                ...ChartTheme.tooltip,
+                // At currentHourIndex, chartActualValues holds either the
+                // real partial reading (partialKwh != null - show it,
+                // clearly marked as partial) or, lacking that, a clone of
+                // the last real hour used only to close the visual gap
+                // (partialKwh == null - hide it, it's not a real reading).
+                filter: item => !(item.dataset.label === 'Actual' && item.dataIndex === currentHourIndex && partialKwh == null),
+                callbacks: {
+                  // The aligned-* styles put forecast bars at x=hour+0.5 and
+                  // the Actual line at x=hour - two different x values for
+                  // "the same hour". Chart.js's default tooltip title comes
+                  // from whichever dataset's point is nearest the cursor, so
+                  // it'd flip between an integer ("7") and a half ("7.5")
+                  // depending on which one that happened to be. dataIndex is
+                  // the array position, not the x value, and is consistent
+                  // across every dataset for a given hour regardless of
+                  // style - use that instead to always show the real hour.
+                  title: items => items.length ? data.hours[items[0].dataIndex].time : '',
+                  // item.parsed.y is always a plain number regardless of
+                  // whether the underlying data point was a bare number
+                  // (category-axis datasets) or a {x, y} object
+                  // (aligned-axis datasets) - item.raw would differ between
+                  // the two and need separate handling.
+                  label: item => {
+                    const val = item.parsed.y;
+                    if (item.dataset.label !== 'Actual' || val == null) {
+                      return ` ${item.dataset.label}: ${val != null ? val.toFixed(2) : '—'} kWh`;
+                    }
+                    const suffix = item.dataIndex === currentHourIndex ? ' (so far, partial)' : '';
+                    return ` Actual: ${val.toFixed(2)} kWh${suffix}`;
+                  },
+                }
+              }
+            },
+            scales: {
+              x: xScale,
+              y: {
+                stacked: true,
+                beginAtZero: true,
+                ticks: {
+                  color: ChartTheme.axisTickColor,
+                  font: { size: 11 },
+                  callback(v) {
+                    return this.chart.width < 500 ? v : v + ' kWh';
+                  },
+                },
+                grid: {
+                  color: ChartTheme.gridColor,
+                  borderDash: ChartTheme.gridDash,
+                },
+                border: { color: ChartTheme.axisBorderColor }
+              }
+            }
+          }
+        });
+      }
+
+      document.getElementById('actual-style').addEventListener('change', buildChart);
+      buildChart();
+    })();
+  </script>
 </body>
 
 </html>

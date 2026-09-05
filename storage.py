@@ -408,3 +408,33 @@ def backfill_hourly_summary(conn: sqlite3.Connection, full_rescan: bool = False)
         conn.commit()
         backfilled += 1
     return backfilled
+
+
+def get_pv_kwh_so_far(conn: sqlite3.Connection, hour_start: int, as_of: int) -> Optional[float]:
+    """Actual PV production from `hour_start` up to `as_of` - which, unlike
+    hourly_summary's pv_kwh, may be *before* the hour has finished (e.g.
+    `as_of` = now, for the currently in-progress hour). Same e_day-diffing
+    logic as backfill_hourly_summary's pv_kwh column, just against the
+    hour's current partial end point instead of its completed one
+    (hour_start + 3600). Returns None if there's no e_day sample yet in
+    [hour_start, as_of).
+    """
+    current = conn.execute(
+        "SELECT MAX(e_day) FROM inverter_history WHERE timestamp_epoch >= ? AND timestamp_epoch < ?",
+        (hour_start, as_of),
+    ).fetchone()[0]
+    if current is None:
+        return None
+    previous = conn.execute(
+        "SELECT MAX(e_day) FROM inverter_history WHERE timestamp_epoch >= ? AND timestamp_epoch < ?",
+        (hour_start - 3600, hour_start),
+    ).fetchone()[0]
+    if previous is None:
+        return None
+    # e_day resets to 0 right after local midnight - see
+    # backfill_hourly_summary's docstring for why this is keyed off the
+    # value actually dropping rather than the hour crossing a calendar-day
+    # boundary.
+    if current < previous:
+        return current
+    return current - previous
