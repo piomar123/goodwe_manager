@@ -1,0 +1,151 @@
+/* Live power-flow diagram (see
+   docs/superpowers/specs/2026-09-03-live-power-flow-dashboard-design.md and
+   its mockups under docs/superpowers/mockups/, which this was ported from
+   verbatim after several rounds of visual iteration there). Plain CSS, no
+   build step - matches this project's existing convention of loading
+   everything via <link>/<script> tags. */
+
+.diagram {
+  position: relative;
+  display: grid;
+  /* Inverter gets the most width (it has the longest status text, e.g.
+     "Normal (Off-Grid)"); Junction gets barely any (it's just a dot).
+     Backup/Load are a flex pair (see .bottom-row) spanning the merged
+     Inverter+Junction column space instead of individually inheriting
+     those columns' widths - neither needs Inverter's extra width or
+     Junction's narrowness, both have short content ("14 W", "1017 W").
+     This is safe even though the pair's centering can shift slightly
+     with content width, because the connecting lines are computed from
+     each box's own rendered position (see diagram-render.js), not from
+     column/flex alignment. */
+  grid-template-columns: minmax(90px, 1fr) minmax(130px, 1.4fr) minmax(24px, 0.35fr) minmax(90px, 1fr);
+  grid-template-areas:
+    ".        pv         .          ."
+    "battery  inverter   junction   grid"
+    ".        bottomrow  bottomrow  .";
+  gap: 56px 32px;
+  max-width: 620px;
+  margin: 24px auto;
+}
+
+.bottom-row {
+  grid-area: bottomrow;
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+}
+
+.diagram-svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 0;
+}
+
+.diagram-node {
+  position: relative;
+  z-index: 1;
+  overflow: hidden;
+  border: 2px solid #6c757d;
+  border-radius: 8px;
+  padding: 6px;
+  text-align: center;
+  font-size: 0.85rem;
+  background: var(--bs-body-bg, #272b30);
+  color: #6c757d;
+  cursor: pointer;
+}
+
+#node-pv { grid-area: pv; }
+#node-battery { grid-area: battery; }
+#node-inverter { grid-area: inverter; }
+#node-grid { grid-area: grid; }
+#node-backup, #node-load { flex: 1 1 0; min-width: 90px; max-width: 160px; }
+
+#node-junction {
+  grid-area: junction;
+  border: none;
+  padding: 0;
+  width: 7px;
+  height: 7px;
+  justify-self: center;
+  align-self: center;
+  border-radius: 50%;
+  background: currentColor;
+  cursor: default;
+}
+
+.diagram-node-content {
+  position: relative;
+  z-index: 1;
+}
+
+/* The border, icon, and every number in a node take the status color as
+   one unit (no separate card background), so the state reads as a single
+   color rather than a colored outline around neutral-colored text. The
+   battery node is the one exception - see its water-fill rules below,
+   where text needs to stay readable against a color-filled background
+   instead. */
+.diagram-icon {
+  font-size: 1.5rem;
+  color: inherit;
+  display: block;
+}
+
+/* Name labels (PV, Battery, ...) are hidden by default - the icon alone
+   identifies the node - and only appear once details are expanded, as the
+   first line inside .diagram-details. */
+.diagram-node-name {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.diagram-node--grey { color: #6c757d; border-color: #6c757d; }
+.diagram-node--green { color: #28a745; border-color: #28a745; }
+.diagram-node--orange { color: #fd7e14; border-color: #fd7e14; }
+.diagram-node--red { color: #dc3545; border-color: #dc3545; }
+.diagram-node--pink { color: #e83e8c; border-color: #e83e8c; }
+.diagram-node--yellow { color: #ffc107; border-color: #ffc107; }
+
+/* Battery water-fill: height tracks SoC%, filled with the status color at
+   low opacity so it reads as a tint rather than a solid block. Text is
+   pinned to a fixed light color (not the status color) since it has to
+   stay legible whether it's sitting over the filled or empty part of the
+   box. No battery installed fades the whole node instead (see
+   diagram-render.js). */
+.battery-fill {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 0%;
+  background: currentColor;
+  opacity: 0.3;
+  z-index: 0;
+  transition: height 0.3s ease;
+}
+#node-battery .diagram-node-content,
+#node-battery .diagram-node-content .diagram-details {
+  color: #f1f3f5;
+}
+.diagram-node--grey .diagram-icon { color: #6c757d; }
+.diagram-node--green .diagram-icon { color: #28a745; }
+.diagram-node--orange .diagram-icon { color: #fd7e14; }
+.diagram-node--red .diagram-icon { color: #dc3545; }
+.diagram-node--pink .diagram-icon { color: #e83e8c; }
+.diagram-node--yellow .diagram-icon { color: #ffc107; }
+
+.diagram-details { display: none; font-size: 0.75rem; margin-top: 4px; opacity: 0.85; }
+.diagram-details--open { display: block; }
+.diagram-alert { color: #dc3545 !important; font-weight: bold; }
+
+@media (max-width: 400px) {
+  .diagram {
+    grid-template-columns: minmax(64px, 1fr) minmax(100px, 1.4fr) minmax(18px, 0.3fr) minmax(64px, 1fr);
+    gap: 44px 16px;
+    font-size: 0.7rem;
+  }
+  .bottom-row { gap: 16px; }
+}

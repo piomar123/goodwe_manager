@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Power-flow diagram mockup v3</title>
+<!-- v3: same node layout/colors/behavior as v2 (which had settled into a
+     good shape), but the connecting lines are now hand-drawn SVG computed
+     directly from box positions instead of the LeaderLine library. Several
+     rounds of fighting LeaderLine's socket/anchor/path-routing heuristics
+     (curved paths, chaotic 'grid' routing, label baseline offset, needing
+     invisible anchor divs for non-centered connections) suggested it was
+     worth trying full manual control instead. v2 (and its snapshots) stay
+     available as a fallback if this turns out worse. -->
+<link href="../../../static/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<style>
+  body { padding: 24px; }
+
+  .diagram {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(90px, 1fr) minmax(130px, 1.4fr) minmax(24px, 0.35fr) minmax(90px, 1fr);
+    grid-template-areas:
+      ".        pv         .          ."
+      "battery  inverter   junction   grid"
+      ".        bottomrow  bottomrow  .";
+    gap: 56px 32px;
+    max-width: 620px;
+    margin: 24px auto;
+  }
+
+  .bottom-row {
+    grid-area: bottomrow;
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+  }
+
+  /* The SVG overlay sits behind the nodes (lower z-index) and ignores
+     pointer events entirely, so it never has to fight for clicks the way
+     LeaderLine's own overlay did. */
+  .diagram-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+    z-index: 0;
+  }
+
+  .diagram-node {
+    position: relative;
+    z-index: 1;
+    overflow: hidden;
+    border: 2px solid #6c757d;
+    border-radius: 8px;
+    padding: 6px;
+    text-align: center;
+    font-size: 0.85rem;
+    background: var(--bs-body-bg, #272b30);
+    color: #6c757d;
+    cursor: pointer;
+  }
+
+  #node-pv { grid-area: pv; }
+  #node-battery { grid-area: battery; }
+  #node-inverter { grid-area: inverter; }
+  #node-grid { grid-area: grid; }
+  #node-backup, #node-load { flex: 1 1 0; min-width: 90px; max-width: 160px; }
+
+  #node-junction {
+    grid-area: junction;
+    border: none;
+    padding: 0;
+    width: 7px;
+    height: 7px;
+    justify-self: center;
+    align-self: center;
+    border-radius: 50%;
+    background: currentColor;
+    cursor: default;
+  }
+
+  .diagram-node-content {
+    position: relative;
+    z-index: 1;
+  }
+
+  .diagram-icon {
+    font-size: 1.5rem;
+    color: inherit;
+    display: block;
+  }
+
+  .diagram-node-name {
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+
+  .diagram-node--grey { color: #6c757d; border-color: #6c757d; }
+  .diagram-node--green { color: #28a745; border-color: #28a745; }
+  .diagram-node--orange { color: #fd7e14; border-color: #fd7e14; }
+  .diagram-node--red { color: #dc3545; border-color: #dc3545; }
+  .diagram-node--pink { color: #e83e8c; border-color: #e83e8c; }
+  .diagram-node--yellow { color: #ffc107; border-color: #ffc107; }
+
+  .battery-fill {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 0%;
+    background: currentColor;
+    opacity: 0.3;
+    z-index: 0;
+    transition: height 0.3s ease;
+  }
+  #node-battery .diagram-node-content,
+  #node-battery .diagram-node-content .diagram-details {
+    color: #f1f3f5;
+  }
+  .diagram-node--grey .diagram-icon { color: #6c757d; }
+  .diagram-node--green .diagram-icon { color: #28a745; }
+  .diagram-node--orange .diagram-icon { color: #fd7e14; }
+  .diagram-node--red .diagram-icon { color: #dc3545; }
+  .diagram-node--pink .diagram-icon { color: #e83e8c; }
+  .diagram-node--yellow .diagram-icon { color: #ffc107; }
+
+  .diagram-details { display: none; font-size: 0.75rem; margin-top: 4px; opacity: 0.85; }
+  .diagram-details--open { display: block; }
+  .diagram-alert { color: #dc3545 !important; font-weight: bold; }
+
+  @media (max-width: 400px) {
+    .diagram {
+      grid-template-columns: minmax(64px, 1fr) minmax(100px, 1.4fr) minmax(18px, 0.3fr) minmax(64px, 1fr);
+      gap: 44px 16px;
+      font-size: 0.7rem;
+    }
+    .bottom-row { gap: 16px; }
+  }
+
+  .scenario-bar { max-width: 480px; margin: 0 auto 12px; text-align: center; }
+  .scenario-bar button { margin: 2px; }
+  .viewport-note { max-width: 480px; margin: 0 auto 12px; font-size: 0.8rem; color: var(--bs-secondary-color, #adb5bd); text-align: center; }
+</style>
+</head>
+<body>
+
+<h1 class="h4 text-center">Live power-flow diagram — mockup v3</h1>
+<p class="viewport-note">Same layout as v2, but the lines are hand-drawn SVG instead of the LeaderLine library. Tap a node to reveal its name and extra details.</p>
+
+<div class="scenario-bar" id="scenario-bar"></div>
+
+<div class="diagram">
+  <svg id="diagram-svg" class="diagram-svg"></svg>
+  <div id="node-pv" class="diagram-node" data-toggle-details="pv">
+    <i class="bi bi-sun diagram-icon"></i>
+    <div id="pv-watts">- W</div>
+    <div id="pv-details" class="diagram-details">
+      <div class="diagram-node-name">PV</div>
+      <div>PV1: <span id="pv-string1">-</span></div>
+      <div>PV2: <span id="pv-string2">-</span></div>
+    </div>
+  </div>
+  <div id="node-battery" class="diagram-node diagram-node--grey" data-toggle-details="battery">
+    <div id="battery-fill" class="battery-fill"></div>
+    <div class="diagram-node-content">
+      <i class="bi bi-battery-half diagram-icon"></i>
+      <div id="battery-soc">- %</div>
+      <div id="battery-watts">- W</div>
+      <div id="battery-details" class="diagram-details">
+        <div class="diagram-node-name">Battery</div>
+        <div><span id="battery-voltage">-</span> V</div>
+        <div><span id="battery-temp">-</span> °C</div>
+      </div>
+    </div>
+  </div>
+  <div id="node-inverter" class="diagram-node diagram-node--grey" data-toggle-details="inverter">
+    <i class="bi bi-cpu diagram-icon"></i>
+    <div id="inverter-status">-</div>
+    <div id="inverter-details" class="diagram-details">
+      <div class="diagram-node-name">Inverter</div>
+      <div>Air: <span id="inverter-temp-air">-</span> °C</div>
+      <div>Internal: <span id="inverter-temp">-</span> °C</div>
+    </div>
+  </div>
+  <div id="node-junction" class="diagram-node diagram-node--grey"></div>
+  <div id="node-grid" class="diagram-node diagram-node--grey" data-toggle-details="grid">
+    <i class="bi bi-broadcast-pin diagram-icon"></i>
+    <div id="grid-watts">- W</div>
+    <div id="grid-details" class="diagram-details">
+      <div class="diagram-node-name">Grid</div>
+      <div id="grid-meter">-</div>
+      <div id="grid-voltages">-</div>
+      <div id="grid-freqs">-</div>
+    </div>
+  </div>
+  <div class="bottom-row">
+    <div id="node-backup" class="diagram-node" data-toggle-details="backup">
+      <i class="bi bi-plug diagram-icon"></i>
+      <div id="backup-watts">- W</div>
+      <div id="backup-details" class="diagram-details">
+        <div class="diagram-node-name">Backup</div>
+        <div id="backup-line1">L1: <span id="backup-i1">-</span> A</div>
+        <div id="backup-line2">L2: <span id="backup-i2">-</span> A</div>
+        <div id="backup-line3">L3: <span id="backup-i3">-</span> A</div>
+      </div>
+    </div>
+    <div id="node-load" class="diagram-node" data-toggle-details="load">
+      <i class="bi bi-house diagram-icon"></i>
+      <div id="load-watts">- W</div>
+      <div id="load-details" class="diagram-details">
+        <div class="diagram-node-name">Load</div>
+        <div>L1: <span id="load-p1">-</span></div>
+        <div>L2: <span id="load-p2">-</span></div>
+        <div>L3: <span id="load-p3">-</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Hardcoded scenarios pulled from real data.db rows checked during the
+  // design phase (see docs/superpowers/specs/2026-09-03-...design.md) - not
+  // wired to SSE, just for eyeballing colors/layout/spacing before building
+  // the real diagram-calc.js/diagram-render.js.
+  var SCENARIOS = {
+    'Day: charging': {
+      pv: 1367, pv1: 700, vpv1: 320, pv2: 667, vpv2: 318,
+      battery: { watts: 364, color: 'green', direction: 'charge' }, soc: 52, vbat: 320.1, batTemp: 28,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 32, temp: 38,
+      // ~13W baseline, not exactly 0 - see the comment on FULL_THICKNESS_WATTS's
+      // neighboring backup-baseline note below for why (checked against real
+      // data: it's roughly constant, not proportional to load as first guessed).
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 9, color: 'grey' }, gridV: [230.1, 231.4, 229.8], gridF: [50.01, 50.01, 50.0], meterP: [3, 3, 3],
+      load: 960, loadP: [320, 340, 300],
+    },
+    'Night: grid-covered, battery idle': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      // Corrected back: 30-day production data at near-zero power (ppv=0,
+      // |pbattery1|<50W) is 98.6% "Standby" (only 1.4% "Discharge") - the
+      // single "Discharge" sample the original spec investigation found
+      // was the unrepresentative outlier, not the norm. Standby genuinely
+      // has no defined direction, so the fix is in drawEdge (only show an
+      // arrowhead when direction is actually known), not in this data.
+      battery: { watts: 31, color: 'grey', direction: 'none' }, soc: 100, vbat: 200.9, batTemp: 18,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 15, temp: 20,
+      // ~13W baseline, not exactly 0 - see the comment on FULL_THICKNESS_WATTS's
+      // neighboring backup-baseline note below for why (checked against real
+      // data: it's roughly constant, not proportional to load as first guessed).
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 385, color: 'orange' }, gridV: [229.0, 230.2, 228.6], gridF: [49.99, 49.99, 50.0], meterP: [128, 129, 128],
+      load: 382, loadP: [130, 125, 127],
+    },
+    // Corrected against a real Fault event found in production data
+    // (2026-04-23, grid_mode_label=Fault, backup_ptotal 5480-5750W): Load
+    // was NOT 0 during the fault - it stayed substantial (2148-4851W,
+    // fluctuating) the whole time. Originally assumed Load would die
+    // along with the grid since it's tied to the same physical
+    // connection; the real data doesn't support that assumption, so Load
+    // is left nonzero here rather than asserting something unverified.
+    'Grid Fault (blackout)': {
+      pv: 2100, pv1: 1050, vpv1: 330, pv2: 1050, vpv2: 328,
+      battery: { watts: 1500, color: 'orange', direction: 'discharge' }, soc: 40, vbat: 195.2, batTemp: 30,
+      inverter: { color: 'pink', label: 'Normal (Off-Grid)' }, tempAir: 34, temp: 40,
+      backup: 5500, backupI: [12.1, 14.0, 11.8], disconnected: true,
+      grid: { watts: 0, color: 'red' }, gridV: [0, 0, 0], gridF: [0, 0, 0], meterP: [0, 0, 0],
+      load: 3200, loadP: [1050, 1100, 1050],
+    },
+    // Real single-phase failure, fully confirmed against production data
+    // for the exact row (2026-04-08 13:37:08): vgrid2 dropped to 0V while
+    // vgrid/vgrid3 stayed ~224V, meter_active_power2 went to 0 while
+    // phases 1/3 kept importing/exporting normally, grid_mode_label read
+    // "Fault" for the whole connection even though only one phase actually
+    // failed (a 3-phase system can't stay synced with one phase dead) -
+    // and notably work_mode_label was "Normal (Off-Grid)", not a work-mode
+    // fault: the inverter's own response to a grid-side fault is to switch
+    // to island mode, a genuinely different field/failure mode than an
+    // internal Fault Mode. (First pass at this scenario guessed On-Grid
+    // green and SoC 70 - both wrong; corrected once the row came back.)
+    'Single-phase grid failure (L2 dead)': {
+      pv: 42, pv1: 21, vpv1: 300, pv2: 21, vpv2: 298,
+      battery: { watts: 22, color: 'orange', direction: 'discharge' }, soc: 11, vbat: 190.0, batTemp: 20,
+      inverter: { color: 'pink', label: 'Normal (Off-Grid)' }, tempAir: 22, temp: 28,
+      backup: 10, backupI: [0.2, 0.2, 0.3], disconnected: true,
+      // meterP is the real per-phase meter_active_power1/2/3 for this row
+      // (-89, 0, -55) - shown as magnitudes; phase 2 reading 0 here is the
+      // clearest confirmation of the dead phase, more direct than voltage.
+      grid: { watts: 144, color: 'red' }, gridV: [224.2, 0.0, 223.9], gridF: [50.0, 0.0, 50.0], meterP: [89, 0, 55],
+      load: 316, loadP: [95, 0, 221],
+    },
+    // Real Fault Mode event, fully confirmed (id 16091898, 2025-08-12
+    // 10:53:06). Initially assumed no real Fault Mode sample existed at
+    // all (a 180-day check found none) - a full-history scan found 15,
+    // just older than that window. All 15 have backup_i ~0A and coincide
+    // with grid_mode_label=Fault - there's no evidence backup overload is
+    // involved; every single one is grid-triggered instead. This
+    // particular sample is, again, an L2-dead single-phase failure (like
+    // the scenario above) - just one severe enough to also trip an
+    // internal work-mode Fault, not merely a mode switch to Off-Grid.
+    // gridF, meterP, and the per-phase load split weren't queried for this
+    // row and are estimated, everything else is the real row's data.
+    'Inverter Fault Mode (real event, grid-triggered)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 31, color: 'orange', direction: 'discharge' }, soc: 16, vbat: 185.0, batTemp: 24,
+      inverter: { color: 'red', label: 'Fault Mode' }, tempAir: 24, temp: 30,
+      backup: 0, backupI: [0.0, 0.1, 0.0], disconnected: true,
+      grid: { watts: 95, color: 'red' }, gridV: [232.9, 0.0, 229.2], gridF: [50.0, 0.0, 50.0], meterP: [55, 0, 40],
+      load: 442, loadP: [140, 0, 302],
+    },
+    // Distinct real failure mode, per direct confirmation rather than
+    // DB records: sustained backup overload (>13.5A for ~a minute) trips
+    // a Fault that disables ALL output, backup included - a harder,
+    // more total shutdown than the grid-triggered Fault above (which
+    // still had live PV/battery/load numbers). No DB evidence of this
+    // exists or can exist: the last such event predates this Pi having a
+    // UPS, so the fault itself also cut power to the Pi running the
+    // logger, at the exact moment that would have recorded it.
+    'Fault after backup overload (real behavior, unloggable event)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 0, color: 'grey', direction: 'none' }, soc: 20, vbat: 188.0, batTemp: 30,
+      inverter: { color: 'red', label: 'Fault Mode' }, tempAir: 30, temp: 38,
+      backup: 0, backupI: [0.0, 0.0, 0.0], disconnected: true,
+      grid: { watts: 0, color: 'red' }, gridV: [0, 0, 0], gridF: [0, 0, 0], meterP: [0, 0, 0],
+      load: 0, loadP: [0, 0, 0],
+    },
+    'Grid Not Connected (inverter waiting)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 0, color: 'grey', direction: 'none' }, soc: 88, vbat: 205.0, batTemp: 25,
+      inverter: { color: 'grey', label: 'Wait Mode' }, tempAir: 20, temp: 24,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: true,
+      grid: { watts: 300, color: 'orange' }, gridV: [230.4, 229.9, 230.1], gridF: [50.02, 50.01, 50.02], meterP: [100, 100, 100],
+      load: 300, loadP: [100, 100, 100],
+    },
+    'High power (thickness check)': {
+      pv: 7500, pv1: 3800, vpv1: 340, pv2: 3700, vpv2: 338,
+      battery: { watts: 4000, color: 'green', direction: 'charge' }, soc: 61, vbat: 330.0, batTemp: 33,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 36, temp: 42,
+      // ~13W baseline, not exactly 0 - see the comment on FULL_THICKNESS_WATTS's
+      // neighboring backup-baseline note below for why (checked against real
+      // data: it's roughly constant, not proportional to load as first guessed).
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 2800, color: 'green' }, gridV: [231.0, 232.1, 230.5], gridF: [50.01, 50.0, 50.01], meterP: [933, 934, 933],
+      load: 3200, loadP: [1050, 1100, 1050],
+    },
+    // battery_mode 0 "No battery" - a PV+Grid-only install with no battery
+    // hardware at all. Same undirected-line treatment as Standby (no
+    // known/meaningful direction), but at genuinely 0W rather than a real
+    // idle trickle, and soc/vbat/temp are meaningless (shown as 0/blank).
+    'No battery installed': {
+      pv: 1800, pv1: 900, vpv1: 325, pv2: 900, vpv2: 322,
+      battery: { watts: 0, color: 'grey', direction: 'none', noBattery: true }, soc: 0, vbat: 0, batTemp: 0,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 28, temp: 34,
+      // ~13W baseline, not exactly 0 - see the comment on FULL_THICKNESS_WATTS's
+      // neighboring backup-baseline note below for why (checked against real
+      // data: it's roughly constant, not proportional to load as first guessed).
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 400, color: 'green' }, gridV: [230.5, 231.0, 229.9], gridF: [50.0, 50.01, 50.0], meterP: [133, 134, 133],
+      load: 1400, loadP: [460, 470, 470],
+    },
+    'Battery at SoC floor': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 250, color: 'red', direction: 'discharge' }, soc: 10, vbat: 190.0, batTemp: 22,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 18, temp: 24,
+      // ~13W baseline, not exactly 0 - see the comment on FULL_THICKNESS_WATTS's
+      // neighboring backup-baseline note below for why (checked against real
+      // data: it's roughly constant, not proportional to load as first guessed).
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 150, color: 'orange' }, gridV: [230, 230, 230], gridF: [50, 50, 50], meterP: [50, 50, 50],
+      load: 400, loadP: [130, 140, 130],
+    },
+  };
+
+  var LINE_COLORS = { grey: '#6c757d', green: '#28a745', orange: '#fd7e14', red: '#dc3545', pink: '#e83e8c', yellow: '#ffc107' };
+  var FULL_THICKNESS_WATTS = 6000, MIN_THICKNESS_PX = 2, MAX_THICKNESS_PX = 9;
+
+  function arrowThickness(watts) {
+    var w = Math.abs(watts);
+    if (w === 0) return 0;
+    var ratio = Math.min(w / FULL_THICKNESS_WATTS, 1);
+    return MIN_THICKNESS_PX + ratio * (MAX_THICKNESS_PX - MIN_THICKNESS_PX);
+  }
+
+  function fmtW(w) { return Math.round(w) + ' W'; }
+  function byId(id) { return document.getElementById(id); }
+
+  function setNodeColor(nodeId, colorName) {
+    var el = byId(nodeId);
+    el.className = el.className.replace(/\bdiagram-node--\w+\b/g, '').trim();
+    el.classList.add('diagram-node--' + colorName);
+  }
+
+  // --- Hand-drawn SVG connections ------------------------------------
+  //
+  // Every edge in this diagram is either purely horizontal or purely
+  // vertical by design (matching the grid layout), so a "point" is enough
+  // to describe each connection - no path routing, no library sockets.
+  // Backup/Load (in the flex-based bottom row) aren't centered under
+  // Inverter/Junction's column, so their point deliberately uses the
+  // *other* element's center coordinate instead of their own - the same
+  // trick used in v2, just done directly as coordinate math instead of via
+  // invisible anchor divs LeaderLine could anchor to.
+
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+    return el;
+  }
+
+  function diagramRect() {
+    return document.querySelector('.diagram').getBoundingClientRect();
+  }
+
+  function centerX(el) {
+    var c = diagramRect(), r = el.getBoundingClientRect();
+    return (r.left + r.right) / 2 - c.left;
+  }
+  function centerY(el) {
+    var c = diagramRect(), r = el.getBoundingClientRect();
+    return (r.top + r.bottom) / 2 - c.top;
+  }
+  function edgeY(el, which) {
+    var c = diagramRect(), r = el.getBoundingClientRect();
+    return (which === 'top' ? r.top : r.bottom) - c.top;
+  }
+  function edgeX(el, which) {
+    var c = diagramRect(), r = el.getBoundingClientRect();
+    return (which === 'left' ? r.left : r.right) - c.left;
+  }
+
+  // Returns the six edge geometries fresh from current DOM positions -
+  // called on every render/resize, cheap enough for ~6 lines. Points sit
+  // exactly on each box's true edge - the line itself was never the
+  // problem; only the arrowhead tip needed nudging (see drawEdge below).
+  function computeEdges() {
+    var pv = byId('node-pv'), battery = byId('node-battery'), inverter = byId('node-inverter'),
+        junction = byId('node-junction'), backup = byId('node-backup'), grid = byId('node-grid'), load = byId('node-load');
+    return {
+      pv: { x1: centerX(inverter), y1: edgeY(pv, 'bottom'), x2: centerX(inverter), y2: edgeY(inverter, 'top') },
+      battery: { x1: edgeX(battery, 'right'), y1: centerY(inverter), x2: edgeX(inverter, 'left'), y2: centerY(inverter) },
+      backup: { x1: centerX(backup), y1: edgeY(inverter, 'bottom'), x2: centerX(backup), y2: edgeY(backup, 'top') },
+      bus: { x1: edgeX(inverter, 'right'), y1: centerY(inverter), x2: edgeX(junction, 'left'), y2: centerY(inverter) },
+      grid: { x1: edgeX(junction, 'right'), y1: centerY(inverter), x2: edgeX(grid, 'left'), y2: centerY(inverter) },
+      load: { x1: centerX(junction), y1: centerY(junction), x2: centerX(junction), y2: edgeY(load, 'top') },
+    };
+  }
+
+  // Moves a point `amount` px along `dir` ('up'/'down'/'left'/'right').
+  function moveAlong(x, y, dir, amount) {
+    switch (dir) {
+      case 'right': return [x + amount, y];
+      case 'left': return [x - amount, y];
+      case 'down': return [x, y + amount];
+      case 'up': return [x, y - amount];
+    }
+  }
+
+  // dir here is the direction FROM the back corners TO the tip.
+  function arrowheadPolygonPoints(tipX, tipY, dir, size) {
+    var half = size * 0.6;
+    var back = moveAlong(tipX, tipY, dir, -size);
+    if (dir === 'right' || dir === 'left') return [[back[0], back[1] - half], [tipX, tipY], [back[0], back[1] + half]];
+    return [[back[0] - half, back[1]], [tipX, tipY], [back[0] + half, back[1]]];
+  }
+
+  // Tip nudged TIP_OVERLAP_PX past the box edge (into the box) so it reads
+  // as touching the border rather than just meeting it edge-on; the line
+  // is then retreated `size` back from that *same* tip point, so its
+  // round-capped end sits exactly at the triangle's flat back edge -
+  // otherwise the (often-wider-than-the-tip) line stroke shows through
+  // past the point: "--->here" instead of "---here>".
+  var TIP_OVERLAP_PX = 0;
+
+  // directionKnown=false (only used for the battery edge's Standby/
+  // No-battery states) suppresses the arrowhead even when there's real
+  // nonzero magnitude to show - Standby's ~-30W is genuine BMS/self-
+  // consumption draw, but the firmware doesn't call it a discharge, and
+  // there's no reliable way to know which way it's actually flowing (see
+  // the spec's pbattery1-sign-unreliability finding), so drawing an
+  // arrowhead in either direction would be asserting something we don't
+  // actually know.
+  function drawEdge(svg, geo, colorName, thicknessPx, reversed, opacity, directionKnown) {
+    var hasFlow = thicknessPx > 0;
+    var color = LINE_COLORS[colorName] || LINE_COLORS.grey;
+    var strokeWidth = hasFlow ? thicknessPx : 1;
+    var horizontal = geo.y1 === geo.y2;
+    var hasDirection = hasFlow && directionKnown !== false;
+    // The arrow points from (x1,y1) to (x2,y2) by default; reversed swaps
+    // which end the arrowhead sits at, without changing where the line
+    // itself is drawn - same idea as flipping startPlug/endPlug in v2.
+    var arrowAtStart = hasDirection && reversed;
+    var arrowAtEnd = hasDirection && !reversed;
+
+    // At the thickness cap (9px), the old 1.6x multiplier only flared the
+    // head to ~14px - barely wider than the line itself, so on the
+    // high-power scenario the arrowhead barely read as a distinct shape.
+    var size = Math.max(8, 6 + strokeWidth * 2.2);
+    var endDir = horizontal ? (geo.x2 > geo.x1 ? 'right' : 'left') : (geo.y2 > geo.y1 ? 'down' : 'up');
+    var startDir = horizontal ? (endDir === 'right' ? 'left' : 'right') : (endDir === 'down' ? 'up' : 'down');
+
+    var endTip = moveAlong(geo.x2, geo.y2, endDir, TIP_OVERLAP_PX);
+    var startTip = moveAlong(geo.x1, geo.y1, startDir, TIP_OVERLAP_PX);
+    var lineEnd = arrowAtEnd ? moveAlong(endTip[0], endTip[1], endDir, -size) : [geo.x2, geo.y2];
+    var lineStart = arrowAtStart ? moveAlong(startTip[0], startTip[1], startDir, -size) : [geo.x1, geo.y1];
+
+    svg.appendChild(svgEl('line', {
+      x1: lineStart[0], y1: lineStart[1], x2: lineEnd[0], y2: lineEnd[1],
+      stroke: color, 'stroke-width': strokeWidth, 'stroke-linecap': 'round',
+      opacity: opacity === undefined ? 1 : opacity,
+    }));
+
+    if (!hasFlow) return;
+    if (arrowAtEnd) {
+      svg.appendChild(svgEl('polygon', { points: arrowheadPolygonPoints(endTip[0], endTip[1], endDir, size).map(function (p) { return p.join(','); }).join(' '), fill: color, opacity: opacity === undefined ? 1 : opacity }));
+    }
+    if (arrowAtStart) {
+      svg.appendChild(svgEl('polygon', { points: arrowheadPolygonPoints(startTip[0], startTip[1], startDir, size).map(function (p) { return p.join(','); }).join(' '), fill: color, opacity: opacity === undefined ? 1 : opacity }));
+    }
+  }
+
+  function drawCross(svg, geo) {
+    var midX = (geo.x1 + geo.x2) / 2, midY = (geo.y1 + geo.y2) / 2, r = 6;
+    var color = LINE_COLORS.red;
+    [[-r, -r, r, r], [-r, r, r, -r]].forEach(function (d) {
+      svg.appendChild(svgEl('line', {
+        x1: midX + d[0], y1: midY + d[1], x2: midX + d[2], y2: midY + d[3],
+        stroke: color, 'stroke-width': 2, 'stroke-linecap': 'round',
+      }));
+    });
+  }
+
+  function renderDiagram(s) {
+    byId('pv-watts').textContent = fmtW(s.pv);
+    byId('pv-string1').textContent = fmtW(s.pv1) + ', ' + s.vpv1.toFixed(1) + ' V';
+    byId('pv-string2').textContent = fmtW(s.pv2) + ', ' + s.vpv2.toFixed(1) + ' V';
+    setNodeColor('node-pv', s.pv > 0 ? 'green' : 'grey');
+
+    byId('battery-soc').textContent = s.soc + ' %';
+    byId('battery-watts').textContent = fmtW(s.battery.watts);
+    byId('battery-voltage').textContent = s.vbat.toFixed(1);
+    byId('battery-temp').textContent = s.batTemp;
+    setNodeColor('node-battery', s.battery.color);
+    byId('battery-fill').style.height = s.soc + '%';
+    // No battery hardware at all - the whole node fades out, distinct from
+    // Standby (which is a real battery just not actively charging or
+    // discharging right now).
+    byId('node-battery').style.opacity = s.battery.noBattery ? 0.5 : 1;
+
+    byId('inverter-status').textContent = s.inverter.label;
+    setNodeColor('node-inverter', s.inverter.color);
+    byId('inverter-temp-air').textContent = s.tempAir;
+    byId('inverter-temp').textContent = s.temp;
+
+    byId('backup-watts').textContent = fmtW(s.backup);
+    setNodeColor('node-backup', s.backup > 0 ? 'orange' : 'grey');
+    ['backup-i1', 'backup-i2', 'backup-i3'].forEach(function (id, i) {
+      byId(id).textContent = s.backupI[i].toFixed(1);
+      byId(id.replace('backup-i', 'backup-line')).classList.toggle('diagram-alert', s.backupI[i] >= 13.5);
+    });
+
+    byId('grid-watts').textContent = fmtW(s.grid.watts);
+    setNodeColor('node-grid', s.grid.color);
+    byId('grid-meter').textContent = s.meterP.map(function (v) { return Math.round(v); }).join(' / ') + ' W';
+    byId('grid-voltages').textContent = s.gridV.map(function (v) { return v.toFixed(1); }).join(' / ') + ' V';
+    byId('grid-freqs').textContent = s.gridF.map(function (v) { return v.toFixed(2); }).join(' / ') + ' Hz';
+
+    byId('load-watts').textContent = fmtW(s.load);
+    setNodeColor('node-load', s.load > 0 ? 'orange' : 'grey');
+    byId('load-p1').textContent = fmtW(s.loadP[0]);
+    byId('load-p2').textContent = fmtW(s.loadP[1]);
+    byId('load-p3').textContent = fmtW(s.loadP[2]);
+
+    redrawLines(s);
+  }
+
+  function redrawLines(s) {
+    var svg = byId('diagram-svg');
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var edges = computeEdges();
+
+    drawEdge(svg, edges.pv, s.pv > 0 ? 'green' : 'grey', arrowThickness(s.pv), false);
+    // No battery installed -> no wire to draw at all, not even an
+    // undirected line (unlike Standby, which is a real, connected battery).
+    if (!s.battery.noBattery) {
+      drawEdge(svg, edges.battery, s.battery.color, arrowThickness(s.battery.watts), s.battery.direction === 'charge', 1, s.battery.direction !== 'none');
+    }
+    drawEdge(svg, edges.backup, s.backup > 0 ? 'orange' : 'grey', arrowThickness(s.backup), false);
+    drawEdge(svg, edges.bus, s.disconnected ? 'red' : 'grey', s.disconnected ? 0 : arrowThickness(s.load), false, s.disconnected ? 0.5 : 1);
+    // Same fix as the battery Standby case: 'red' (Fault) doesn't tell us
+    // import vs. export, so defaulting to the "export" direction whenever
+    // color isn't 'orange' was asserting a direction we don't actually
+    // know during a fault - suppress the arrowhead instead.
+    drawEdge(svg, edges.grid, s.grid.color, arrowThickness(s.grid.watts), s.grid.color === 'orange', 1, s.grid.color !== 'red');
+    drawEdge(svg, edges.load, s.load > 0 ? 'orange' : 'grey', arrowThickness(s.load), false);
+    if (s.disconnected) drawCross(svg, edges.bus);
+  }
+
+  var lastScenario = null;
+  function render(s) {
+    lastScenario = s;
+    renderDiagram(s);
+  }
+
+  document.querySelectorAll('[data-toggle-details]').forEach(function (trigger) {
+    trigger.addEventListener('click', function () {
+      var key = trigger.getAttribute('data-toggle-details');
+      byId(key + '-details').classList.toggle('diagram-details--open');
+      if (lastScenario) redrawLines(lastScenario); // box heights can change
+    });
+  });
+
+  var bar = byId('scenario-bar');
+  Object.keys(SCENARIOS).forEach(function (name, i) {
+    var btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-outline-primary';
+    btn.textContent = name;
+    btn.addEventListener('click', function () { render(SCENARIOS[name]); });
+    bar.appendChild(btn);
+  });
+
+  document.fonts.ready.then(function () {
+    render(SCENARIOS[Object.keys(SCENARIOS)[0]]);
+    setTimeout(function () { if (lastScenario) redrawLines(lastScenario); }, 150);
+  });
+
+  window.addEventListener('resize', function () { if (lastScenario) redrawLines(lastScenario); });
+</script>
+</body>
+</html>

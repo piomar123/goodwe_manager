@@ -90,6 +90,7 @@ SELECTED_SENSORS = [
     'vbattery1',
     'ibattery1',
     'pbattery1',
+    'battery_mode',
     'battery_mode_label',
     'battery_temperature',
     'battery_soc',
@@ -109,6 +110,7 @@ SELECTED_SENSORS = [
     'meter_e_total_imp',
     'e_bat_charge_total',
     'e_bat_discharge_total',
+    'work_mode',
     'work_mode_label',
     'rssi',
 ]

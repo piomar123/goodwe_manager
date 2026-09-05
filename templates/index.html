@@ -5,6 +5,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link href="/static/bootstrap.min.css" rel="stylesheet">
+  <link href="/static/css/diagram.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
   <title>Energy Manager</title>
 </head>
 
@@ -19,17 +21,83 @@
           <span id="read-badge" class="badge" data-bs-toggle="tooltip" title="How long the server's read_runtime_data() call to the inverter itself took. Poor wifi to the inverter is the most likely cause of a high value here."></span>
           <span id="delivery-badge" class="badge" data-bs-toggle="tooltip" title="Extra delay delivering an update from the server to this browser, on top of the best-case delivery seen recently (clock-skew corrected, so it's a relative delay, not an absolute one)."></span>
         </div>
-        <div>PV: <span data-inverter="ppv"></span>W</div>
-        <div>Battery: <span data-inverter="pbattery1"></span>W, <span data-inverter="battery_soc"></span>%, <span data-inverter="vbattery1"></span>V</div>
-        <div>Load: <span data-inverter="load_ptotal"></span>W (<span data-inverter="load_p1"></span> / <span data-inverter="load_p2"></span> / <span data-inverter="load_p3"></span> W)</div>
-        <div>Backup: <span data-inverter="backup_ptotal"></span>W (<span data-inverter="backup_p1"></span> / <span data-inverter="backup_p2"></span> / <span data-inverter="backup_p3"></span> W)</div>
-        <div>Output: <span data-inverter="pgrid"></span> / <span data-inverter="pgrid2"></span> / <span data-inverter="pgrid3"></span> W</div>
-        <div>Grid: <span data-inverter="vgrid"></span> / <span data-inverter="vgrid2"></span> / <span data-inverter="vgrid3"></span> V, <span data-inverter="fgrid"></span> / <span data-inverter="fgrid2"></span> / <span data-inverter="fgrid3"></span> Hz</div>
-        <div>Meter: <span data-inverter="meter_active_power_total"></span>W (<span data-inverter="meter_active_power1"></span> / <span data-inverter="meter_active_power2"></span> / <span data-inverter="meter_active_power3"></span> W)</div>
-        <div>Diagnose: <span data-inverter="diagnose_result_label"></span></div>
-        <div>Hourly export: <span data-inverter="_hourly_meter_export"></span> kWh</div>
-        <div>Hourly import: <span data-inverter="_hourly_meter_import"></span> kWh</div>
-        <div>Hourly load: <span data-inverter="_hourly_load"></span> kWh</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <div class="diagram">
+          <svg id="diagram-svg" class="diagram-svg"></svg>
+          <div id="node-pv" class="diagram-node" data-toggle-details="pv">
+            <i class="bi bi-sun diagram-icon"></i>
+            <div id="pv-watts">- W</div>
+            <div id="pv-details" class="diagram-details">
+              <div class="diagram-node-name">PV</div>
+              <div>PV1: <span id="pv-string1">-</span></div>
+              <div>PV2: <span id="pv-string2">-</span></div>
+            </div>
+          </div>
+          <div id="node-battery" class="diagram-node diagram-node--grey" data-toggle-details="battery">
+            <div id="battery-fill" class="battery-fill"></div>
+            <div class="diagram-node-content">
+              <i class="bi bi-battery-half diagram-icon"></i>
+              <div id="battery-soc">- %</div>
+              <div id="battery-watts">- W</div>
+              <div id="battery-details" class="diagram-details">
+                <div class="diagram-node-name">Battery</div>
+                <div><span id="battery-voltage">-</span> V</div>
+                <div><span id="battery-temp">-</span> °C</div>
+              </div>
+            </div>
+          </div>
+          <div id="node-inverter" class="diagram-node diagram-node--grey" data-toggle-details="inverter">
+            <i class="bi bi-cpu diagram-icon"></i>
+            <div id="inverter-status">-</div>
+            <div id="inverter-details" class="diagram-details">
+              <div class="diagram-node-name">Inverter</div>
+              <div>Air: <span id="inverter-temp-air">-</span> °C</div>
+              <div>Internal: <span id="inverter-temp">-</span> °C</div>
+            </div>
+          </div>
+          <div id="node-junction" class="diagram-node diagram-node--grey"></div>
+          <div id="node-grid" class="diagram-node diagram-node--grey" data-toggle-details="grid">
+            <i class="bi bi-broadcast-pin diagram-icon"></i>
+            <div id="grid-watts">- W</div>
+            <div id="grid-details" class="diagram-details">
+              <div class="diagram-node-name">Grid</div>
+              <div id="grid-meter">-</div>
+              <div id="grid-voltages">-</div>
+              <div id="grid-freqs">-</div>
+            </div>
+          </div>
+          <div class="bottom-row">
+            <div id="node-backup" class="diagram-node" data-toggle-details="backup">
+              <i class="bi bi-plug diagram-icon"></i>
+              <div id="backup-watts">- W</div>
+              <div id="backup-details" class="diagram-details">
+                <div class="diagram-node-name">Backup</div>
+                <div id="backup-line1">L1: <span id="backup-i1">-</span> A</div>
+                <div id="backup-line2">L2: <span id="backup-i2">-</span> A</div>
+                <div id="backup-line3">L3: <span id="backup-i3">-</span> A</div>
+              </div>
+            </div>
+            <div id="node-load" class="diagram-node" data-toggle-details="load">
+              <i class="bi bi-house diagram-icon"></i>
+              <div id="load-watts">- W</div>
+              <div id="load-details" class="diagram-details">
+                <div class="diagram-node-name">Load</div>
+                <div>L1: <span id="load-p1">-</span></div>
+                <div>L2: <span id="load-p2">-</span></div>
+                <div>L3: <span id="load-p3">-</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="small text-muted">
+          <div>Diagnose: <span data-inverter="diagnose_result_label"></span></div>
+          <div>Hourly export: <span data-inverter="_hourly_meter_export"></span> kWh</div>
+          <div>Hourly import: <span data-inverter="_hourly_meter_import"></span> kWh</div>
+          <div>Hourly load: <span data-inverter="_hourly_load"></span> kWh</div>
+        </div>
       </div>
     </div>
     <div class="row">
@@ -188,6 +256,8 @@
       });
     });
   </script>
+  <script src="/static/js/diagram-calc.js"></script>
+  <script src="/static/js/diagram-render.js"></script>
 </body>
 
 </html>
