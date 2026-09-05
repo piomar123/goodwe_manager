@@ -345,9 +345,22 @@ def backfill_hourly_summary(conn: sqlite3.Connection, full_rescan: bool = False)
 
     pv_kwh (sourced from e_day) is a special case: e_day resets to 0 right
     after local midnight, unlike the other lifetime-cumulative counters, so
-    the hour whose start crosses a calendar-day boundary uses e_day's
-    current-hour value alone rather than diffing against the previous
-    (different day's) value.
+    an hour whose e_day value is *lower* than the previous hour's uses
+    e_day's current-hour value alone rather than diffing against the
+    previous (different day's) value.
+
+    This is keyed off the value actually dropping, not off the hour crossing
+    a calendar-day boundary - an earlier version compared hour_start's date
+    to hour_start-3600's date instead, on the assumption the reset always
+    lands inside local midnight's own hour bucket. It doesn't when the
+    inverter goes quiet overnight (no PV input) and the first sample(s) after
+    local midnight are still its last, stale pre-reset reading: the
+    calendar-day check fired anyway, attributing yesterday's *entire* e_day
+    total to the 00:00 hour (a large, physically impossible spike for a
+    single hour), and then the following hour's normal diff went sharply
+    negative against that stale carried-over baseline. Comparing values
+    instead of dates only fires once the counter has actually reset,
+    whichever hour that happens to land in.
 
     full_rescan is passed straight through to find_hours_needing_backfill -
     see its docstring for when a one-off full rescan is needed instead of
@@ -357,25 +370,14 @@ def backfill_hourly_summary(conn: sqlite3.Connection, full_rescan: bool = False)
     for hour_start in find_hours_needing_backfill(conn, full_rescan=full_rescan):
         current = _max_counters(conn, hour_start, hour_start + 3600)
         previous = _max_counters(conn, hour_start - 3600, hour_start)
-        # fromtimestamp() (no tzinfo) uses the host's local timezone, the
-        # exact symmetric inverse of parse_timestamp_epoch()'s naive-local
-        # strptime(...).timestamp() - so .date() reflects the same local
-        # calendar day the inverter itself resets e_day at. This requires
-        # the host's system timezone to be set to the inverter's own
-        # timezone (Europe/Warsaw); see the Global Constraints note.
-        crosses_midnight = (
-            datetime.fromtimestamp(hour_start).date() != datetime.fromtimestamp(hour_start - 3600).date()
-        )
         metrics = {}
         for source, target in _HOURLY_METRIC_COLUMNS:
-            if current is None:
+            if current is None or current[source] is None:
                 metrics[target] = None
-            elif source == 'e_day' and crosses_midnight:
+            elif previous is None or previous[source] is None:
+                metrics[target] = None
+            elif source == 'e_day' and current[source] < previous[source]:
                 metrics[target] = current[source]
-            elif previous is None:
-                metrics[target] = None
-            elif current[source] is None or previous[source] is None:
-                metrics[target] = None
             else:
                 metrics[target] = current[source] - previous[source]
         quality = _hour_quality_stats(conn, hour_start, hour_start + 3600)
