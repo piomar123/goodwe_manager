@@ -60,6 +60,14 @@ class AsyncioThread(threading.Thread):
     _db_conn: Optional[aiosqlite.Connection] = None
     _should_stop = threading.Event()
     _calculated_values_evaluator = CalculatedValuesEvaluator()
+    # Safety valve for the hour-rollover backfill retry loop (see
+    # _get_inverter_data): normally a pending hour verifies within a retry
+    # or two, but if it never can (e.g. a whole hour got silently skipped -
+    # its own next-hour proof-bucket then never exists either), retrying
+    # every ~1s forever would be an unbounded cost for a gap that was never
+    # going to be recoverable anyway. ~5 minutes at the loop's ~1s cadence
+    # is generous - past that, give up and move on instead of spinning.
+    _PENDING_BACKFILL_RETRY_LIMIT = 300
 
     def __init__(self,
                  group=None,
@@ -160,6 +168,7 @@ class AsyncioThread(threading.Thread):
             await self._seed_hour_start_baseline()
             await self._backfill_hourly_summary()
             current_hour_start, _ = storage.current_hour_bounds(datetime.now())
+            pending_backfill_retries = 0
             while True:
                 read_start = time.monotonic()
                 inverter_runtime = await self._inverter.read_runtime_data()
@@ -182,12 +191,8 @@ class AsyncioThread(threading.Thread):
                 announcer.announce(json.dumps(announce_payload))
                 new_hour_start, _ = storage.current_hour_bounds(datetime.now())
                 if new_hour_start != current_hour_start:
-                    # the wall clock just rolled into a new hour - the hour
-                    # that just ended now has a sample in the following
-                    # (current) hour, so it can be backfilled immediately,
-                    # rather than waiting on a fixed polling interval
-                    current_hour_start = new_hour_start
-                    await self._backfill_hourly_summary()
+                    current_hour_start, pending_backfill_retries = await self._advance_hour_or_retry_backfill(
+                        current_hour_start, new_hour_start, pending_backfill_retries)
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
@@ -201,24 +206,72 @@ class AsyncioThread(threading.Thread):
         self._calculated_values_evaluator.seed_hour_start(baseline)
 
     @staticmethod
-    async def _backfill_hourly_summary():
+    async def _backfill_hourly_summary(verify_hour_start: Optional[int] = None) -> bool:
         """Derives any newly-completed hourly_summary rows from
         inverter_history. Runs on a plain sqlite3 connection (not the shared
         aiosqlite one) via a worker thread, since storage.backfill_hourly_summary
         is synchronous and issues several queries per hour - a short-lived
         connection here avoids sharing sqlite3's not-thread-safe-by-default
         connection object with the asyncio loop's own aiosqlite connection.
+
+        If verify_hour_start is given, returns whether that specific hour has
+        a hourly_summary row now (whether this call just inserted it or it
+        was already there beforehand) - used by the polling loop to know
+        whether an hour-rollover's backfill attempt actually succeeded, since
+        it can legitimately find nothing to do yet (see the loop's comment).
+        Without verify_hour_start, always returns True.
         """
         def _run():
             conn = sqlite3.connect(storage.DATA_DB_PATH)
             try:
-                return storage.backfill_hourly_summary(conn)
+                backfilled = storage.backfill_hourly_summary(conn)
+                if verify_hour_start is None:
+                    return backfilled, True
+                row = conn.execute("SELECT 1 FROM hourly_summary WHERE hour_start = ?", (verify_hour_start,)).fetchone()
+                return backfilled, row is not None
             finally:
                 conn.close()
 
-        backfilled = await asyncio.to_thread(_run)
+        backfilled, verified = await asyncio.to_thread(_run)
         if backfilled:
             logger.info(f"Backfilled {backfilled} hourly_summary row(s)")
+        return verified
+
+    async def _advance_hour_or_retry_backfill(self, current_hour_start: int, new_hour_start: int, pending_retries: int) -> tuple:
+        """Called once per polling-loop iteration where the wall clock has
+        rolled past current_hour_start. Returns the (current_hour_start,
+        pending_retries) the loop should carry into its next iteration.
+
+        current_hour_start's hour can be backfilled once inverter_history
+        has a sample in the new hour, proving the old one is complete. On
+        the very first iteration after the boundary that proof doesn't
+        always exist yet: the sample inserted a few lines up in the caller
+        can still belong to the *old* hour (insert happens a moment before
+        the hour check), so backfill_hourly_summary correctly finds nothing
+        to do. In that case current_hour_start is deliberately *not*
+        adopted as new_hour_start, so the caller keeps calling this again
+        on every following iteration (a couple of seconds) instead of only
+        retrying at the *next* hour's rollover, up to an hour later, which
+        is what an unconditional update used to do.
+
+        pending_retries caps that retrying: if current_hour_start's hour can
+        never be proven complete (e.g. it was itself silently skipped
+        entirely - a single read_runtime_data() stall spanning more than an
+        hour - so it can never gain its own proof-bucket), retrying forever
+        would be an unbounded cost for a gap that was never recoverable
+        anyway. Past _PENDING_BACKFILL_RETRY_LIMIT retries, give up and
+        move on instead of spinning.
+        """
+        if await self._backfill_hourly_summary(verify_hour_start=current_hour_start):
+            return new_hour_start, 0
+        pending_retries += 1
+        if pending_retries >= self._PENDING_BACKFILL_RETRY_LIMIT:
+            logger.warning(
+                f"Giving up waiting for hour {current_hour_start} to become "
+                f"backfillable after {pending_retries} retries - moving on"
+            )
+            return new_hour_start, 0
+        return current_hour_start, pending_retries
 
     def ensure_inverter_ready(self):
         if self._asyncio_loop is None:
