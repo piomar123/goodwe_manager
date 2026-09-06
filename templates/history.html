@@ -7,13 +7,23 @@
   <link href="/static/bootstrap.min.css" rel="stylesheet">
   <title>History - Energy Manager</title>
   <style>
-    /* Bounding .table-responsive's height (rather than letting the whole
-       page scroll) gives `position: sticky` a well-defined scrolling
-       ancestor, so the header row reliably stays visible while scrolling
-       through rows - this is flaky/inconsistent across browsers when the
-       page itself is the scroll container. */
-    .table-responsive { max-height: 70vh; overflow-y: auto; }
-    .table-responsive thead th { position: sticky; top: 0; background-color: var(--bs-table-bg); z-index: 1; }
+    /* Confirmed on a real device: the *page* overflowing horizontally (not
+       any horizontal scroll container per se) breaks fixed/sticky-positioned
+       elements on Android Chrome - forcing the table to fit the viewport via
+       `table-layout: fixed` + truncation (tried first) fixed stickiness but
+       made wide tables unreadable. This instead confines the overflow to
+       `.history-table` itself (`overflow-x: auto` - a horizontal scrollbar
+       on the table, not the page), keeping every column at its natural
+       width, and goes back to the JS fixed-position-clone header from
+       table.js for stickiness: `position: sticky` can't work inside this
+       wrapper (its `overflow-x` forces the browser to also treat it as a
+       vertical scroll container per the CSS overflow spec, giving sticky
+       elements that box - not the page - to stick within), but
+       `position: fixed` isn't subject to that rule; it's only affected by a
+       transform/perspective/filter on an ancestor, none of which apply
+       here, so the clone stays positioned relative to the viewport exactly
+       as it was when the page itself did the horizontal overflowing. */
+    .history-table { overflow-x: auto; }
   </style>
 </head>
 
@@ -74,7 +84,7 @@
           </div>
         </div>
 
-        <div class="table-responsive mt-3">
+        <div class="history-table mt-3">
           <table class="table table-sm table-striped">
             <thead id="raw-thead"></thead>
             <tbody id="raw-tbody"></tbody>
@@ -108,7 +118,7 @@
           </div>
         </div>
 
-        <div class="table-responsive mt-3">
+        <div class="history-table mt-3">
           <table class="table table-sm table-striped">
             <thead id="hourly-thead"></thead>
             <tbody id="hourly-tbody"></tbody>
@@ -250,6 +260,12 @@
 
     rawController.load();
     document.getElementById('hourly-tab-btn').addEventListener('shown.bs.tab', () => hourlyController.load(), { once: true });
+
+    // Tab switches are picked up automatically - initStickyTableHeader()'s
+    // rAF loop re-measures every frame, so a hidden tab's table just reads
+    // as zero-sized and stays unstuck without any extra wiring here.
+    initStickyTableHeader(document.querySelector('#raw-tab table'));
+    initStickyTableHeader(document.querySelector('#hourly-tab table'));
   </script>
 </body>
 
