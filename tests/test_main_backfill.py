@@ -104,5 +104,60 @@ class BackfillHourlySummaryVerifyHourStartTest(unittest.TestCase):
             conn.close()
 
 
+class AdvanceHourOrRetryBackfillTest(unittest.TestCase):
+    """Covers the retry-cap safety valve in _advance_hour_or_retry_backfill:
+    if an hour can never be verified (e.g. it was itself silently skipped
+    entirely, so it can never gain the proof-bucket it needs),
+    retrying _backfill_hourly_summary forever every ~1s would be an
+    unbounded cost for a gap that was never recoverable anyway."""
+
+    def setUp(self):
+        self._orig_limit = main.AsyncioThread._PENDING_BACKFILL_RETRY_LIMIT
+        main.AsyncioThread._PENDING_BACKFILL_RETRY_LIMIT = 3  # keep the test fast
+
+    def tearDown(self):
+        main.AsyncioThread._PENDING_BACKFILL_RETRY_LIMIT = self._orig_limit
+
+    def _thread_with_backfill_result(self, results):
+        """A bare (un-started) AsyncioThread instance with
+        _backfill_hourly_summary stubbed to return each of `results` in
+        turn, one per call - avoids needing a real sqlite file or a real
+        hour-rollover race to drive this decision logic."""
+        thread = main.AsyncioThread.__new__(main.AsyncioThread)
+        results_iter = iter(results)
+
+        async def fake_backfill_hourly_summary(verify_hour_start=None):
+            return next(results_iter)
+
+        thread._backfill_hourly_summary = fake_backfill_hourly_summary
+        return thread
+
+    def test_adopts_new_hour_start_once_verified(self):
+        thread = self._thread_with_backfill_result([True])
+
+        current, retries = asyncio.run(thread._advance_hour_or_retry_backfill(100, 200, 0))
+
+        self.assertEqual(current, 200)
+        self.assertEqual(retries, 0)
+
+    def test_keeps_retrying_current_hour_start_while_unverified(self):
+        thread = self._thread_with_backfill_result([False])
+
+        current, retries = asyncio.run(thread._advance_hour_or_retry_backfill(100, 200, 0))
+
+        self.assertEqual(current, 100)  # not adopted yet - caller will call again next tick
+        self.assertEqual(retries, 1)
+
+    def test_gives_up_and_advances_once_the_retry_limit_is_reached(self):
+        thread = self._thread_with_backfill_result([False, False, False])
+        current, retries = 100, 0
+
+        for _ in range(main.AsyncioThread._PENDING_BACKFILL_RETRY_LIMIT):
+            current, retries = asyncio.run(thread._advance_hour_or_retry_backfill(current, 200, retries))
+
+        self.assertEqual(current, 200)  # gave up waiting and moved on
+        self.assertEqual(retries, 0)  # reset, ready to track the next hour
+
+
 if __name__ == '__main__':
     unittest.main()
