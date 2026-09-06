@@ -183,11 +183,21 @@ class AsyncioThread(threading.Thread):
                 new_hour_start, _ = storage.current_hour_bounds(datetime.now())
                 if new_hour_start != current_hour_start:
                     # the wall clock just rolled into a new hour - the hour
-                    # that just ended now has a sample in the following
-                    # (current) hour, so it can be backfilled immediately,
-                    # rather than waiting on a fixed polling interval
-                    current_hour_start = new_hour_start
-                    await self._backfill_hourly_summary()
+                    # that just ended can be backfilled once inverter_history
+                    # has a sample in the new hour, proving the old one is
+                    # complete. On the very first iteration after the
+                    # boundary that proof doesn't always exist yet: the
+                    # sample inserted a few lines up can still belong to the
+                    # *old* hour (insert happens a moment before this check),
+                    # so backfill_hourly_summary correctly finds nothing to
+                    # do. Only adopt new_hour_start once backfill actually
+                    # confirms current_hour_start is done - otherwise keep
+                    # retrying this check on every following iteration (a
+                    # couple of seconds), instead of only retrying at the
+                    # *next* hour's rollover, up to an hour later, which is
+                    # what a plain unconditional update here used to do.
+                    if await self._backfill_hourly_summary(verify_hour_start=current_hour_start):
+                        current_hour_start = new_hour_start
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
@@ -201,24 +211,36 @@ class AsyncioThread(threading.Thread):
         self._calculated_values_evaluator.seed_hour_start(baseline)
 
     @staticmethod
-    async def _backfill_hourly_summary():
+    async def _backfill_hourly_summary(verify_hour_start: Optional[int] = None) -> bool:
         """Derives any newly-completed hourly_summary rows from
         inverter_history. Runs on a plain sqlite3 connection (not the shared
         aiosqlite one) via a worker thread, since storage.backfill_hourly_summary
         is synchronous and issues several queries per hour - a short-lived
         connection here avoids sharing sqlite3's not-thread-safe-by-default
         connection object with the asyncio loop's own aiosqlite connection.
+
+        If verify_hour_start is given, returns whether that specific hour has
+        a hourly_summary row now (whether this call just inserted it or it
+        was already there beforehand) - used by the polling loop to know
+        whether an hour-rollover's backfill attempt actually succeeded, since
+        it can legitimately find nothing to do yet (see the loop's comment).
+        Without verify_hour_start, always returns True.
         """
         def _run():
             conn = sqlite3.connect(storage.DATA_DB_PATH)
             try:
-                return storage.backfill_hourly_summary(conn)
+                backfilled = storage.backfill_hourly_summary(conn)
+                if verify_hour_start is None:
+                    return backfilled, True
+                row = conn.execute("SELECT 1 FROM hourly_summary WHERE hour_start = ?", (verify_hour_start,)).fetchone()
+                return backfilled, row is not None
             finally:
                 conn.close()
 
-        backfilled = await asyncio.to_thread(_run)
+        backfilled, verified = await asyncio.to_thread(_run)
         if backfilled:
             logger.info(f"Backfilled {backfilled} hourly_summary row(s)")
+        return verified
 
     def ensure_inverter_ready(self):
         if self._asyncio_loop is None:
