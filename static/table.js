@@ -48,6 +48,7 @@ function initStickyTableHeader(table) {
     lastTheadHTML = thead.innerHTML;
     cloneTable = table.cloneNode(false);
     cloneTable.removeAttribute('id');
+    cloneTable.setAttribute('aria-hidden', 'true'); // presentational duplicate of the live table's header
     Object.assign(cloneTable.style, {
       position: 'fixed', top: '0', margin: '0', zIndex: '10', display: 'none',
       tableLayout: 'fixed', backgroundColor: 'var(--bs-table-bg)',
