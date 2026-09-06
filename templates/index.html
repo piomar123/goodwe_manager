@@ -122,7 +122,33 @@
     var ageBadge = document.getElementById('age-badge');
     var readBadge = document.getElementById('read-badge');
     var deliveryBadge = document.getElementById('delivery-badge');
-    var eventSource = new EventSource('/listen');
+    // On mobile Chrome, backgrounding the tab (screen lock, app-switch, the
+    // OS putting the browser to sleep) can leave the EventSource's
+    // underlying socket silently dead - the browser doesn't always notice
+    // right away, so its own auto-reconnect (onerror -> retry) can take a
+    // long time to kick in (the OS/network stack has to actually notice the
+    // dead connection first, rather than the tab being frozen making that
+    // detection itself stall). Rather than wait for that, explicitly tear
+    // down and recreate the connection when the page becomes visible again
+    // - but only if the data actually looks stale (same >10s "something is
+    // actually stuck" threshold updateFreshnessBadges uses for the danger
+    // badge below), not on every tab switch: a quick switch-away-and-back
+    // leaves a perfectly healthy connection, and reconnecting anyway would
+    // just be needless server-side listener churn for no benefit.
+    var STALE_AGE_SECONDS = 10;
+    var eventSource;
+    function connectEventSource() {
+      if (eventSource) eventSource.close();
+      eventSource = new EventSource('/listen');
+      eventSource.onmessage = handleMessage;
+      eventSource.onerror = handleError;
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState !== 'visible') return;
+      const ageSeconds = lastMessageReceivedAt === null ? Infinity : (Date.now() - lastMessageReceivedAt) / 1000;
+      if (ageSeconds > STALE_AGE_SECONDS) connectEventSource();
+    });
 
     // Two independent lag sources, tracked separately:
     //  - readDurationSeconds: how long the inverter itself took to answer
@@ -161,7 +187,7 @@
       return rawDeltaSeconds - deliveryCalibration.minSeconds;
     }
 
-    eventSource.onmessage = function (e) {
+    function handleMessage(e) {
       let data = JSON.parse(e.data);
       document.querySelectorAll("[data-inverter]").forEach(el => {
         const key = el.getAttribute('data-inverter');
@@ -183,9 +209,9 @@
       // clean whole seconds.
       clearInterval(freshnessTimer);
       freshnessTimer = setInterval(updateFreshnessBadges, 1000);
-    };
+    }
 
-    eventSource.onerror = function () {
+    function handleError() {
       // Stop the ticking timer and clear the freshness state it reads -
       // otherwise the still-running freshnessTimer fires within 1s and
       // overwrites this "disconnected" badge with a fresh-looking one
@@ -197,7 +223,9 @@
       [ageBadge, readBadge, deliveryBadge].forEach(b => b.textContent = '');
       ageBadge.textContent = 'disconnected';
       ageBadge.className = 'badge bg-danger';
-    };
+    }
+
+    connectEventSource();
 
     // Each badge is colored against its own thresholds, not a shared one -
     // a slow inverter read and a slow delivery hop are different problems
