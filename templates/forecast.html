@@ -97,7 +97,7 @@
       const currentHourIndex = data.current_hour ? data.hours.findIndex(h => h.time === data.current_hour) : -1;
       const partialKwh = data.current_hour_actual_partial_kwh; // how much the in-progress hour has produced so far (not a full hour's worth)
       const actualLineColor = '#22cc66'; // pure green - reads clearly as "measured" against the near-white/amber forecast bars
-      const trailingHourColor = '#8f7fc9'; // calm purple (matches ChartTheme's own palette) for the current, still-partial hour - distinct from the teal/blue/amber used elsewhere in this chart
+      const trailingHourColor = '#ffffff'; // white for the current, still-partial hour - distinct from the teal/blue/amber used elsewhere in this chart
 
       // Fill in the current-hour slot for rendering continuity: with 'before'
       // stepped mode, a segment holds its *starting* point's value flat
