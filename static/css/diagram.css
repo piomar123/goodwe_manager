@@ -168,6 +168,13 @@
 
 .diagram-details { display: none; font-size: 0.75rem; margin-top: 4px; opacity: 0.85; }
 .diagram-details--open { display: block; }
+/* Explicit, not inherited from the node's own border color - Backup's
+   per-line power/current text needs to stay orange for the phases that
+   are fine even when the node itself has gone red from another phase's
+   overload (setNodeColor('node-backup', ...) in diagram-render.js).
+   .diagram-alert's !important still wins over this for the actual
+   offending line(s). */
+#backup-line1, #backup-line2, #backup-line3 { color: #fd7e14; }
 .diagram-alert { color: #dc3545 !important; font-weight: bold; }
 
 /* Status text pulled out of the (now icon-only) Inverter box - see

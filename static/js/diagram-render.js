@@ -490,6 +490,7 @@
     byId('battery-watts').textContent = fmtW(battery.watts);
     byId('battery-voltage').textContent = calc.toNumber(data.vbattery1).toFixed(1);
     byId('battery-temp').textContent = calc.toNumber(data.battery_temperature);
+    byId('battery-discharge-limit').textContent = calc.toNumber(data.battery_discharge_limit);
     setNodeColor('node-battery', battery.color);
     byId('battery-fill').style.height = calc.toNumber(data.battery_soc) + '%';
     // No battery hardware at all - the whole node fades out, distinct
@@ -515,6 +516,7 @@
     // covers the phase-overload case) - avoid computing/setting it twice.
     ['backup-i1', 'backup-i2', 'backup-i3'].forEach(function (id, i) {
       byId(id).textContent = backup.phaseCurrents[i].toFixed(1);
+      byId(id.replace('backup-i', 'backup-p')).textContent = Math.round(calc.toNumber(data[id.replace('backup-i', 'backup_p')]));
       byId(id.replace('backup-i', 'backup-line')).classList.toggle('diagram-alert', backup.phaseAlerts[i]);
     });
 
