@@ -10,6 +10,7 @@
   var BATTERY_MODE = { NO_BATTERY: 0, STANDBY: 1, DISCHARGE: 2, CHARGE: 3, TO_BE_CHARGED: 4, TO_BE_DISCHARGED: 5 };
   var GRID_IN_OUT = { IDLE: 0, EXPORTING: 1, IMPORTING: 2 };
   var GRID_MODE = { NOT_CONNECTED: 0, CONNECTED: 1, FAULT: 2 };
+  var WORK_MODE = { WAIT: 0, NORMAL_ON_GRID: 1, NORMAL_OFF_GRID: 2, FAULT: 3, FLASH: 4, CHECK: 5 };
   var WORK_MODE_COLORS = { 0: 'grey', 1: 'green', 2: 'pink', 3: 'red', 4: 'orange', 5: 'yellow' };
 
   var BACKUP_CURRENT_ALERT_THRESHOLD_A = 13.5;
@@ -179,6 +180,7 @@
     BATTERY_MODE: BATTERY_MODE,
     GRID_IN_OUT: GRID_IN_OUT,
     GRID_MODE: GRID_MODE,
+    WORK_MODE: WORK_MODE,
     BACKUP_CURRENT_ALERT_THRESHOLD_A: BACKUP_CURRENT_ALERT_THRESHOLD_A,
     toNumber: toNumber,
     setBackupActiveThreshold: setBackupActiveThreshold,

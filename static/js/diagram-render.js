@@ -360,11 +360,23 @@
 
   // Backup can be fed via a straight bypass relay (Junction, when grid_mode
   // is Connected) or synthesized by the inverter itself (islanding/fault) -
-  // see DiagramCalc.backupSource. Combined with gridState's `crossed` here
-  // (not in diagram-calc.js) so backupState stays a pure function of
-  // Backup's own data.
-  function isBackupActive(backup, grid) {
-    return grid.crossed || backup.active;
+  // see DiagramCalc.backupSource. Combined with gridState's `crossed` and
+  // the raw work_mode here (not in diagram-calc.js) so backupState stays a
+  // pure function of Backup's own data.
+  //
+  // backup.active (the wattage threshold) only distinguishes real usage
+  // from CT-crosstalk noise while genuinely Normal (On-Grid) - it was only
+  // ever calibrated against samples in that mode (see
+  // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md).
+  // grid.crossed (Fault/Not-connected) already forces active regardless of
+  // wattage, but that alone misses Check Mode: grid_mode still reads
+  // Connected there (the bypass relay ties Backup straight to grid - see
+  // backupSource's own comment), so grid.crossed is false, yet Check Mode
+  // is just as "not normal" as Fault/Off-Grid for the threshold's purposes.
+  function isBackupActive(backup, grid, data) {
+    if (grid.crossed) return true;
+    var normalOnGrid = DiagramCalc.toNumber(data.work_mode) === DiagramCalc.WORK_MODE.NORMAL_ON_GRID;
+    return normalOnGrid ? backup.active : true;
   }
 
   var lastData = null;
@@ -398,7 +410,7 @@
     }
 
     var backup = calc.backupState(data);
-    var active = isBackupActive(backup, grid);
+    var active = isBackupActive(backup, grid, data);
     var backupColor = backupNodeColor(backup, active);
     var backupThickness = calc.arrowThickness(backup.watts);
     // Battery discharge and PV are the two things that can actually feed
@@ -408,14 +420,20 @@
     var sourceMix = [{ colorName: 'yellow', watts: battDischargeW }, { colorName: 'green', watts: pv.watts }];
     if (calc.backupSource(data) === 'junction') {
       // Grid-bypass: Backup taps the exact same grid-side line the Bus/
-      // Grid edges read below, so it follows the same rule they do -
-      // grid.color as the flat color (orange import / grey idle), or the
-      // PV+battery sourceMix when grid.color is green (net export) - not
-      // a separately-computed status color, which only reflects the
-      // node's own alert/idle state (fine for setNodeColor, wrong for an
-      // arrow - a status color isn't a flow color).
+      // Grid edges read below, so *while actually active* it follows the
+      // same rule they do - grid.color as the flat color (orange import /
+      // grey idle), or the PV+battery sourceMix when grid.color is green
+      // (net export). While inactive (idle noise below the threshold),
+      // the arrow must read grey regardless of grid.color - this used to
+      // draw grid.color unconditionally, so e.g. importing power to charge
+      // the battery (nothing to do with Backup's own circuit) made the
+      // Backup arrow light up orange even though Backup itself was idle.
+      // Phase-overload red still takes priority, same as backupColor/
+      // backupNodeColor - a real overload shouldn't get masked by
+      // whatever the net grid meter happens to read.
       var eb = edges.backupBypass;
-      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, grid.color, backupThickness, false, true, 1, grid.color === 'green' ? sourceMix : null);
+      var bypassColor = backup.phaseAlerts.some(Boolean) ? 'red' : (active ? grid.color : 'grey');
+      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, bypassColor, backupThickness, false, true, 1, (active && grid.color === 'green') ? sourceMix : null);
     } else {
       var ei = edges.backupIslanding;
       drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? sourceMix : null);
