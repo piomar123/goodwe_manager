@@ -424,6 +424,24 @@
     // 'orange', mutually exclusive with the 'green' those branches gate
     // on) - a zero-watt stripe just contributes zero width.
     var battDischargeW = (!battery.noBattery && battery.direction === 'discharge') ? battery.watts : 0;
+    // Two source mixes, not one - they cover physically different edges.
+    // fullSourceMix is for anything tied to the shared grid line at
+    // Junction (Load, Backup's grid-bypass), which really can combine all
+    // three. inverterOutputMix is for the Inverter->Junction bus edge
+    // itself (and Backup's inverter-fed/islanding path) - that edge is the
+    // inverter's own output onto the bus, which is only ever PV and/or
+    // battery discharge; grid import reaches Junction via its own separate
+    // edge, never through the inverter, even while both are flowing at
+    // once (e.g. PV covering part of the load, grid importing the rest -
+    // the bus edge is 100% PV then, and previously got a spurious orange
+    // stripe added on top from folding this into fullSourceMix (a real bug
+    // introduced when the dedup commit merged this mix with the one below,
+    // on the false assumption that gridImportW is always 0 wherever the
+    // narrower mix used to be used).
+    var inverterOutputMix = [
+      { colorName: 'yellow', watts: battDischargeW },
+      { colorName: 'green', watts: pv.watts },
+    ];
     var fullSourceMix = [
       { colorName: 'yellow', watts: battDischargeW },
       { colorName: 'green', watts: pv.watts },
@@ -443,8 +461,13 @@
       var bypassColor = backup.phaseAlerts.some(Boolean) ? 'red' : (active ? 'orange' : 'grey');
       drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, bypassColor, backupThickness, false, true, 1, active ? fullSourceMix : null);
     } else {
+      // Inverter-fed (islanding/fault): Backup is synthesized by the
+      // inverter itself, same PV+battery-discharge-only source as the bus
+      // edge below - never grid import (backupSource() only takes this
+      // branch when grid_mode isn't Connected, so gridImportW is always 0
+      // here anyway, but inverterOutputMix says so directly).
       var ei = edges.backupIslanding;
-      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? fullSourceMix : null);
+      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? inverterOutputMix : null);
     }
 
     // The Inverter<->Junction ("bus") edge used to be approximated as
@@ -473,7 +496,7 @@
     var eBus = edges.bus;
     drawManhattanEdge(svg, eBus.p0, eBus.dir0, eBus.p1, eBus.dir1,
       grid.crossed ? 'red' : (netBus < 0 ? 'orange' : 'grey'), grid.crossed ? 0 : busThickness, netBus < 0, true, grid.crossed ? 0.5 : 1,
-      (!grid.crossed && netBus >= 0) ? fullSourceMix : null);
+      (!grid.crossed && netBus >= 0) ? inverterOutputMix : null);
 
     // Same mix again for Grid's edge, only when actually exporting - an
     // import is already single-source (grid itself), correct as a plain
