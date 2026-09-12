@@ -12,9 +12,6 @@ a plain daemon thread, no new scheduler dependency.
 This is safe to fail: the read path (rce.get_rce_15min) always falls back
 to a live fetch on a cache miss, so /prices for tomorrow keeps working
 (just with one live PSE call) even if this whole thread is broken.
-
-See docs/superpowers/specs/2026-08-27-sqlite-storage-design.md,
-"RCE price cache" section.
 """
 import logging
 import threading

@@ -1,7 +1,6 @@
 """
 SQLite storage for inverter telemetry: raw per-sample history
 (inverter_history) and derived per-hour totals (hourly_summary).
-See docs/superpowers/specs/2026-08-27-sqlite-storage-design.md.
 """
 import json
 import sqlite3
