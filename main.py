@@ -752,7 +752,12 @@ def main():
     rce_prefetch_thread.start()
     # atexit.register(stop_threads)
     try:
-        app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False)
+        # threaded=True is Flask's own default (Flask.run() sets it via
+        # options.setdefault before handing off to Werkzeug, whose raw
+        # run_simple() defaults to False) - passed explicitly here so a
+        # long-lived /listen SSE connection can never be mistaken for the
+        # reason other requests stall behind it.
+        app.run('0.0.0.0', port=APP_PORT, debug=True, use_reloader=False, threaded=True)
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received, shutting down")
     finally:
