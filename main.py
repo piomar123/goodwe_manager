@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import io
 import json
 import logging
@@ -57,6 +58,23 @@ EVERY_DAY = 0b1111111
 EVERY_DAY_STR = 'all'
 
 ForecastData = namedtuple('ForecastData', ('angle90_in_kWh', 'angle270_in_kWh', 'total_in_kWh'))
+
+
+@contextlib.contextmanager
+def _data_db_connection():
+    """A short-lived, synchronous connection to data.db, always closed on
+    the way out - every route/helper here that isn't using the shared
+    aiosqlite connection needs exactly this (connect, use, close), which
+    was previously duplicated as its own try/finally at each call site.
+    Note this only closes the connection, unlike sqlite3.Connection's own
+    `with conn:` context manager, which manages the transaction (commit/
+    rollback) but doesn't close anything.
+    """
+    conn = sqlite3.connect(storage.DATA_DB_PATH)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 class AsyncioThread(threading.Thread):
@@ -227,15 +245,12 @@ class AsyncioThread(threading.Thread):
         Without verify_hour_start, always returns True.
         """
         def _run():
-            conn = sqlite3.connect(storage.DATA_DB_PATH)
-            try:
+            with _data_db_connection() as conn:
                 backfilled = storage.backfill_hourly_summary(conn)
                 if verify_hour_start is None:
                     return backfilled, True
                 row = conn.execute("SELECT 1 FROM hourly_summary WHERE hour_start = ?", (verify_hour_start,)).fetchone()
                 return backfilled, row is not None
-            finally:
-                conn.close()
 
         backfilled, verified = await asyncio.to_thread(_run)
         if backfilled:
@@ -581,11 +596,8 @@ def _get_actual_hourly_pv_kwh(date_yyyymmdd):
     day = datetime.strptime(date_yyyymmdd, '%Y-%m-%d').date()
     start_epoch, end_epoch = history.date_range_to_epoch(day, day)
     try:
-        conn = sqlite3.connect(storage.DATA_DB_PATH)
-        try:
+        with _data_db_connection() as conn:
             rows, _ = history.fetch_hourly_rows(conn, start_epoch, end_epoch, limit=24, offset=0)
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         # Optional/supplementary data - e.g. a fresh checkout (--dry-run,
         # never connected to the inverter) has no hourly_summary table yet.
@@ -604,11 +616,8 @@ def _get_actual_pv_kwh_so_far_this_hour(now):
     """
     hour_start_epoch, _ = storage.current_hour_bounds(now)
     try:
-        conn = sqlite3.connect(storage.DATA_DB_PATH)
-        try:
+        with _data_db_connection() as conn:
             value = storage.get_pv_kwh_so_far(conn, hour_start_epoch, int(now.timestamp()))
-        finally:
-            conn.close()
     except sqlite3.Error as e:
         logger.warning(f"Couldn't read this hour's partial PV production: {e}")
         return None
@@ -678,11 +687,8 @@ def get_history_inverter_json():
     columns_param = request.args.get('columns')
     requested_columns = columns_param.split(',') if columns_param else None
     columns = history.resolve_raw_columns(requested_columns)
-    conn = sqlite3.connect(storage.DATA_DB_PATH)
-    try:
+    with _data_db_connection() as conn:
         rows, has_more = history.fetch_inverter_rows(conn, columns, start_epoch, end_epoch, limit, offset)
-    finally:
-        conn.close()
     return flask.jsonify({
         'start': start_date.strftime('%Y-%m-%d'),
         'end': end_date.strftime('%Y-%m-%d'),
@@ -699,11 +705,8 @@ def get_history_inverter_json():
 @app.get('/history/hourly.json')
 def get_history_hourly_json():
     start_date, end_date, _start_time, _end_time, start_epoch, end_epoch, limit, offset = _parse_history_range_params()
-    conn = sqlite3.connect(storage.DATA_DB_PATH)
-    try:
+    with _data_db_connection() as conn:
         rows, has_more = history.fetch_hourly_rows(conn, start_epoch, end_epoch, limit, offset)
-    finally:
-        conn.close()
     return flask.jsonify({
         'start': start_date.strftime('%Y-%m-%d'),
         'end': end_date.strftime('%Y-%m-%d'),
