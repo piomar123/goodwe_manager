@@ -1,7 +1,8 @@
 """Query-building logic for the read-only /history viewer. Kept Flask-free
-so it's independently unit-testable — see the Global Constraints note in
-docs/superpowers/plans/2026-08-29-history-viewer.md about why main.py can't
-be imported by the test suite.
+so it's independently unit-testable - main.py has import-time side effects
+(an INVERTER_IP env var assertion, and constructing the inverter/RCE-
+prefetch background threads at module scope) that make it unsafe to import
+from the test suite.
 """
 import sqlite3
 from datetime import date, datetime, time, timedelta

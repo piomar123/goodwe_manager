@@ -1,7 +1,5 @@
 """
 SQLite cache for RCE 15-minute electricity prices (rce_prices.db).
-See docs/superpowers/specs/2026-08-27-sqlite-storage-design.md,
-"RCE price cache" section.
 """
 import sqlite3
 import time

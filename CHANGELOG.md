@@ -15,8 +15,6 @@ grouped under `Unreleased` until that changes.
   count, per-phase grid voltage/frequency min-max, inverter/battery
   temperature min-max, and a `work_mode_label` breakdown), and a `/history`
   page for browsing both raw samples and hourly summaries in the browser.
-  See `docs/superpowers/specs/2026-08-27-sqlite-storage-design.md` for the
-  full storage design.
 - `hourly_summary` is kept up to date automatically by the running app (on
   startup and on every hour rollover). A `--full-rescan` option on
   `_backfill_hourly_summary.py` covers the rare case of a gap that needs
