@@ -1,9 +1,8 @@
-/* Live power-flow diagram (see
-   docs/superpowers/specs/2026-09-03-live-power-flow-dashboard-design.md and
-   its mockups under docs/superpowers/mockups/, which this was ported from
-   verbatim after several rounds of visual iteration there). Plain CSS, no
-   build step - matches this project's existing convention of loading
-   everything via <link>/<script> tags. */
+/* Live power-flow diagram (see the mockups under
+   docs/superpowers/mockups/, which this was ported from verbatim after
+   several rounds of visual iteration there). Plain CSS, no build step -
+   matches this project's existing convention of loading everything via
+   <link>/<script> tags. */
 
 /* Junction sits in its own row directly below Inverter, between it and
    Load, with all four of its sides used by exactly one flow: top=
