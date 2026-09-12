@@ -16,7 +16,7 @@
     <div class="row">
       <div class="col">
         <div><span data-inverter="timestamp"></span></div>
-        <div>
+        <div class="mb-3">
           <span id="age-badge" class="badge" data-bs-toggle="tooltip" title="Time since the last SSE update arrived in this browser. Keeps ticking even if the connection stalls - a growing number here means updates have actually stopped, not just slowed down."></span>
           <span id="read-badge" class="badge" data-bs-toggle="tooltip" title="How long the server's read_runtime_data() call to the inverter itself took. Poor wifi to the inverter is the most likely cause of a high value here."></span>
           <span id="delivery-badge" class="badge" data-bs-toggle="tooltip" title="Extra delay delivering an update from the server to this browser, on top of the best-case delivery seen recently (clock-skew corrected, so it's a relative delay, not an absolute one)."></span>
@@ -25,6 +25,9 @@
     </div>
     <div class="row">
       <div class="col">
+        <div class="inverter-status-line">
+          Inverter: <span id="inverter-status-line-text">-</span>
+        </div>
         <div class="diagram">
           <svg id="diagram-svg" class="diagram-svg"></svg>
           <div id="node-pv" class="diagram-node" data-toggle-details="pv">
@@ -51,9 +54,9 @@
           </div>
           <div id="node-inverter" class="diagram-node diagram-node--grey" data-toggle-details="inverter">
             <i class="bi bi-cpu diagram-icon"></i>
-            <div id="inverter-status">-</div>
             <div id="inverter-details" class="diagram-details">
               <div class="diagram-node-name">Inverter</div>
+              <div id="inverter-status">-</div>
               <div>Air: <span id="inverter-temp-air">-</span> °C</div>
               <div>Internal: <span id="inverter-temp">-</span> °C</div>
             </div>
@@ -69,26 +72,24 @@
               <div id="grid-freqs">-</div>
             </div>
           </div>
-          <div class="bottom-row">
-            <div id="node-backup" class="diagram-node" data-toggle-details="backup">
-              <i class="bi bi-plug diagram-icon"></i>
-              <div id="backup-watts">- W</div>
-              <div id="backup-details" class="diagram-details">
-                <div class="diagram-node-name">Backup</div>
-                <div id="backup-line1">L1: <span id="backup-i1">-</span> A</div>
-                <div id="backup-line2">L2: <span id="backup-i2">-</span> A</div>
-                <div id="backup-line3">L3: <span id="backup-i3">-</span> A</div>
-              </div>
+          <div id="node-backup" class="diagram-node" data-toggle-details="backup">
+            <i class="bi bi-plug diagram-icon"></i>
+            <div id="backup-watts">- W</div>
+            <div id="backup-details" class="diagram-details">
+              <div class="diagram-node-name">Backup</div>
+              <div id="backup-line1">L1: <span id="backup-i1">-</span> A</div>
+              <div id="backup-line2">L2: <span id="backup-i2">-</span> A</div>
+              <div id="backup-line3">L3: <span id="backup-i3">-</span> A</div>
             </div>
-            <div id="node-load" class="diagram-node" data-toggle-details="load">
-              <i class="bi bi-house diagram-icon"></i>
-              <div id="load-watts">- W</div>
-              <div id="load-details" class="diagram-details">
-                <div class="diagram-node-name">Load</div>
-                <div>L1: <span id="load-p1">-</span></div>
-                <div>L2: <span id="load-p2">-</span></div>
-                <div>L3: <span id="load-p3">-</span></div>
-              </div>
+          </div>
+          <div id="node-load" class="diagram-node" data-toggle-details="load">
+            <i class="bi bi-house diagram-icon"></i>
+            <div id="load-watts">- W</div>
+            <div id="load-details" class="diagram-details">
+              <div class="diagram-node-name">Load</div>
+              <div>L1: <span id="load-p1">-</span></div>
+              <div>L2: <span id="load-p2">-</span></div>
+              <div>L3: <span id="load-p3">-</span></div>
             </div>
           </div>
         </div>
@@ -257,6 +258,12 @@
     });
   </script>
   <script src="/static/js/diagram-calc.js"></script>
+  <script>
+    // Backup output above this is real usage, not CT-crosstalk noise - see
+    // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md.
+    // Configurable via the BACKUP_ACTIVE_THRESHOLD_W env var (main.py).
+    window.BACKUP_ACTIVE_THRESHOLD_W = {{ backup_active_threshold_w }};
+  </script>
   <script src="/static/js/diagram-render.js"></script>
 </body>
 

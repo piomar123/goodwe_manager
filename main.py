@@ -37,6 +37,11 @@ dotenv.load_dotenv()
 INVERTER_IP = os.environ.get('INVERTER_IP')
 assert INVERTER_IP, "INVERTER_IP environment variable is not set, copy .env.example to .env and set it"
 APP_PORT = int(os.environ.get('APP_PORT', 5000))
+# Backup output above this is treated as real usage rather than CT-crosstalk
+# noise (see docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md -
+# a flat constant for now, pending the adaptive-threshold formula explored
+# there).
+BACKUP_ACTIVE_THRESHOLD_W = float(os.environ.get('BACKUP_ACTIVE_THRESHOLD_W', 35))
 
 # FIXME poor-man's config - convert to .env and de-hard-code
 PV_ORIENTATIONS = (90, 270)  # this is used for the forecast only, if the count of orientations is changed, modify also ForecastData tuple and forecast.html template
@@ -288,7 +293,7 @@ rce_prefetch_thread = RcePrefetchThread()
 
 @app.route('/')
 def serve_index():
-    return flask.render_template('index.html')
+    return flask.render_template('index.html', backup_active_threshold_w=BACKUP_ACTIVE_THRESHOLD_W)
 
 
 class EcoMode(Enum):

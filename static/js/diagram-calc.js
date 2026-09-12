@@ -14,13 +14,20 @@
   var WORK_MODE_COLORS = { 0: 'grey', 1: 'green', 2: 'pink', 3: 'red', 4: 'orange', 5: 'yellow' };
 
   var BACKUP_CURRENT_ALERT_THRESHOLD_A = 13.5;
+  // Backup output above this is real usage, not CT-crosstalk noise (see
+  // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md - a
+  // flat constant for now, pending the adaptive-threshold formula explored
+  // there). Overridable at runtime via setBackupActiveThreshold, since the
+  // real value comes from a server-side env var (main.py's
+  // BACKUP_ACTIVE_THRESHOLD_W) injected into the page after this file loads.
+  var BACKUP_ACTIVE_THRESHOLD_W = 35;
   // Reference power that maps to full arrow thickness. Chosen from this
   // system's observed range during the design investigation (PV up to
   // ~7.5kW, battery charge up to ~4kW), not from an inverter capacity
   // sensor - none is present in SELECTED_SENSORS.
   var FULL_THICKNESS_WATTS = 6000;
-  var MIN_THICKNESS_PX = 2;
-  var MAX_THICKNESS_PX = 9;
+  var MIN_THICKNESS_PX = 1;
+  var MAX_THICKNESS_PX = 12;
 
   function toNumber(value) {
     if (value === null || value === undefined || value === '') return 0;
@@ -28,11 +35,23 @@
     return Number.isNaN(n) ? 0 : n;
   }
 
+  function setBackupActiveThreshold(watts) {
+    BACKUP_ACTIVE_THRESHOLD_W = toNumber(watts) || 0;
+  }
+
+  // Square root sits between a linear scale (small real-world wattages all
+  // look equally hair-thin next to multi-kW ones) and a log scale (over-
+  // compresses the high end) - see the mockup's "ugly thickness
+  // quantization" checklist item. Math.max(MIN, ratio*MAX) rather than
+  // MIN + ratio*(MAX-MIN): the curve already passes through the origin, so
+  // floor-clamping it at MIN keeps every bucket's watt-range evenly scaled;
+  // an additive MIN offset instead squeezed the first real bucket's range
+  // to roughly half its neighbors'.
   function arrowThickness(watts) {
     var w = Math.abs(toNumber(watts));
     if (w === 0) return 0;
-    var ratio = Math.min(w / FULL_THICKNESS_WATTS, 1);
-    return MIN_THICKNESS_PX + ratio * (MAX_THICKNESS_PX - MIN_THICKNESS_PX);
+    var ratio = Math.min(Math.sqrt(w) / Math.sqrt(FULL_THICKNESS_WATTS), 1);
+    return Math.max(MIN_THICKNESS_PX, ratio * MAX_THICKNESS_PX);
   }
 
   function pvState(data) {
@@ -52,26 +71,39 @@
   // and there's no trustworthy way to know which way it's flowing -
   // diagram-render.js renders 'none' as an undirected line, not a
   // fabricated arrow.
+  // color here is a *status* color (can be red at the reserve floor) for
+  // setNodeColor('node-battery', ...) only - flowColor (never red; see
+  // below) is what any arrow/stripe fed by the battery should use instead,
+  // so an alert state never gets misread as "an alert is flowing."
   function batteryState(data) {
     var watts = Math.abs(toNumber(data.pbattery1));
     var mode = toNumber(data.battery_mode);
-    var soc = toNumber(data.battery_soc);
     var dischargeLimit = toNumber(data.battery_discharge_limit);
     var direction = 'none';
-    var color = 'grey';
+    var flowColor = 'grey';
     if (mode === BATTERY_MODE.CHARGE || mode === BATTERY_MODE.TO_BE_CHARGED) {
       direction = 'charge';
-      color = 'green';
+      flowColor = 'green';
     } else if (mode === BATTERY_MODE.DISCHARGE || mode === BATTERY_MODE.TO_BE_DISCHARGED) {
       direction = 'discharge';
-      color = 'orange';
+      // Yellow, not orange - orange already means grid-import throughout
+      // this diagram, so a battery-discharge stripe sitting next to a
+      // grid-import stripe in the same arrow (e.g. Load's) would be
+      // indistinguishable otherwise.
+      flowColor = 'yellow';
     }
     var noBattery = mode === BATTERY_MODE.NO_BATTERY;
-    // soc/battery_discharge_limit are meaningless with no battery
-    // installed (both typically read 0, which would otherwise trip this
-    // check every time via 0 <= 0).
-    if (!noBattery && soc <= dischargeLimit) color = 'red';
-    return { watts: watts, direction: direction, color: color, noBattery: noBattery };
+    // The reserve floor is hit when battery_discharge_limit (amperes)
+    // itself reads 0A, not by comparing it against battery_soc (a %) - see
+    // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md.
+    // The old `soc <= dischargeLimit` check was a units mismatch: it both
+    // missed the real case (soc:10, dischargeLimit:0 never trips 10<=0)
+    // and false-positived on unrelated ones (soc:11, dischargeLimit:25
+    // trips 11<=25 despite the floor not being hit at all). soc/
+    // dischargeLimit are meaningless with no battery installed (both
+    // typically read 0), so this only applies when a battery is present.
+    var color = (!noBattery && dischargeLimit === 0) ? 'red' : flowColor;
+    return { watts: watts, direction: direction, color: color, flowColor: flowColor, noBattery: noBattery };
   }
 
   function inverterState(data) {
@@ -112,13 +144,30 @@
     return { watts: toNumber(data.load_ptotal) };
   }
 
+  // active is threshold-based (BACKUP_ACTIVE_THRESHOLD_W), not just
+  // watts > 0 - see the backup-threshold investigation note. This doesn't
+  // account for the grid-fault/off-grid case (backup reads real even at
+  // low wattage there) - callers combine this with gridState's `crossed`
+  // themselves, same as the mockup's backupActive() did, so this stays a
+  // pure function of backup's own data.
   function backupState(data) {
     var watts = toNumber(data.backup_ptotal);
     var phaseCurrents = [toNumber(data.backup_i1), toNumber(data.backup_i2), toNumber(data.backup_i3)];
     var phaseAlerts = phaseCurrents.map(function (amps) {
       return amps >= BACKUP_CURRENT_ALERT_THRESHOLD_A;
     });
-    return { watts: watts, active: watts > 0, phaseCurrents: phaseCurrents, phaseAlerts: phaseAlerts };
+    return { watts: watts, active: watts > BACKUP_ACTIVE_THRESHOLD_W, phaseCurrents: phaseCurrents, phaseAlerts: phaseAlerts };
+  }
+
+  // Backup can be fed two different ways depending on the relay matrix's
+  // position: grid-bypass whenever grid_mode reads Connected (relay ties
+  // Backup straight to grid, skipping the inverter), or inverter-fed
+  // otherwise (islanding/fault - the inverter synthesizes Backup's output
+  // itself from PV/battery). Confirmed against real history data
+  // (2026-08-20 fault event) - see
+  // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md.
+  function backupSource(data) {
+    return toNumber(data.grid_mode) === GRID_MODE.CONNECTED ? 'junction' : 'inverter';
   }
 
   var DiagramCalc = {
@@ -127,6 +176,7 @@
     GRID_MODE: GRID_MODE,
     BACKUP_CURRENT_ALERT_THRESHOLD_A: BACKUP_CURRENT_ALERT_THRESHOLD_A,
     toNumber: toNumber,
+    setBackupActiveThreshold: setBackupActiveThreshold,
     arrowThickness: arrowThickness,
     pvState: pvState,
     inverterBusState: inverterBusState,
@@ -135,6 +185,7 @@
     gridState: gridState,
     loadState: loadState,
     backupState: backupState,
+    backupSource: backupSource,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

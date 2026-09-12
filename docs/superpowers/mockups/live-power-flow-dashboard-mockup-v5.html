@@ -1,0 +1,1729 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Power-flow diagram mockup v5</title>
+<!-- v5: on top of v4's settled layout -
+     1. Backup's per-phase details now show power alongside current
+        ("L1: 200 W, 0.9 A"), using the sensors already collected
+        (backup_p1/p2/p3, see sensors.py) but not previously displayed.
+        Overload (any phase >= 13.5A, same threshold as before) now also
+        turns the whole Backup node red (border+icon), on top of the
+        existing per-line red text - previously overload only affected the
+        text color of the one over-limit line, not the node's own status
+        color, so it was easy to miss when the box itself was showing
+        orange/grey. Non-overloaded phase lines stay explicitly orange
+        (not inherited from the now-red node border) so only the actual
+        offending phase(s) read red.
+     2. Inverter box shrunk to a small square (was a wide rectangle,
+        then just narrower - see #node-inverter) and decoupled from its
+        grid column's width via justify-self - it only ever holds an icon.
+     3. Edges are back to the original production model: single straight
+        line per fixed connection, stopping at the inverter/junction
+        box's own border (not routed through its interior) - see
+        computeEdges/drawEdge below, ported near-verbatim from
+        diagram-render.js. Two earlier attempts on this file explored
+        routing arrows through the inverter box's center (both as
+        aggregate lines and later as per-source-per-target split arrows -
+        see live-power-flow-dashboard-mockup-v5-snapshot1.html for that
+        exploration) - paused per explicit request, kept here only as a
+        snapshot for reference, not carried forward.
+     4. Backup can be fed two different ways depending on the relay
+        matrix's position, and now visualizes both instead of always
+        drawing inverter->backup: (a) grid-bypass - relay ties Backup
+        straight to the grid input, used whenever grid_mode reads
+        Connected (this covers Normal On-Grid *and* Check Mode, where the
+        inverter's own output is diverted to internal testing - confirmed
+        against real history data, see the design discussion in chat);
+        (b) inverter-fed - relay switches Backup onto the inverter's own
+        synthesized output, used whenever grid_mode is not Connected
+        (islanding/fault). Chosen by backupSource() below, driven by the
+        same raw grid_mode field the real dashboard receives - no new
+        derived field needed. This exposed the mockup's remaining
+        drift from production's actual input contract, so scenario data
+        was also converted from ad-hoc pre-computed fields (color,
+        direction, disconnected...) to the same raw sensor field names
+        SELECTED_SENSORS/diagram-calc.js use, and this file now loads the
+        real diagram-calc.js instead of re-approximating its logic inline.
+     5. Junction sits in its own row between Inverter and Load, each of
+        its four sides used by exactly one flow: top=Inverter(bus in),
+        left=Backup(grid-bypass case), right=Grid, bottom=Load. Backup
+        moved to share Junction's row (left of it) so that case is a
+        plain straight edge again. The inverter-fed case (Backup/Inverter
+        aren't adjacent) still bends, but no longer shares its exit point
+        with the bus edge the way an earlier iteration of this row did -
+        that one had both edges leaving Inverter's bottom-center at the
+        same x, overlapping for their first stretch before diverging; this
+        one offsets the bent path's exit x slightly so the two run
+        alongside each other, never on top of each other (see
+        computeEdges().backupIslanding, which enters Backup's *right*
+        border rather than its top).
+     6. Two more mockup-local corrections, both pending a production port
+        (see their own code comments for exact rationale): arrow thickness
+        is now sqrt(watts)-scaled instead of DiagramCalc.arrowThickness's
+        linear scale (which briefly and unintentionally replaced this
+        file's own log1p scale when DiagramCalc was wired in - neither
+        extreme read well), and Battery's low-SoC red check now uses
+        dischargeLimit===0 instead of DiagramCalc.batteryState's buggy
+        soc<=dischargeLimit (a %-vs-amperes comparison).
+     Everything else (adaptive/constant/disabled backup threshold controls)
+     is unchanged from v4. Every scenario value is editable live via the
+     panel below the diagram. -->
+<link href="../../../static/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<script src="../../../static/js/diagram-calc.js"></script>
+<style>
+  body { padding: 24px; }
+
+  /* Junction sits in its own row directly below Inverter, between it and
+     Load, with all four of its sides used by exactly one flow: top=
+     Inverter(bus in), left=Backup(grid-bypass), right=Grid, bottom=Load.
+     Backup shares Junction's row (immediately left of it), so the
+     grid-bypass edge is a plain straight line - only the inverter-fed
+     case (Inverter and Backup aren't adjacent) still bends. */
+  .diagram {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(90px, 1fr) minmax(90px, 1fr) minmax(90px, 1fr);
+    grid-template-areas:
+      ".        pv         ."
+      "battery  inverter   ."
+      "backup   junction   grid"
+      ".        load       .";
+    gap: 56px 32px;
+    max-width: 620px;
+    margin: 24px auto;
+  }
+
+  .diagram-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+    z-index: 0;
+  }
+
+  .diagram-node {
+    position: relative;
+    z-index: 1;
+    overflow: hidden;
+    border: 2px solid #6c757d;
+    border-radius: 8px;
+    padding: 6px;
+    text-align: center;
+    font-size: 0.85rem;
+    background: var(--bs-body-bg, #272b30);
+    color: #6c757d;
+    cursor: pointer;
+    /* touch-action:none so dragging a node doesn't also try to scroll the
+       page on a phone - the free-position layout editor (see the JS
+       pointerdown/move/up handlers) needs the raw pointer stream. */
+    touch-action: none;
+  }
+  .diagram-node--dragging { cursor: grabbing; opacity: 0.85; z-index: 2; }
+  /* Layout dragging starts locked (see toggle-layout-edit-btn) - while
+     locked, nodes should look/act like plain tap targets again, not
+     draggable ones, so the 'grab' cursor Junction otherwise shows
+     (#node-junction below) doesn't mislead into thinking a drag will
+     work. */
+  .diagram.layout-locked .diagram-node,
+  .diagram.layout-locked #node-junction { cursor: pointer; }
+
+  #node-pv { grid-area: pv; }
+  #node-battery { grid-area: battery; }
+  /* Shrunk and decoupled from its grid cell's width (justify-self: center
+     lets it sit smaller than the column) - it only ever holds an icon now
+     that status text lives in .inverter-status-line, so it doesn't need
+     the same footprint as the other nodes. Height is left auto (not
+     fixed) so tapping it open for details still grows normally instead
+     of clipping. */
+  #node-inverter {
+    grid-area: inverter;
+    justify-self: center;
+    /* align-self: stretch is CSS Grid's default, but this box has an
+       explicit aspect-ratio, so the browser can't actually stretch it to
+       the row's full height - it falls back to top-aligning instead,
+       leaving the box (and everything computeEdges anchors to its
+       center) sitting well above the row's true vertical center, where
+       Battery/Junction/Grid all still align (they aren't square, so they
+       do stretch). That's what made the bus/grid lines miss the Junction
+       dot. align-self: center restores a shared centerY across the whole
+       row, which every edge here assumes. */
+    align-self: center;
+    width: 46px;
+    aspect-ratio: 1;
+    padding: 4px;
+    overflow: visible;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  #node-inverter .diagram-icon { font-size: 1.15rem; }
+  /* Grown back toward its pre-shrink footprint while its details are
+     open - a 46px square can't hold the status/temperature lines
+     without severe wrapping. :has() targets the inner details div's
+     open state, so this needs no new JS - the existing toggle handler
+     already adds/removes diagram-details--open and calls redrawLines(). */
+  #node-inverter:has(.diagram-details--open) {
+    width: auto;
+    min-width: 90px;
+    aspect-ratio: auto;
+  }
+  #node-grid { grid-area: grid; }
+  #node-backup { grid-area: backup; }
+  #node-load { grid-area: load; }
+
+  /* Visible dot stays 7px, but the actual (draggable, tappable) box is
+     22px - a radial-gradient only paints the inner 7px circle, so the
+     enlarged hit area is invisible. centerX/centerY still land on the
+     same point either way, since it's centered within the bigger box. */
+  #node-junction {
+    grid-area: junction;
+    border: none;
+    padding: 0;
+    width: 22px;
+    height: 22px;
+    justify-self: center;
+    align-self: center;
+    border-radius: 50%;
+    background: radial-gradient(circle at center, currentColor 3.5px, transparent 3.6px);
+    cursor: grab;
+    touch-action: none;
+  }
+
+  .diagram-node-content { position: relative; z-index: 1; }
+  .diagram-icon { font-size: 1.5rem; color: inherit; display: block; }
+  .diagram-node-name { font-weight: 600; margin-bottom: 2px; }
+
+  .diagram-node--grey { color: #6c757d; border-color: #6c757d; }
+  .diagram-node--green { color: #28a745; border-color: #28a745; }
+  .diagram-node--orange { color: #fd7e14; border-color: #fd7e14; }
+  .diagram-node--red { color: #dc3545; border-color: #dc3545; }
+  .diagram-node--pink { color: #e83e8c; border-color: #e83e8c; }
+  .diagram-node--yellow { color: #ffc107; border-color: #ffc107; }
+
+  .battery-fill {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 0%;
+    background: currentColor;
+    opacity: 0.3;
+    z-index: 0;
+    transition: height 0.3s ease;
+  }
+  #node-battery .diagram-node-content,
+  #node-battery .diagram-node-content .diagram-details { color: #f1f3f5; }
+  .diagram-node--grey .diagram-icon { color: #6c757d; }
+  .diagram-node--green .diagram-icon { color: #28a745; }
+  .diagram-node--orange .diagram-icon { color: #fd7e14; }
+  .diagram-node--red .diagram-icon { color: #dc3545; }
+  .diagram-node--pink .diagram-icon { color: #e83e8c; }
+  .diagram-node--yellow .diagram-icon { color: #ffc107; }
+
+  .diagram-details { display: none; font-size: 0.75rem; margin-top: 4px; opacity: 0.85; }
+  .diagram-details--open { display: block; }
+  /* Explicit, not inherited from the node's own border color - Backup's
+     per-line power/current text needs to stay orange for the phases that
+     are fine even when the node itself has gone red from another phase's
+     overload (see file header comment #1). .diagram-alert's !important
+     still wins over this for the actual offending line(s). */
+  #backup-line1, #backup-line2, #backup-line3 { color: #fd7e14; }
+  .diagram-alert { color: #dc3545 !important; font-weight: bold; }
+
+  @media (max-width: 400px) {
+    .diagram {
+      grid-template-columns: minmax(64px, 1fr) minmax(64px, 1fr) minmax(64px, 1fr);
+      gap: 44px 16px;
+      font-size: 0.7rem;
+    }
+  }
+
+  .chart-wrap { max-width: 620px; margin: 24px auto; }
+  .thickness-table { width: 100%; margin: 12px 0; border-collapse: collapse; font-size: 0.78rem; }
+  .thickness-table th, .thickness-table td { border: 1px solid #495057; padding: 3px 6px; text-align: right; }
+  .thickness-table th:first-child, .thickness-table td:first-child { text-align: center; }
+  .thickness-table thead th { color: #e9ecef; }
+
+  .scenario-bar { max-width: 620px; margin: 0 auto 8px; text-align: center; }
+  .scenario-bar button { margin: 2px; }
+  .viewport-note { max-width: 620px; margin: 0 auto 12px; font-size: 0.8rem; color: var(--bs-secondary-color, #adb5bd); text-align: center; }
+
+  .inverter-status-line { max-width: 620px; margin: 0 auto 12px; text-align: center; font-size: 1rem; font-weight: 600; }
+
+  .controls-bar { max-width: 620px; margin: 0 auto 16px; font-size: 0.85rem; display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: center; align-items: center; }
+  .controls-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .controls-bar input[type=number] { width: 80px; }
+
+  .editor { max-width: 620px; margin: 24px auto; }
+  .editor summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+  .editor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 12px; }
+  .editor-field label { display: block; font-size: 0.72rem; color: var(--bs-secondary-color, #adb5bd); margin-bottom: 2px; }
+  .editor-field input, .editor-field select { width: 100%; }
+</style>
+</head>
+<body>
+
+<h1 class="h4 text-center">Live power-flow diagram — mockup v5</h1>
+<p class="viewport-note">Builds on v4: per-phase backup power+current with overload turning the whole node red (non-overloaded phases stay orange), a square inverter box, edges back to the original border-to-border single-line model, and a Backup connection that switches between grid-bypass and inverter-fed based on grid_mode (see file header comment). Scenario data is now the same raw sensor shape the real dashboard receives. Tap a node for its extra details. Edit any value at the bottom.</p>
+
+<div class="scenario-bar" id="scenario-bar"></div>
+
+<p class="viewport-note">
+  Layout dragging starts locked so a stray tap doesn't rearrange things -
+  click "Enable layout editing" first. Once unlocked, drag any box (or the
+  Junction dot) to try a different arrangement - the arrows bend
+  (Manhattan-only) to follow wherever you drop it, instead of cutting a
+  diagonal straight line. Positions are a session-only nudge (a transform
+  offset, not a layout re-flow), not saved per scenario.
+  <button type="button" class="btn btn-sm btn-outline-primary" id="toggle-layout-edit-btn">Enable layout editing</button>
+  <button type="button" class="btn btn-sm btn-outline-secondary" id="reset-layout-btn">Reset layout</button>
+  <button type="button" class="btn btn-sm btn-outline-secondary" id="export-layout-btn">Export layout</button>
+</p>
+<textarea id="layout-export-output" readonly style="display:none; width:100%; max-width:620px; height:100px; margin:0 auto 12px; font-size:0.72rem;"></textarea>
+<div class="controls-bar" id="anchor-side-controls">
+  <label>Inverter bus exit
+    <select id="inverter-bus-side">
+      <option value="top">top</option><option value="right">right</option>
+      <option value="bottom" selected>bottom</option><option value="left">left</option>
+    </select>
+  </label>
+  <label>Grid entry
+    <select id="grid-entry-side">
+      <option value="top">top</option><option value="right">right</option>
+      <option value="bottom">bottom</option><option value="left" selected>left</option>
+    </select>
+  </label>
+</div>
+
+<div class="inverter-status-line">
+  Inverter: <span id="inverter-status-line-text">-</span>
+</div>
+
+<div class="diagram layout-locked">
+  <svg id="diagram-svg" class="diagram-svg"></svg>
+  <div id="node-pv" class="diagram-node" data-toggle-details="pv">
+    <i class="bi bi-sun diagram-icon"></i>
+    <div id="pv-watts">- W</div>
+    <div id="pv-details" class="diagram-details">
+      <div class="diagram-node-name">PV</div>
+      <div>PV1: <span id="pv-string1">-</span></div>
+      <div>PV2: <span id="pv-string2">-</span></div>
+    </div>
+  </div>
+  <div id="node-battery" class="diagram-node diagram-node--grey" data-toggle-details="battery">
+    <div id="battery-fill" class="battery-fill"></div>
+    <div class="diagram-node-content">
+      <i class="bi bi-battery-half diagram-icon"></i>
+      <div id="battery-soc">- %</div>
+      <div id="battery-watts">- W</div>
+      <div id="battery-details" class="diagram-details">
+        <div class="diagram-node-name">Battery</div>
+        <div><span id="battery-voltage">-</span> V</div>
+        <div><span id="battery-temp">-</span> °C</div>
+        <div>Discharge limit: <span id="battery-discharge-limit">-</span> A</div>
+      </div>
+    </div>
+  </div>
+  <div id="node-inverter" class="diagram-node diagram-node--grey" data-toggle-details="inverter">
+    <i class="bi bi-cpu diagram-icon"></i>
+    <div id="inverter-details" class="diagram-details">
+      <div class="diagram-node-name">Inverter</div>
+      <div id="inverter-status">-</div>
+      <div>Air: <span id="inverter-temp-air">-</span> °C</div>
+      <div>Internal: <span id="inverter-temp">-</span> °C</div>
+    </div>
+  </div>
+  <div id="node-junction" class="diagram-node diagram-node--grey"></div>
+  <div id="node-grid" class="diagram-node diagram-node--grey" data-toggle-details="grid">
+    <i class="bi bi-broadcast-pin diagram-icon"></i>
+    <div id="grid-watts">- W</div>
+    <div id="grid-details" class="diagram-details">
+      <div class="diagram-node-name">Grid</div>
+      <div id="grid-meter">-</div>
+      <div id="grid-voltages">-</div>
+      <div id="grid-freqs">-</div>
+    </div>
+  </div>
+  <div id="node-backup" class="diagram-node" data-toggle-details="backup">
+    <i class="bi bi-plug diagram-icon"></i>
+    <div id="backup-watts">- W</div>
+    <div id="backup-details" class="diagram-details">
+      <div class="diagram-node-name">Backup</div>
+      <div id="backup-line1">L1: <span id="backup-p1">-</span> W, <span id="backup-i1">-</span> A</div>
+      <div id="backup-line2">L2: <span id="backup-p2">-</span> W, <span id="backup-i2">-</span> A</div>
+      <div id="backup-line3">L3: <span id="backup-p3">-</span> W, <span id="backup-i3">-</span> A</div>
+    </div>
+  </div>
+  <div id="node-load" class="diagram-node" data-toggle-details="load">
+    <i class="bi bi-house diagram-icon"></i>
+    <div id="load-watts">- W</div>
+    <div id="load-details" class="diagram-details">
+      <div class="diagram-node-name">Load</div>
+      <div>L1: <span id="load-p1">-</span></div>
+      <div>L2: <span id="load-p2">-</span></div>
+      <div>L3: <span id="load-p3">-</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="chart-wrap">
+  <h2 class="h6 text-center">Arrow-thickness scale comparison</h2>
+  <svg id="thickness-chart" viewBox="0 0 580 240" style="width:100%;max-width:580px;display:block;margin:0 auto;"></svg>
+  <p class="viewport-note">
+    X: watts (0-8000, covering the "High power" scenario's 7500W). Y: line
+    thickness (1-12px). Dashed vertical at 6000W = FULL_THICKNESS_WATTS,
+    where all three scales are pinned to reach max thickness - only their
+    shape below that point differs.
+  </p>
+  <table id="thickness-table" class="thickness-table"></table>
+  <p class="viewport-note">
+    Same three scales as the chart above, read as watt ranges instead of a
+    curve - the range for each px step, per scale (computed by sampling
+    each scale's own function, not a separate formula, so it can't drift
+    from what the chart/diagram actually draw). A wildly uneven range next
+    to its neighbors is the "ugly quantization" checklist item made
+    literal.
+  </p>
+</div>
+
+<p class="viewport-note">
+  Backup "in use" is two independent signals: <b>(1) off-grid/fault</b> -
+  active regardless of wattage whenever grid_mode/work_mode reports
+  Fault/Off-Grid. <b>(2) On-grid wattage threshold</b> - only while the
+  grid connection is normal, to tell idle CT-crosstalk noise apart from
+  genuine continuous backup load. Pick a mode below.
+</p>
+<div class="controls-bar" id="threshold-mode-bar">
+  <label><input type="radio" name="threshold-mode" value="adaptive" checked> Adaptive</label>
+  <label><input type="radio" name="threshold-mode" value="constant"> Constant</label>
+  <label><input type="radio" name="threshold-mode" value="disabled"> Disabled</label>
+</div>
+<div class="controls-bar" id="threshold-adaptive-controls">
+  <label>baseline <input type="number" id="adaptive-intercept" value="11.62" step="0.01"> W</label>
+  <label>+ <input type="number" id="adaptive-slope" value="0.000877" step="0.0001"> W per W of inverter output</label>
+  <label>+ margin <input type="number" id="adaptive-margin" value="7.5" step="0.5"> W</label>
+</div>
+<p class="viewport-note" id="threshold-adaptive-note">
+  Placeholder coefficients - see docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md
+  for the calibrated candidates (18/20 + 0.001957*x), not yet ported here.
+</p>
+<div class="controls-bar" id="threshold-constant-controls" style="display:none;">
+  <label>Backup "in use" threshold <input type="number" id="backup-threshold" value="30"> W</label>
+</div>
+<p class="viewport-note" id="threshold-constant-note" style="display:none;">
+  Fixed cutoff regardless of load.
+</p>
+<p class="viewport-note" id="threshold-disabled-note" style="display:none;">
+  Disabled: any backup_ptotal &gt; 0W counts as active.
+</p>
+
+<details class="editor" open>
+  <summary>Edit current scenario's values</summary>
+  <div class="editor-grid" id="editor-grid"></div>
+</details>
+
+<script>
+  // Scenario objects now carry the same raw sensor field names
+  // SELECTED_SENSORS/diagram-calc.js use (see sensors.py), instead of
+  // pre-computed presentational fields (color, direction, disconnected) -
+  // this file loads the real diagram-calc.js above and derives all of
+  // that the same way production does, so the mockup can't drift from
+  // what the dashboard actually receives. work_mode/grid_mode/battery_mode
+  // are the numeric codes from the design spec
+  // (docs/superpowers/specs/2026-09-03-live-power-flow-dashboard-design.md):
+  //   work_mode:  0 Wait | 1 Normal(On-Grid) | 2 Normal(Off-Grid)
+  //               | 3 Fault | 4 Flash | 5 Check
+  //   grid_mode:  0 Not connected | 1 Connected | 2 Fault
+  // pgrid/pgrid2/pgrid3 (the inverter's own grid-tie AC port, used for the
+  // Inverter<->Junction bus edge) are split evenly from the old scalar
+  // "bus" value - illustrative, not real per-phase telemetry, same
+  // approximation basis as backup_p1/2/3 below (backup_i * ~230V, rounded;
+  // backup_p1/2/3 are real sensors per sensors.py, just not modeled by
+  // diagram-calc.js yet, so they stay mockup-authored custom fields).
+  var BATTERY_MODE = DiagramCalc.BATTERY_MODE, GRID_IN_OUT = DiagramCalc.GRID_IN_OUT, GRID_MODE = DiagramCalc.GRID_MODE;
+  var SCENARIOS = {
+    'Day: charging': {
+      ppv: 1367, ppv1: 700, vpv1: 320, ppv2: 667, vpv2: 318,
+      pbattery1: 364, battery_mode: BATTERY_MODE.CHARGE, battery_soc: 52, battery_discharge_limit: 25, vbattery1: 320.1, battery_temperature: 28,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 32, temperature: 38, pgrid: 317, pgrid2: 317, pgrid3: 317,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 9, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 230.1, vgrid2: 231.4, vgrid3: 229.8, fgrid: 50.01, fgrid2: 50.01, fgrid3: 50.0, meter_active_power1: 3, meter_active_power2: 3, meter_active_power3: 3,
+      load_ptotal: 990, load_p1: 330, load_p2: 340, load_p3: 320,
+    },
+    'Night: grid-covered, battery idle': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      pbattery1: 31, battery_mode: BATTERY_MODE.STANDBY, battery_soc: 100, battery_discharge_limit: 25, vbattery1: 200.9, battery_temperature: 18,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 15, temperature: 20, pgrid: 0, pgrid2: 0, pgrid3: 0,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 385, grid_in_out: GRID_IN_OUT.IMPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 229.0, vgrid2: 230.2, vgrid3: 228.6, fgrid: 49.99, fgrid2: 49.99, fgrid3: 50.0, meter_active_power1: 128, meter_active_power2: 129, meter_active_power3: 128,
+      load_ptotal: 372, load_p1: 120, load_p2: 125, load_p3: 127,
+    },
+    'Grid Fault (blackout)': {
+      ppv: 2100, ppv1: 1050, vpv1: 330, ppv2: 1050, vpv2: 328,
+      pbattery1: 3400, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 40, battery_discharge_limit: 25, vbattery1: 195.2, battery_temperature: 30,
+      work_mode: 2, work_mode_label: 'Normal (Off-Grid)', temperature_air: 34, temperature: 40, pgrid: 1067, pgrid2: 1067, pgrid3: 1066,
+      backup_ptotal: 5500, backup_i1: 12.1, backup_i2: 14.0, backup_i3: 11.8, backup_p1: 1810, backup_p2: 2130, backup_p3: 1560,
+      meter_active_power_total: 0, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.FAULT, grid_mode_label: 'Fault',
+      vgrid: 0, vgrid2: 0, vgrid3: 0, fgrid: 0, fgrid2: 0, fgrid3: 0, meter_active_power1: 0, meter_active_power2: 0, meter_active_power3: 0,
+      // Non-critical circuits are de-energized off-grid (Junction/Grid
+      // path is dead) - all generation+discharge (2100+3400=5500) goes to
+      // Backup instead, matching its total exactly. Battery bumped from
+      // 1500W to cover the gap rather than shrinking Backup, so this
+      // still exercises the L2 overload (>=13.5A) case.
+      load_ptotal: 0, load_p1: 0, load_p2: 0, load_p3: 0,
+    },
+    'Single-phase grid failure (L2 dead)': {
+      ppv: 42, ppv1: 21, vpv1: 300, ppv2: 21, vpv2: 298,
+      pbattery1: 284, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 11, battery_discharge_limit: 25, vbattery1: 190.0, battery_temperature: 20,
+      work_mode: 2, work_mode_label: 'Normal (Off-Grid)', temperature_air: 22, temperature: 28, pgrid: 105, pgrid2: 105, pgrid3: 106,
+      backup_ptotal: 10, backup_i1: 0.2, backup_i2: 0.2, backup_i3: 0.3, backup_p1: 46, backup_p2: 46, backup_p3: 69,
+      meter_active_power_total: 144, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.FAULT, grid_mode_label: 'Fault',
+      vgrid: 224.2, vgrid2: 0.0, vgrid3: 223.9, fgrid: 50.0, fgrid2: 0.0, fgrid3: 50.0, meter_active_power1: 89, meter_active_power2: 0, meter_active_power3: 55,
+      load_ptotal: 316, load_p1: 95, load_p2: 0, load_p3: 221,
+    },
+    'Inverter Fault Mode (real event, grid-triggered)': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      pbattery1: 31, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 16, battery_discharge_limit: 25, vbattery1: 185.0, battery_temperature: 24,
+      work_mode: 3, work_mode_label: 'Fault Mode', temperature_air: 24, temperature: 30, pgrid: 0, pgrid2: 0, pgrid3: 0,
+      backup_ptotal: 0, backup_i1: 0.0, backup_i2: 0.1, backup_i3: 0.0, backup_p1: 0, backup_p2: 23, backup_p3: 0,
+      meter_active_power_total: 95, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.FAULT, grid_mode_label: 'Fault',
+      vgrid: 232.9, vgrid2: 0.0, vgrid3: 229.2, fgrid: 50.0, fgrid2: 0.0, fgrid3: 50.0, meter_active_power1: 55, meter_active_power2: 0, meter_active_power3: 40,
+      load_ptotal: 31, load_p1: 10, load_p2: 0, load_p3: 21,
+    },
+    'Fault after backup overload (real behavior, unloggable event)': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      pbattery1: 0, battery_mode: BATTERY_MODE.STANDBY, battery_soc: 20, battery_discharge_limit: 25, vbattery1: 188.0, battery_temperature: 30,
+      work_mode: 3, work_mode_label: 'Fault Mode', temperature_air: 30, temperature: 38, pgrid: 0, pgrid2: 0, pgrid3: 0,
+      backup_ptotal: 0, backup_i1: 0.0, backup_i2: 0.0, backup_i3: 0.0, backup_p1: 0, backup_p2: 0, backup_p3: 0,
+      meter_active_power_total: 0, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.FAULT, grid_mode_label: 'Fault',
+      vgrid: 0, vgrid2: 0, vgrid3: 0, fgrid: 0, fgrid2: 0, fgrid3: 0, meter_active_power1: 0, meter_active_power2: 0, meter_active_power3: 0,
+      load_ptotal: 0, load_p1: 0, load_p2: 0, load_p3: 0,
+    },
+    'Grid Not Connected (inverter waiting)': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      pbattery1: 0, battery_mode: BATTERY_MODE.STANDBY, battery_soc: 88, battery_discharge_limit: 25, vbattery1: 205.0, battery_temperature: 25,
+      work_mode: 0, work_mode_label: 'Wait Mode', temperature_air: 20, temperature: 24, pgrid: 0, pgrid2: 0, pgrid3: 0,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      // Was hand-authored as color:'orange' with a separate disconnected:
+      // true flag - an inconsistent pair that couldn't happen from a
+      // single grid_mode value (NOT_CONNECTED forces grey+crossed in
+      // gridState(), never orange). Fixed to the one raw value that
+      // actually produces this scenario's intent.
+      meter_active_power_total: 0, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.NOT_CONNECTED, grid_mode_label: 'Not connected to grid',
+      vgrid: 230.4, vgrid2: 229.9, vgrid3: 230.1, fgrid: 50.02, fgrid2: 50.01, fgrid3: 50.02, meter_active_power1: 0, meter_active_power2: 0, meter_active_power3: 0,
+      load_ptotal: 287, load_p1: 87, load_p2: 100, load_p3: 100,
+    },
+    'High power (thickness check)': {
+      ppv: 7500, ppv1: 3800, vpv1: 340, ppv2: 3700, vpv2: 338,
+      // Battery/grid/load scaled down from their original 4000/2800/3200
+      // (which summed to 10013W against only 7500W of PV, no other
+      // source) to fit exactly within PV's total, keeping all four still
+      // substantial enough to exercise near-max arrow thickness.
+      pbattery1: 3000, battery_mode: BATTERY_MODE.CHARGE, battery_soc: 61, battery_discharge_limit: 25, vbattery1: 330.0, battery_temperature: 33,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 36, temperature: 42, pgrid: 2000, pgrid2: 2000, pgrid3: 2000,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 2087, grid_in_out: GRID_IN_OUT.EXPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 231.0, vgrid2: 232.1, vgrid3: 230.5, fgrid: 50.01, fgrid2: 50.0, fgrid3: 50.01, meter_active_power1: 696, meter_active_power2: 696, meter_active_power3: 695,
+      load_ptotal: 2400, load_p1: 790, load_p2: 820, load_p3: 790,
+    },
+    'No battery installed': {
+      ppv: 1800, ppv1: 900, vpv1: 325, ppv2: 900, vpv2: 322,
+      pbattery1: 0, battery_mode: BATTERY_MODE.NO_BATTERY, battery_soc: 0, battery_discharge_limit: 0, vbattery1: 0, battery_temperature: 0,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 28, temperature: 34, pgrid: 600, pgrid2: 600, pgrid3: 600,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 400, grid_in_out: GRID_IN_OUT.EXPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 230.5, vgrid2: 231.0, vgrid3: 229.9, fgrid: 50.0, fgrid2: 50.01, fgrid3: 50.0, meter_active_power1: 133, meter_active_power2: 134, meter_active_power3: 133,
+      load_ptotal: 1387, load_p1: 447, load_p2: 470, load_p3: 470,
+    },
+    'Battery discharge limit at 0A (reserve floor hit)': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      pbattery1: 250, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 10, battery_discharge_limit: 0, vbattery1: 190.0, battery_temperature: 22,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 18, temperature: 24, pgrid: 83, pgrid2: 83, pgrid3: 84,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 150, grid_in_out: GRID_IN_OUT.IMPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 230, vgrid2: 230, vgrid3: 230, fgrid: 50, fgrid2: 50, fgrid3: 50, meter_active_power1: 50, meter_active_power2: 50, meter_active_power3: 50,
+      load_ptotal: 387, load_p1: 117, load_p2: 140, load_p3: 130,
+    },
+    'Backup idle noise (22W, no real usage)': {
+      ppv: 1200, ppv1: 600, vpv1: 318, ppv2: 600, vpv2: 316,
+      pbattery1: 200, battery_mode: BATTERY_MODE.CHARGE, battery_soc: 70, battery_discharge_limit: 25, vbattery1: 315.0, battery_temperature: 26,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 30, temperature: 36, pgrid: 267, pgrid2: 267, pgrid3: 266,
+      backup_ptotal: 22, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 7, backup_p2: 7, backup_p3: 8,
+      meter_active_power_total: 100, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 230, vgrid2: 230, vgrid3: 230, fgrid: 50, fgrid2: 50, fgrid3: 50, meter_active_power1: 30, meter_active_power2: 30, meter_active_power3: 30,
+      load_ptotal: 978, load_p1: 326, load_p2: 326, load_p3: 326,
+    },
+    'Off-grid: backup engaged, ramping (real event replay)': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      // Was direction:'none'/watts:0 - but something has to be supplying
+      // Backup's 220W during a real off-grid event with no PV, and it's
+      // not the grid (disconnected). Battery discharging is the only
+      // physically sensible source here, and also balances the totals.
+      pbattery1: 220, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 45, battery_discharge_limit: 25, vbattery1: 210.0, battery_temperature: 20,
+      work_mode: 2, work_mode_label: 'Normal (Off-Grid)', temperature_air: 18, temperature: 22, pgrid: 0, pgrid2: 0, pgrid3: 0,
+      backup_ptotal: 220, backup_i1: 0.3, backup_i2: 0.3, backup_i3: 0.3, backup_p1: 73, backup_p2: 73, backup_p3: 74,
+      meter_active_power_total: 0, grid_in_out: GRID_IN_OUT.IDLE, grid_mode: GRID_MODE.FAULT, grid_mode_label: 'Fault',
+      vgrid: 0, vgrid2: 0, vgrid3: 0, fgrid: 0, fgrid2: 0, fgrid3: 0, meter_active_power1: 0, meter_active_power2: 0, meter_active_power3: 0,
+      load_ptotal: 0, load_p1: 0, load_p2: 0, load_p3: 0,
+    },
+    // New: two simultaneous sources (PV + battery discharging) feeding two
+    // simultaneous sinks (Backup + Grid export) - the "nontrivial 2x2"
+    // case discussed while designing the split-arrow feature. Exists to
+    // exercise proportional apportionment with more than one source and
+    // more than one sink at once, which none of the scenarios above do
+    // simultaneously while grid-connected (the blackout scenarios are
+    // 2-source but grid/export is unavailable there).
+    'Two sources, two sinks (PV+battery -> backup+export)': {
+      ppv: 1500, ppv1: 750, vpv1: 330, ppv2: 750, vpv2: 328,
+      pbattery1: 800, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 55, battery_discharge_limit: 25, vbattery1: 310.0, battery_temperature: 29,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 31, temperature: 37, pgrid: 767, pgrid2: 767, pgrid3: 766,
+      backup_ptotal: 900, backup_i1: 1.3, backup_i2: 1.3, backup_i3: 1.3, backup_p1: 300, backup_p2: 300, backup_p3: 300,
+      meter_active_power_total: 1400, grid_in_out: GRID_IN_OUT.EXPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 230, vgrid2: 231, vgrid3: 229, fgrid: 50, fgrid2: 50, fgrid3: 50, meter_active_power1: 467, meter_active_power2: 467, meter_active_power3: 466,
+      load_ptotal: 0, load_p1: 0, load_p2: 0, load_p3: 0,
+    },
+    // Missing case flagged in review: grid is the source, battery is the
+    // sink - none of the scenarios above have grid-import feeding a
+    // charging battery (this project already has RCE/cheap-tariff timing
+    // logic elsewhere, so this is a realistic case: charge overnight at a
+    // cheap price even with zero PV). Also the scenario that best exercises
+    // the grid-bypass backup path with a genuinely nonzero grid meter, per
+    // the theory this is Normal On-Grid confirmed against real history:
+    // grid_mode Connected -> backup rides the bypass relay, not the
+    // inverter's own (near-zero, unrelated) pgrid sum.
+    'Night: charging battery from grid (cheap tariff)': {
+      ppv: 0, ppv1: 0, vpv1: 0, ppv2: 0, vpv2: 0,
+      pbattery1: 700, battery_mode: BATTERY_MODE.CHARGE, battery_soc: 35, battery_discharge_limit: 25, vbattery1: 305.0, battery_temperature: 19,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 14, temperature: 18, pgrid: 0, pgrid2: 0, pgrid3: 0,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 900, grid_in_out: GRID_IN_OUT.IMPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 230, vgrid2: 230, vgrid3: 230, fgrid: 50, fgrid2: 50, fgrid3: 50, meter_active_power1: 300, meter_active_power2: 300, meter_active_power3: 300,
+      load_ptotal: 187, load_p1: 60, load_p2: 64, load_p3: 63,
+    },
+    // Real 3-source case requested for the striped-edge work: overcast
+    // cold morning, PV weak, battery able to help but BMS current-limited
+    // by low temperature (distinct from the "reserve floor hit" scenario
+    // above - discharge_limit here is a real nonzero-but-low 8A, not 0),
+    // so grid tops up the rest. All three feed Load simultaneously.
+    'Cloudy cold morning: low PV + cold-limited battery + grid top-up': {
+      ppv: 300, ppv1: 150, vpv1: 280, ppv2: 150, vpv2: 278,
+      pbattery1: 150, battery_mode: BATTERY_MODE.DISCHARGE, battery_soc: 58, battery_discharge_limit: 8, vbattery1: 185.0, battery_temperature: 2,
+      work_mode: 1, work_mode_label: 'Normal (On-Grid)', temperature_air: 3, temperature: 11, pgrid: 146, pgrid2: 146, pgrid3: 145,
+      backup_ptotal: 13, backup_i1: 0.1, backup_i2: 0.1, backup_i3: 0.1, backup_p1: 4, backup_p2: 4, backup_p3: 5,
+      meter_active_power_total: 400, grid_in_out: GRID_IN_OUT.IMPORTING, grid_mode: GRID_MODE.CONNECTED, grid_mode_label: 'Connected to grid',
+      vgrid: 228, vgrid2: 229, vgrid3: 227, fgrid: 50, fgrid2: 50, fgrid3: 50, meter_active_power1: 133, meter_active_power2: 134, meter_active_power3: 133,
+      load_ptotal: 837, load_p1: 279, load_p2: 279, load_p3: 279,
+    },
+  };
+
+  // Colors/threshold come from DiagramCalc (loaded above) instead of a
+  // locally re-approximated copy - LINE_COLORS is display-only (SVG stroke
+  // colors, not part of DiagramCalc's DOM-free contract) so it stays here,
+  // matching diagram-render.js's own local copy.
+  var LINE_COLORS = { grey: '#6c757d', green: '#28a745', orange: '#fd7e14', red: '#dc3545', pink: '#e83e8c', yellow: '#ffc107' };
+  var BACKUP_CURRENT_ALERT_THRESHOLD_A = DiagramCalc.BACKUP_CURRENT_ALERT_THRESHOLD_A;
+
+  // arrowThickness is deliberately NOT wired to DiagramCalc.arrowThickness
+  // (unlike everything above) - that one turned out to be linear
+  // (w/FULL_THICKNESS_WATTS), which silently undid this mockup's own log1p
+  // scale when DiagramCalc was wired in, despite the file header claiming
+  // "log-scale... unchanged from v4" - a mistake, not an intentional
+  // revert. Linear made small real-world wattages all look equally
+  // hair-thin next to multi-kW ones; pure log1p (the old v4 scale)
+  // over-corrected the other way, compressing small and huge flows too
+  // close together. Square root sits between the two: it still gives small
+  // values noticeably more weight than linear does, without log's
+  // aggressive compression at the top end. FULL/MIN/MAX_THICKNESS_PX below
+  // mirror diagram-calc.js's own (unexported) constants - mockup-only
+  // pending a decision on which scale to actually port back. Range widened
+  // to 1-12px (was 2-9) per the ugly-quantization checklist item
+  // (docs/superpowers/notes/2026-09-11-diagram-mockup-checklist.md): the
+  // old `MIN + ratio*(MAX-MIN)` formula added MIN as a flat offset on top
+  // of the curve, so the "0 -> first bucket" jump only needed to cross
+  // half a normal step (nothing below MIN exists for w>0) while every
+  // later bucket needed a full step - the first bucket you can actually
+  // reach (2px) ended up roughly half the watt-width of the next one,
+  // which is what made "almost nothing gets 2px, it jumps straight to
+  // 3px" happen. Math.max(MIN, ratio*MAX) instead: the curve legitimately
+  // passes through the origin and is only floor-clamped at MIN, so 1px
+  // becomes the (intentionally narrow) near-zero catch-all and every
+  // bucket above it gets the curve's real, evenly-scaled step width.
+  var FULL_THICKNESS_WATTS = 6000, MIN_THICKNESS_PX = 1, MAX_THICKNESS_PX = 12;
+  function arrowThickness(watts) {
+    var w = Math.abs(DiagramCalc.toNumber(watts));
+    if (w === 0) return 0;
+    var ratio = Math.min(Math.sqrt(w) / Math.sqrt(FULL_THICKNESS_WATTS), 1);
+    return Math.max(MIN_THICKNESS_PX, ratio * MAX_THICKNESS_PX);
+  }
+
+  // Wraps DiagramCalc.batteryState to correct its still-unfixed low-SoC
+  // red check (docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md):
+  // it compares battery_soc (a %) against battery_discharge_limit (amperes)
+  // via `soc <= dischargeLimit`, which is a units mismatch, not a real
+  // condition - it both misses the real case (e.g. soc:10, dischargeLimit:0
+  // never trips 10<=0) and false-positives on unrelated ones (e.g.
+  // soc:11, dischargeLimit:25 trips 11<=25 even though the reserve floor
+  // isn't hit at all). Correct condition: the reserve floor is hit when
+  // dischargeLimit itself reads 0 A. direction/watts/noBattery aren't
+  // affected by the bug, so only color is recomputed here. Mockup-only,
+  // pending the production port (same note as arrowThickness above).
+  //
+  // Also switches discharge from orange to yellow (source-color-
+  // consistency checklist item, docs/superpowers/notes/2026-09-11-diagram-
+  // mockup-checklist.md): orange is already grid-import's color throughout
+  // this diagram, so a battery-discharge stripe sitting next to a
+  // grid-import stripe in the same arrow (e.g. Load's) would be
+  // indistinguishable. Changing it here, in the one place battery.color is
+  // computed, is what keeps the battery box, the battery->inverter edge,
+  // and every downstream stripe fed by battery discharge all in agreement
+  // automatically - none of those call sites hardcode the color
+  // themselves, they all just read battery.color.
+  //
+  // battery.color (red when the reserve floor is hit) is only ever a
+  // *status* color for the node itself, not a flow color - red isn't a
+  // real "what's flowing" hue anywhere else in this diagram (that's what
+  // yellow/green/orange mean), so an arrow using it directly would read
+  // as "an alert is flowing," which doesn't make sense - the discharge is
+  // still really happening (still discharging, just below the floor),
+  // it's the reserve level that's in alert, not the flow itself. Exposed
+  // separately as battery.flowColor (never red) for anything that draws
+  // an arrow/stripe; battery.color (which can be red) stays for
+  // setNodeColor('node-battery', ...) only.
+  function batteryState(s) {
+    var battery = DiagramCalc.batteryState(s);
+    if (!battery.noBattery) {
+      battery.flowColor = battery.direction === 'charge' ? 'green' : battery.direction === 'discharge' ? 'yellow' : 'grey';
+      battery.color = (DiagramCalc.toNumber(s.battery_discharge_limit) === 0) ? 'red' : battery.flowColor;
+    }
+    return battery;
+  }
+
+  function fmtW(w) { return Math.round(w) + ' W'; }
+  function byId(id) { return document.getElementById(id); }
+
+  // Shared by render() (node color) and redrawLines() (arrow color) so
+  // Backup's own arrow can never drift from the node it feeds - a bug
+  // reported in review: the arrow used a separately re-derived
+  // orange/grey-only value that never accounted for the overload case, so
+  // the Backup node could show red while every arrow feeding it still
+  // read plain orange (source-color-consistency checklist item - the
+  // *destination* box's color needs to agree with its own arrows just as
+  // much as a source box's does).
+  function backupNodeColor(backup, isBackupActive) {
+    return backup.phaseAlerts.some(Boolean) ? 'red' : (isBackupActive ? 'orange' : 'grey');
+  }
+
+  // Explicit whitelist rather than a \bdiagram-node--\w+\b regex strip -
+  // an earlier version of this file also had a diagram-node--translucent
+  // modifier class that a blanket regex would wipe on every render().
+  var NODE_COLOR_NAMES = ['grey', 'green', 'orange', 'red', 'pink', 'yellow'];
+  function setNodeColor(nodeId, colorName) {
+    var el = byId(nodeId);
+    NODE_COLOR_NAMES.forEach(function (name) { el.classList.remove('diagram-node--' + name); });
+    el.classList.add('diagram-node--' + colorName);
+  }
+
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+    return el;
+  }
+
+  function diagramRect() { return document.querySelector('.diagram').getBoundingClientRect(); }
+  function centerX(el) { var c = diagramRect(), r = el.getBoundingClientRect(); return (r.left + r.right) / 2 - c.left; }
+  function centerY(el) { var c = diagramRect(), r = el.getBoundingClientRect(); return (r.top + r.bottom) / 2 - c.top; }
+  function edgeY(el, which) { var c = diagramRect(), r = el.getBoundingClientRect(); return (which === 'top' ? r.top : r.bottom) - c.top; }
+  function edgeX(el, which) { var c = diagramRect(), r = el.getBoundingClientRect(); return (which === 'left' ? r.left : r.right) - c.left; }
+
+  function moveAlong(x, y, dir, amount) {
+    switch (dir) {
+      case 'right': return [x + amount, y];
+      case 'left': return [x - amount, y];
+      case 'down': return [x, y + amount];
+      case 'up': return [x, y - amount];
+    }
+  }
+
+  // Direction of travel for a Manhattan segment, inferred from its own
+  // coordinates (works after `reversed` has already swapped a segment's
+  // endpoints, since it only ever looks at the geo it's given, never which
+  // "end" is conceptually the source).
+  function segDir(geo) {
+    if (geo.y1 === geo.y2) return geo.x2 > geo.x1 ? 'right' : 'left';
+    return geo.y2 > geo.y1 ? 'down' : 'up';
+  }
+  var DIR_VECTOR = { right: { x: 1, y: 0 }, left: { x: -1, y: 0 }, down: { x: 0, y: 1 }, up: { x: 0, y: -1 } };
+  // A 90 degree rotation of the direction vector (perp = {dy, -dx}), used
+  // to lay out stripes (drawStripedManhattanEdge/drawStripedArrowheadGradient)
+  // by direction of travel rather than by raw horizontal/vertical axis - see
+  // the "stripe order flips at a bend" checklist item for why that
+  // distinction matters. Sign chosen so stripe index 0 (first in the
+  // array - battery/yellow, by convention) lands on the *left* for a
+  // downward-traveling edge, matching the screen order the source boxes
+  // actually sit in (Battery left, PV middle, Grid right) - e.g. Load's
+  // arrow, which travels straight down, reads yellow/green/orange
+  // left-to-right.
+  function perpVector(dir) {
+    var u = DIR_VECTOR[dir];
+    return { x: u.y, y: -u.x };
+  }
+
+  function arrowheadPolygonPoints(tipX, tipY, dir, size) {
+    var half = size * 0.6;
+    var back = moveAlong(tipX, tipY, dir, -size);
+    if (dir === 'right' || dir === 'left') return [[back[0], back[1] - half], [tipX, tipY], [back[0], back[1] + half]];
+    return [[back[0] - half, back[1]], [tipX, tipY], [back[0] + half, back[1]]];
+  }
+
+  // --- Hand-drawn SVG connections --------------------------------------
+  // Every edge is anchored to a specific *side* of each of its two boxes
+  // (not just a bare point) so it can auto-bend when a box no longer sits
+  // where the default CSS grid put it (see initFreeLayoutEditor - dragging
+  // a node is the normal way that happens now). sideAnchor gives the point
+  // on a given border; LEAVE_DIR/enterDir give the direction of travel
+  // leaving/arriving via that border; manhattanSegments connects any two
+  // (point, direction) pairs with 1-3 right-angle-only segments - a single
+  // segment when they're already aligned (the common, undragged case,
+  // identical to the old behavior), an "L" when the two directions are on
+  // perpendicular axes, a "Z" (via a midline) when they're on the same
+  // axis. Only the segment actually touching the destination box carries
+  // an arrowhead/stripes - see drawManhattanEdge.
+  var OPPOSITE_SIDE = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' };
+  var LEAVE_DIR = { left: 'left', right: 'right', top: 'up', bottom: 'down' };
+  // Junction's actual box (#node-junction) is a 22px hit-box so it's easy
+  // to grab/drag on a phone, but the *visible* dot painted inside it is
+  // only 7px (radius 3.5px, see the CSS radial-gradient) - a leftover from
+  // adding the free-position editor. sideAnchor used to derive Junction's
+  // border the same way as every other node (edgeX/edgeY off the real
+  // element box), which after that change meant "touching Junction's
+  // border" put every arrow ~7-8px short of the dot you can actually see,
+  // landing them on the invisible hit-box's edge instead. Special-cased
+  // here to the dot's own visible radius so arrows touch the dot again,
+  // regardless of hit-box size.
+  var JUNCTION_DOT_RADIUS = 3.5;
+  function sideAnchor(el, side) {
+    if (el.id === 'node-junction') {
+      var jx = centerX(el), jy = centerY(el), r = JUNCTION_DOT_RADIUS;
+      switch (side) {
+        case 'left': return { x: jx - r, y: jy };
+        case 'right': return { x: jx + r, y: jy };
+        case 'top': return { x: jx, y: jy - r };
+        case 'bottom': return { x: jx, y: jy + r };
+      }
+    }
+    return (side === 'left' || side === 'right') ? { x: edgeX(el, side), y: centerY(el) } : { x: centerX(el), y: edgeY(el, side) };
+  }
+  function enterDir(side) { return LEAVE_DIR[OPPOSITE_SIDE[side]]; }
+
+  function manhattanSegments(p0, dir0, p1, dir1) {
+    if (p0.x === p1.x || p0.y === p1.y) return [{ x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y }];
+    var horiz0 = dir0 === 'left' || dir0 === 'right';
+    var horiz1 = dir1 === 'left' || dir1 === 'right';
+    if (horiz0 !== horiz1) {
+      var corner = horiz0 ? { x: p1.x, y: p0.y } : { x: p0.x, y: p1.y };
+      return [
+        { x1: p0.x, y1: p0.y, x2: corner.x, y2: corner.y },
+        { x1: corner.x, y1: corner.y, x2: p1.x, y2: p1.y },
+      ];
+    }
+    if (horiz0) {
+      var midX = (p0.x + p1.x) / 2;
+      return [
+        { x1: p0.x, y1: p0.y, x2: midX, y2: p0.y },
+        { x1: midX, y1: p0.y, x2: midX, y2: p1.y },
+        { x1: midX, y1: p1.y, x2: p1.x, y2: p1.y },
+      ];
+    }
+    var midY = (p0.y + p1.y) / 2;
+    return [
+      { x1: p0.x, y1: p0.y, x2: p0.x, y2: midY },
+      { x1: p0.x, y1: midY, x2: p1.x, y2: midY },
+      { x1: p1.x, y1: midY, x2: p1.x, y2: p1.y },
+    ];
+  }
+
+  // reversed flips which end is the real destination (battery charging,
+  // grid importing, ...) by reversing the segment list and swapping each
+  // segment's own endpoints, rather than needing separate direction math -
+  // the "last segment carries the arrowhead" rule then naturally lands on
+  // the true destination either way.
+  //
+  // Two earlier per-segment approaches (independent butt-capped lines per
+  // segment, bridged at each joint by either an overshoot or a patch)
+  // both left visible gap/crossing artifacts at a bend - see
+  // drawStripedManhattanEdge's own comment for why a single continuous
+  // shape per stripe replaced that entirely. Plain (non-striped) edges
+  // don't have this problem (round caps already bulge over a joint) and
+  // stay per-segment.
+  function drawManhattanEdge(svg, p0, dir0, p1, dir1, colorName, thicknessPx, reversed, directionKnown, opacity, stripes) {
+    var segments = manhattanSegments(p0, dir0, p1, dir1);
+    if (reversed) segments = segments.slice().reverse().map(function (seg) { return { x1: seg.x2, y1: seg.y2, x2: seg.x1, y2: seg.y1 }; });
+    if (stripes && drawStripedManhattanEdge(svg, segments, stripes, thicknessPx)) return;
+    segments.forEach(function (seg, i) {
+      drawEdge(svg, seg, colorName, thicknessPx, false, opacity, i === segments.length - 1 ? directionKnown : false);
+    });
+  }
+
+  // Junction sits directly below Inverter by default (see the .diagram CSS
+  // comment): bus is vertical (Inverter bottom -> Junction top), grid/
+  // backupBypass are horizontal off Junction's right/left, load is
+  // vertical off Junction's bottom. inverterBusSide/gridEntrySide are
+  // user-adjustable (see the anchor-side <select> controls) - "especially
+  // for Inverter and Grid" per the request, since those are the two boxes
+  // most likely to want a different side once other boxes get dragged
+  // around them.
+  //
+  // backupIslanding (the inverter-fed case) used to be its own hand-rolled
+  // 3-segment function (drawBackupEdge) with a manually-computed elbow -
+  // now that Backup enters via its *right* edge instead of its top (per
+  // request - reads more like "the inverter's own islanded output," not
+  // "something dropping in from above" the way the grid-bypass case
+  // visually reads), the generic manhattanSegments router produces the
+  // same shape on its own: straight down from Inverter's bottom to
+  // Backup's own row, then straight left into Backup's right border - no
+  // special-casing needed any more. p0 is offset a few px left of
+  // Inverter's exact center so it doesn't overlap the bus edge's own
+  // exit point (both leave Inverter's bottom).
+  var anchorConfig = { inverterBusSide: 'bottom', gridEntrySide: 'left' };
+  // Both the backup-islanding edge's exit point and the bus edge's exit
+  // point leave Inverter's bottom border - offset by the same amount in
+  // opposite directions (see redrawLines' islandingActive handling) so
+  // the two sit symmetrically around Inverter's true center instead of
+  // one sitting dead-center while the other is pushed aside.
+  var BACKUP_ISLANDING_SHIFT = 10;
+  // Set by redrawLines before calling computeEdges() - true whenever the
+  // current scenario feeds Backup from the inverter (islanding), which is
+  // also when the bus exit point, Junction, and (so its own edge from
+  // Junction stays straight) Load all shift right by
+  // BACKUP_ISLANDING_SHIFT, to balance against the islanding edge's own
+  // leftward offset.
+  var islandingActive = false;
+  function computeEdges() {
+    var pv = byId('node-pv'), battery = byId('node-battery'), inverter = byId('node-inverter'),
+        junction = byId('node-junction'), backup = byId('node-backup'), grid = byId('node-grid'), load = byId('node-load');
+    var busAnchor = sideAnchor(inverter, anchorConfig.inverterBusSide);
+    var busShift = (islandingActive && anchorConfig.inverterBusSide === 'bottom') ? BACKUP_ISLANDING_SHIFT : 0;
+    return {
+      pv: { p0: sideAnchor(pv, 'bottom'), dir0: 'down', p1: sideAnchor(inverter, 'top'), dir1: enterDir('top') },
+      battery: { p0: sideAnchor(battery, 'right'), dir0: 'right', p1: sideAnchor(inverter, 'left'), dir1: enterDir('left') },
+      bus: { p0: { x: busAnchor.x + busShift, y: busAnchor.y }, dir0: LEAVE_DIR[anchorConfig.inverterBusSide], p1: sideAnchor(junction, 'top'), dir1: enterDir('top') },
+      grid: { p0: sideAnchor(junction, 'right'), dir0: 'right', p1: sideAnchor(grid, anchorConfig.gridEntrySide), dir1: enterDir(anchorConfig.gridEntrySide) },
+      load: { p0: sideAnchor(junction, 'bottom'), dir0: 'down', p1: sideAnchor(load, 'top'), dir1: enterDir('top') },
+      backupBypass: { p0: sideAnchor(junction, 'left'), dir0: 'left', p1: sideAnchor(backup, 'right'), dir1: enterDir('right') },
+      backupIslanding: { p0: { x: centerX(inverter) - BACKUP_ISLANDING_SHIFT, y: edgeY(inverter, 'bottom') }, dir0: 'down', p1: sideAnchor(backup, 'right'), dir1: enterDir('right') },
+    };
+  }
+
+  // Backup can be fed two different ways depending on the relay matrix's
+  // position (see file header comment #4): grid-bypass whenever grid_mode
+  // reads Connected (relay ties Backup straight to grid, skipping the
+  // inverter - true for Normal On-Grid *and* Check Mode, where the
+  // inverter's own output goes to internal testing instead), or
+  // inverter-fed otherwise (islanding/fault - the inverter synthesizes
+  // Backup's output itself from PV/battery). Mutually exclusive, so only
+  // one of Junction/Inverter ever has a Backup edge drawn at once - no new
+  // crossing risk. Confirmed against real history data (2026-08-20 fault
+  // event): during Check Mode, backup_ptotal tracked -meter_active_power_total
+  // almost 1:1 while pgrid sat near 0; during genuine Off-Grid/Fault,
+  // backup_ptotal showed no correlation with pgrid (which measures the
+  // grid-tie port, not the backup port) - consistent with this rule.
+  function backupSource(data) {
+    return DiagramCalc.toNumber(data.grid_mode) === GRID_MODE.CONNECTED ? 'node-junction' : 'node-inverter';
+  }
+
+  function drawEdge(svg, geo, colorName, thicknessPx, reversed, opacity, directionKnown, linecap) {
+    var hasFlow = thicknessPx > 0;
+    var color = LINE_COLORS[colorName] || LINE_COLORS.grey;
+    var strokeWidth = hasFlow ? thicknessPx : 1;
+    var horizontal = geo.y1 === geo.y2;
+    var hasDirection = hasFlow && directionKnown !== false;
+    var arrowAtStart = hasDirection && reversed;
+    var arrowAtEnd = hasDirection && !reversed;
+    var alpha = opacity === undefined ? 1 : opacity;
+
+    var size = Math.max(8, 6 + strokeWidth * 2.2);
+    var endDir = horizontal ? (geo.x2 > geo.x1 ? 'right' : 'left') : (geo.y2 > geo.y1 ? 'down' : 'up');
+    var startDir = horizontal ? (endDir === 'right' ? 'left' : 'right') : (endDir === 'down' ? 'up' : 'down');
+
+    var endTip = [geo.x2, geo.y2];
+    var startTip = [geo.x1, geo.y1];
+    var lineEnd = arrowAtEnd ? moveAlong(endTip[0], endTip[1], endDir, -size) : [geo.x2, geo.y2];
+    var lineStart = arrowAtStart ? moveAlong(startTip[0], startTip[1], startDir, -size) : [geo.x1, geo.y1];
+
+    svg.appendChild(svgEl('line', {
+      x1: lineStart[0], y1: lineStart[1], x2: lineEnd[0], y2: lineEnd[1],
+      stroke: color, 'stroke-width': strokeWidth, 'stroke-linecap': linecap || 'round', opacity: alpha,
+    }));
+
+    if (!hasFlow) return;
+    if (arrowAtEnd) {
+      svg.appendChild(svgEl('polygon', { points: arrowheadPolygonPoints(endTip[0], endTip[1], endDir, size).map(function (p) { return p.join(','); }).join(' '), fill: color, opacity: alpha }));
+    }
+    if (arrowAtStart) {
+      svg.appendChild(svgEl('polygon', { points: arrowheadPolygonPoints(startTip[0], startTip[1], startDir, size).map(function (p) { return p.join(','); }).join(' '), fill: color, opacity: alpha }));
+    }
+  }
+
+  // Middle-ground exploration of the "color mixing" idea from chat: rather
+  // than blending source colors into one muddy hue (two colors additively
+  // mixed doesn't read back as "part A, part B" without a legend), split
+  // the arrow's own width into parallel same-color stripes, one per
+  // contributing source, each sized proportionally to that source's watts.
+  // stripes is ordered left-to-right (for a vertical edge) or top-to-bottom
+  // (for a horizontal one) - callers pass them in the same left-to-right
+  // order the source boxes sit on screen (Battery/PV/Grid), so position
+  // alone hints at "which source" even before reading color. Per-px integer
+  // widths via the largest-remainder method (see the thickness chart's own
+  // quantization note above) - no fractional-px stripes. This is a
+  // proportional-to-*available*-wattage approximation, not the exact
+  // per-sink attribution the paused split-arrow exploration computed
+  // (live-power-flow-dashboard-mockup-v5-snapshot1.html) - it doesn't
+  // account for a source's watts being shared with other concurrent sinks,
+  // so treat it as "who's contributing, roughly how much," not a strict
+  // energy-balance readout.
+  //
+  // Arrowhead bleeding (checklist item): stripes must be shortened by the
+  // same `size` a normal single-color arrow shortens its shaft by, or
+  // they'd poke out past the triangle.
+  //
+  // History of two earlier attempts at the tip, both replaced:
+  // (1) a per-stripe [backPoint, tip, backPoint] wedge fan sharing the tip
+  // vertex - glitchy, since separate triangles converging on the exact
+  // same pixel show visible slivers/seams there;
+  // (2) the *single* real triangle as a <clipPath>, filled by per-stripe
+  // rectangles clipped to its silhouette - no seam at the tip itself, but
+  // still a stack of separate shapes, and didn't address the *shaft*
+  // side's own joint problems (see drawStripedManhattanEdge below).
+  // Replaced by a single <linearGradient> with hard (duplicate-offset)
+  // stops, applied as the fill of the one real triangle polygon - there
+  // is structurally nothing left to seam, since the whole tip is exactly
+  // one shape with exactly one fill. The gradient's own axis runs along
+  // perpVector(dir) (see its own comment), i.e. perpendicular to travel,
+  // spanning the triangle's back-edge half-width - color is constant
+  // along the direction of travel and only varies across it, which is
+  // exactly the desired banding, and the triangle's own taper (not a
+  // separate clip) is what narrows the bands toward the tip.
+  //
+  // Per-stripe integer pixel widths via the largest-remainder method -
+  // shared by the shaft and the arrowhead so both divide the same
+  // thicknessPx the same way. Returns null (not an empty array) when
+  // there's nothing to draw, so callers can tell "no stripes" apart from
+  // "stripes summing to zero width" without a separate total<=0 check.
+  function stripeWidths(stripes, thicknessPx) {
+    var total = stripes.reduce(function (sum, s) { return sum + s.watts; }, 0);
+    if (total <= 0 || thicknessPx <= 0) return null;
+    var raw = stripes.map(function (s) { return thicknessPx * s.watts / total; });
+    var widths = raw.map(Math.floor);
+    var used = widths.reduce(function (a, b) { return a + b; }, 0);
+    var remainder = thicknessPx - used;
+    var byFrac = raw.map(function (r, i) { return { i: i, frac: r - Math.floor(r) }; }).sort(function (a, b) { return b.frac - a.frac; });
+    for (var k = 0; k < remainder; k++) widths[byFrac[k % byFrac.length].i]++;
+    return widths;
+  }
+
+  var stripedGradientCounter = 0;
+
+  // Fills the arrowhead triangle with a single hard-stop gradient instead
+  // of separate per-stripe shapes - see the block comment above for why.
+  function drawStripedArrowheadGradient(svg, tipX, tipY, dir, size, stripes, thicknessPx, widths) {
+    var perp = perpVector(dir);
+    var half = size * 0.6;
+    var back = moveAlong(tipX, tipY, dir, -size);
+    var gx1 = back[0] - perp.x * half, gy1 = back[1] - perp.y * half;
+    var gx2 = back[0] + perp.x * half, gy2 = back[1] + perp.y * half;
+    var gradId = 'stripe-arrowhead-grad-' + (++stripedGradientCounter);
+    var grad = svgEl('linearGradient', { id: gradId, x1: gx1, y1: gy1, x2: gx2, y2: gy2, gradientUnits: 'userSpaceOnUse' });
+    var offset = 0; // fraction 0..1 across the full thicknessPx width
+    stripes.forEach(function (s, i) {
+      var w = widths[i];
+      if (w <= 0) return;
+      var color = LINE_COLORS[s.colorName] || LINE_COLORS.grey;
+      var o1 = offset / thicknessPx, o2 = (offset + w) / thicknessPx;
+      // Duplicate stops at each boundary (not one gradual stop) - a hard
+      // cut between bands, not a blend.
+      grad.appendChild(svgEl('stop', { offset: (o1 * 100) + '%', 'stop-color': color }));
+      grad.appendChild(svgEl('stop', { offset: (o2 * 100) + '%', 'stop-color': color }));
+      offset += w;
+    });
+    svg.appendChild(grad);
+    svg.appendChild(svgEl('polygon', {
+      points: arrowheadPolygonPoints(tipX, tipY, dir, size).map(function (p) { return p.join(','); }).join(' '),
+      fill: 'url(#' + gradId + ')',
+    }));
+  }
+
+  // Draws an entire striped Manhattan edge - every bent segment plus the
+  // arrowhead - as one continuous shape per stripe, instead of separate
+  // per-segment lines stitched together at the joints. Earlier attempts
+  // (per-segment butt-capped lines, with either an overshoot or a patch
+  // to bridge each joint) kept leaving a real gap or a visible crossing
+  // artifact right at the bend, because a joint built from two
+  // *independent* shapes can never be as reliable as there simply being
+  // no joint at all. This computes one exact polygon per stripe that
+  // traces the *entire* bent centerline, offset by that stripe's own
+  // perpendicular distance on each side, with a mathematically exact
+  // miter at every interior corner (not an approximation) - for a
+  // 90-degree Manhattan turn, the miter point works out to simply
+  // `corner + perpIncoming*offset + perpOutgoing*offset`, since the two
+  // segments' perpendiculars are always exactly one x-only and one
+  // y-only (perpendicular directions rotate perpendicular vectors too),
+  // so summing them can't double-count either axis.
+  function drawStripedManhattanEdge(svg, segments, stripes, thicknessPx) {
+    var widths = stripeWidths(stripes, thicknessPx);
+    if (!widths) return false;
+
+    var dirs = segments.map(segDir);
+    var points = [{ x: segments[0].x1, y: segments[0].y1 }];
+    segments.forEach(function (seg) { points.push({ x: seg.x2, y: seg.y2 }); });
+
+    var tip = points[points.length - 1];
+    var endDir = dirs[dirs.length - 1];
+    var size = Math.max(8, 6 + thicknessPx * 2.2);
+    var back = moveAlong(tip.x, tip.y, endDir, -size);
+    // Shaft's own path stops at the arrowhead's back edge, not the true
+    // tip - the triangle (wider than the shaft, by design - that's what
+    // makes it read as an arrowhead) takes over from there.
+    var shaftPoints = points.slice(0, -1).concat([{ x: back[0], y: back[1] }]);
+
+    function offsetPoint(i, offset) {
+      var p = shaftPoints[i];
+      if (i === 0) {
+        var perp0 = perpVector(dirs[0]);
+        return { x: p.x + perp0.x * offset, y: p.y + perp0.y * offset };
+      }
+      if (i === shaftPoints.length - 1) {
+        var perpN = perpVector(dirs[dirs.length - 1]);
+        return { x: p.x + perpN.x * offset, y: p.y + perpN.y * offset };
+      }
+      // Interior corner - exact miter (see this function's own comment).
+      var perpA = perpVector(dirs[i - 1]), perpB = perpVector(dirs[i]);
+      return { x: p.x + perpA.x * offset + perpB.x * offset, y: p.y + perpA.y * offset + perpB.y * offset };
+    }
+
+    var offset = -thicknessPx / 2;
+    stripes.forEach(function (s, idx) {
+      var w = widths[idx];
+      if (w <= 0) return;
+      var lo = offset, hi = offset + w;
+      var low = [], high = [];
+      for (var i = 0; i < shaftPoints.length; i++) { low.push(offsetPoint(i, lo)); high.push(offsetPoint(i, hi)); }
+      var poly = low.concat(high.reverse());
+      svg.appendChild(svgEl('polygon', {
+        points: poly.map(function (p) { return p.x + ',' + p.y; }).join(' '),
+        fill: LINE_COLORS[s.colorName] || LINE_COLORS.grey,
+        'shape-rendering': 'crispEdges',
+      }));
+      offset += w;
+    });
+
+    drawStripedArrowheadGradient(svg, tip.x, tip.y, endDir, size, stripes, thicknessPx, widths);
+    return true;
+  }
+
+  function drawCross(svg, geo) {
+    var midX = (geo.x1 + geo.x2) / 2, midY = (geo.y1 + geo.y2) / 2, r = 6;
+    var color = LINE_COLORS.red;
+    [[-r, -r, r, r], [-r, r, r, -r]].forEach(function (d) {
+      svg.appendChild(svgEl('line', {
+        x1: midX + d[0], y1: midY + d[1], x2: midX + d[2], y2: midY + d[3],
+        stroke: color, 'stroke-width': 2, 'stroke-linecap': 'round',
+      }));
+    });
+  }
+
+  // s here is a raw scenario/sensor-data object, not a derived state -
+  // matches how production's calc functions all take `data` directly.
+  function backupActive(s) {
+    var grid = DiagramCalc.gridState(s);
+    if (grid.crossed) return true;
+    var mode = document.querySelector('input[name="threshold-mode"]:checked').value;
+    var backupWatts = DiagramCalc.backupState(s).watts;
+    if (mode === 'disabled') return backupWatts > 0;
+    if (mode === 'constant') return backupWatts > (Number(byId('backup-threshold').value) || 0);
+    var intercept = Number(byId('adaptive-intercept').value) || 0;
+    var slope = Number(byId('adaptive-slope').value) || 0;
+    var margin = Number(byId('adaptive-margin').value) || 0;
+    var threshold = intercept + slope * DiagramCalc.inverterBusState(s).watts + margin;
+    return backupWatts > threshold;
+  }
+
+  var lastScenario = null;
+  function render(s) {
+    lastScenario = s;
+
+    var pv = DiagramCalc.pvState(s);
+    byId('pv-watts').textContent = fmtW(pv.watts);
+    byId('pv-string1').textContent = fmtW(s.ppv1) + ', ' + s.vpv1.toFixed(1) + ' V';
+    byId('pv-string2').textContent = fmtW(s.ppv2) + ', ' + s.vpv2.toFixed(1) + ' V';
+    setNodeColor('node-pv', pv.active ? 'green' : 'grey');
+
+    var battery = batteryState(s);
+    byId('battery-soc').textContent = s.battery_soc + ' %';
+    byId('battery-watts').textContent = fmtW(battery.watts);
+    byId('battery-voltage').textContent = s.vbattery1.toFixed(1);
+    byId('battery-temp').textContent = s.battery_temperature;
+    byId('battery-discharge-limit').textContent = s.battery_discharge_limit;
+    setNodeColor('node-battery', battery.color);
+    byId('battery-fill').style.height = s.battery_soc + '%';
+    byId('node-battery').style.opacity = battery.noBattery ? 0.5 : 1;
+
+    var inverter = DiagramCalc.inverterState(s);
+    byId('inverter-status').textContent = inverter.label;
+    byId('inverter-status-line-text').textContent = inverter.label;
+    byId('inverter-status-line-text').style.color = LINE_COLORS[inverter.color] || '';
+    setNodeColor('node-inverter', inverter.color);
+    byId('inverter-temp-air').textContent = s.temperature_air;
+    byId('inverter-temp').textContent = s.temperature;
+
+    var isBackupActive = backupActive(s);
+    var backup = DiagramCalc.backupState(s);
+    byId('backup-watts').textContent = fmtW(backup.watts);
+    // Overload now also drives the node's own border/icon color, not just
+    // the per-line text - see file header comment #1. Takes priority over
+    // the active/idle orange-vs-grey coloring.
+    setNodeColor('node-backup', backupNodeColor(backup, isBackupActive));
+    ['backup-i1', 'backup-i2', 'backup-i3'].forEach(function (id, i) {
+      byId(id).textContent = backup.phaseCurrents[i].toFixed(1);
+      byId(id.replace('backup-i', 'backup-p')).textContent = Math.round(s[id.replace('backup-i', 'backup_p')]);
+      byId(id.replace('backup-i', 'backup-line')).classList.toggle('diagram-alert', backup.phaseAlerts[i]);
+    });
+
+    var grid = DiagramCalc.gridState(s);
+    byId('grid-watts').textContent = fmtW(grid.watts);
+    setNodeColor('node-grid', grid.color);
+    byId('grid-meter').textContent = [s.meter_active_power1, s.meter_active_power2, s.meter_active_power3]
+      .map(function (v) { return Math.round(v); }).join(' / ') + ' W';
+    byId('grid-voltages').textContent = [s.vgrid, s.vgrid2, s.vgrid3].map(function (v) { return v.toFixed(1); }).join(' / ') + ' V';
+    byId('grid-freqs').textContent = [s.fgrid, s.fgrid2, s.fgrid3].map(function (v) { return v.toFixed(2); }).join(' / ') + ' Hz';
+
+    var load = DiagramCalc.loadState(s);
+    byId('load-watts').textContent = fmtW(load.watts);
+    setNodeColor('node-load', load.watts > 0 ? 'orange' : 'grey');
+    byId('load-p1').textContent = fmtW(s.load_p1);
+    byId('load-p2').textContent = fmtW(s.load_p2);
+    byId('load-p3').textContent = fmtW(s.load_p3);
+
+    redrawLines(s);
+  }
+
+  function redrawLines(s) {
+    var svg = byId('diagram-svg');
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    // Junction (and, so its own edge down from Junction stays straight,
+    // Load with it) shifts right by BACKUP_ISLANDING_SHIFT whenever
+    // backup is inverter-fed - balances against the islanding edge's own
+    // leftward exit offset (computeEdges reads islandingActive too, to
+    // shift the bus edge's exit point the other way by the same amount).
+    // Applied *before* computeEdges() so it reads the already-shifted
+    // live positions.
+    islandingActive = backupSource(s) === 'node-inverter';
+    var shift = islandingActive ? BACKUP_ISLANDING_SHIFT : 0;
+    autoOffsets['node-junction'] = { x: shift, y: 0 };
+    autoOffsets['node-load'] = { x: shift, y: 0 };
+    applyOffset(byId('node-junction'));
+    applyOffset(byId('node-load'));
+
+    var edges = computeEdges();
+    var isBackupActive = backupActive(s);
+
+    // Hoisted ahead of battery/backup (both need it for their own source
+    // mixes) - grid.color/watts don't depend on anything computed below,
+    // so there's no ordering hazard in reading it this early.
+    var grid = DiagramCalc.gridState(s);
+    var gridImportW = grid.color === 'orange' ? grid.watts : 0;
+
+    var pv = DiagramCalc.pvState(s);
+    drawManhattanEdge(svg, edges.pv.p0, edges.pv.dir0, edges.pv.p1, edges.pv.dir1, pv.active ? 'green' : 'grey', arrowThickness(pv.watts), false, true);
+
+    var battery = batteryState(s);
+    if (!battery.noBattery) {
+      var e = edges.battery;
+      if (battery.direction === 'charge') {
+        // Battery-as-sink (checklist item: source-color consistency
+        // applies to sinks too, not just Load) - charging can be
+        // PV-sourced, grid-sourced (e.g. the cheap-tariff overnight
+        // case), or both at once; stripe it the same way Load's arrow
+        // already does, instead of a flat green that implied "always
+        // from PV."
+        var chargeMix = [{ colorName: 'green', watts: pv.watts }, { colorName: 'orange', watts: gridImportW }];
+        drawManhattanEdge(svg, e.p0, e.dir0, e.p1, e.dir1, battery.flowColor, arrowThickness(battery.watts), true, true, 1, chargeMix);
+      } else {
+        drawManhattanEdge(svg, e.p0, e.dir0, e.p1, e.dir1, battery.flowColor, arrowThickness(battery.watts), false, battery.direction !== 'none');
+      }
+    }
+
+    var backup = DiagramCalc.backupState(s);
+    var backupColor = backupNodeColor(backup, isBackupActive);
+    var backupThickness = arrowThickness(backup.watts);
+    // Color-flow consistency (checklist item, item 6 from chat): battery
+    // discharge and PV are the two things that can actually feed Backup
+    // while inverter-fed (islanding) - same mix computed once below and
+    // reused for the bus edge, since both cases draw from the same pair.
+    var battDischargeW = (!battery.noBattery && battery.direction === 'discharge') ? battery.watts : 0;
+    var sourceMix = [{ colorName: 'yellow', watts: battDischargeW }, { colorName: 'green', watts: pv.watts }];
+    if (backupSource(s) === 'node-junction') {
+      // Grid-bypass: Backup taps the exact same grid-side line eGrid/eBus
+      // read below, so it should follow the same rule they do - grid.color
+      // as the flat color (orange import / grey idle), or the PV+battery
+      // sourceMix when grid.color is green (net export) - not the
+      // separately-computed, always-orange-or-grey backupColor, which
+      // only reflects the node's own alert/idle status (see the
+      // "status/alert color is not a flow color" checklist item -
+      // backupColor is exactly that kind of status value, fine for
+      // setNodeColor, wrong for an arrow).
+      var eb = edges.backupBypass;
+      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, grid.color, backupThickness, false, true, 1, grid.color === 'green' ? sourceMix : null);
+    } else {
+      var ei = edges.backupIslanding;
+      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, isBackupActive ? sourceMix : null);
+    }
+
+    // Inverter<->Junction ("bus") direction/magnitude used to be
+    // approximated as arrowThickness(load) with direction hardcoded to
+    // "inverter exports" - a fine approximation as long as load tracked
+    // roughly with what the inverter pushed out, but it breaks two ways:
+    // (1) wrong direction whenever the inverter is a net importer (e.g.
+    // charging the battery from grid power - the "cheap tariff" case),
+    // and (2) a vanishing arrow whenever load happens to be 0 even though
+    // real power is crossing the bus (e.g. all surplus going to grid
+    // export instead of local load, backup+battery-charge, none of it via
+    // Load - the "two sources, two sinks" case). Fixed with Kirchhoff's
+    // law at the Junction node: it only has three edges (bus, grid, load),
+    // so whatever the bus brings in must equal what grid and load take out
+    // - meaning bus = load - meterSigned. (pgrid/pgrid2/pgrid3 exist as a
+    // real sensor too, but they measure the inverter's grid-tie AC port
+    // specifically - confirmed near-zero during both Off-Grid islanding
+    // and grid-bypass Check Mode, i.e. exactly when Backup is fed via one
+    // of its two other paths - so they're the wrong signal for this edge;
+    // load/meter reconstruction is the one that actually holds.)
+    var load = DiagramCalc.loadState(s);
+    var meterSigned = grid.color === 'orange' ? grid.watts : -grid.watts;
+    var netBus = load.watts - meterSigned;
+    var busThickness = grid.crossed ? 0 : arrowThickness(netBus);
+    // Color-flow consistency: when the inverter is genuinely exporting
+    // onto the bus (netBus>=0), that flow is exactly the PV+battery-
+    // discharge mix - stripe it, same as Backup's inverter-fed case
+    // above. When it's a net importer instead (e.g. charging battery from
+    // grid), the bus is grid-sourced, a single color, no mixing needed -
+    // orange instead of the old plain grey so that direction reads as
+    // "grid-sourced" too, consistent with everywhere else orange means
+    // grid import.
+    var eBus = edges.bus;
+    drawManhattanEdge(svg, eBus.p0, eBus.dir0, eBus.p1, eBus.dir1,
+      grid.crossed ? 'red' : (netBus < 0 ? 'orange' : 'grey'), grid.crossed ? 0 : busThickness, netBus < 0, true, grid.crossed ? 0.5 : 1,
+      (!grid.crossed && netBus >= 0) ? sourceMix : null);
+
+    // Same mix again for Grid's edge, only when actually exporting - an
+    // import is already single-source (grid itself), correct as a plain
+    // orange line, no striping needed.
+    var gridThickness = arrowThickness(grid.watts);
+    var eGrid = edges.grid;
+    drawManhattanEdge(svg, eGrid.p0, eGrid.dir0, eGrid.p1, eGrid.dir1,
+      grid.color, gridThickness, grid.color === 'orange', grid.directionKnown, 1,
+      grid.color === 'green' ? sourceMix : null);
+
+    // Prototype of the striped color-mixing idea from chat (see
+    // drawStripedManhattanEdge's own comment) - Load is the most natural
+    // place to try it: it's the one sink that can genuinely draw from all three
+    // sources at once (battery discharge, PV, grid import), and matches
+    // the order the boxes actually sit in on screen (Battery left, PV/
+    // Inverter center, Grid right).
+    var loadThickness = arrowThickness(load.watts);
+    var eLoad = edges.load;
+    drawManhattanEdge(svg, eLoad.p0, eLoad.dir0, eLoad.p1, eLoad.dir1, load.watts > 0 ? 'orange' : 'grey', loadThickness, false, true, 1, [
+      { colorName: 'yellow', watts: battDischargeW },
+      { colorName: 'green', watts: pv.watts },
+      { colorName: 'orange', watts: gridImportW },
+    ]);
+    if (grid.crossed) drawCross(svg, { x1: eBus.p0.x, y1: eBus.p0.y, x2: eBus.p1.x, y2: eBus.p1.y });
+  }
+
+  document.querySelectorAll('[data-toggle-details]').forEach(function (trigger) {
+    trigger.addEventListener('click', function () {
+      // A drag that just ended also fires a click on release (that's how
+      // pointer/click events work) - without this guard, dragging a node
+      // would also toggle its details open/closed as an unwanted side
+      // effect. initFreeLayoutEditor() sets this flag for one click only.
+      if (trigger.dataset.suppressNextClick) { delete trigger.dataset.suppressNextClick; return; }
+      var key = trigger.getAttribute('data-toggle-details');
+      byId(key + '-details').classList.toggle('diagram-details--open');
+      if (lastScenario) redrawLines(lastScenario);
+    });
+  });
+
+  // --- Free-position layout editor ---------------------------------------
+  // Drag any node (or Junction) to a new spot to try a different
+  // arrangement. Implemented as a CSS transform offset on top of the
+  // normal grid position, not a re-layout - computeEdges already reads
+  // every anchor fresh from getBoundingClientRect() on each redraw, and a
+  // transform moves an element's rendered box without disturbing anyone
+  // else's layout, so "drag -> redrawLines()" is the entire mechanism; no
+  // changes needed to the edge geometry code at all. A short-drag/long-
+  // drag distance threshold (DRAG_THRESHOLD_PX) tells an intentional drag
+  // apart from a tap meant to toggle details - below it, this leaves the
+  // node untouched and lets the normal click handler above fire; at or
+  // above it, position is committed and that trailing click is suppressed.
+  // nodeId -> {x, y} defaults, applied on load AND restored by "Reset
+  // layout" (previously Reset just cleared everything back to the plain
+  // CSS grid spacing - the "old" layout - which stopped matching once a
+  // real arrangement was pasted back in as the default; now both paths
+  // agree). Pulled from a real "Export layout" run (compresses the gap
+  // between the Inverter row and the Junction/Grid/Load/Backup row).
+  // Each axis's tiny (<3px) x-drift from that export was snapped to 0 -
+  // it was drag imprecision, not an intentional offset, and left
+  // uncorrected it would give Load's otherwise-straight vertical drop
+  // from Junction (both at x:0) a pointless few-px Z-bend (checklist
+  // item: don't bend an edge that's really meant to be straight). Grid
+  // is kept at exactly the same y as Junction on purpose - same row.
+  // Backup keeps a real, larger y-difference from Junction/Grid/Load -
+  // that one's an intentional bend (Backup didn't move up as far as the
+  // others), not drag noise.
+  var DEFAULT_NODE_OFFSETS = {
+    'node-junction': { x: 0, y: -46.67 },
+    'node-grid': { x: 0, y: -46.67 },
+    'node-load': { x: 0, y: -52.67 },
+    'node-backup': { x: 0, y: -13.67 },
+  };
+  // The live, session-only offsets actually applied - starts as a copy of
+  // the defaults above (not a reference to them - dragging must never
+  // mutate DEFAULT_NODE_OFFSETS itself, or "Reset" would reset to
+  // whatever was last dragged instead of the real default). Module scope
+  // (not trapped inside initFreeLayoutEditor's closure) so the export
+  // button can read it too.
+  var nodeOffsets = {};
+  Object.keys(DEFAULT_NODE_OFFSETS).forEach(function (id) { nodeOffsets[id] = { x: DEFAULT_NODE_OFFSETS[id].x, y: DEFAULT_NODE_OFFSETS[id].y }; });
+
+  // Separate from nodeOffsets (the user's own drags): a small,
+  // scenario-driven nudge redrawLines applies/clears on its own each
+  // render - e.g. shifting Junction/Load right while backup islanding is
+  // active (see BACKUP_ISLANDING_SHIFT). Not user-draggable, not part of
+  // the layout export. applyOffset (below) adds this on top of whatever
+  // the user has dragged, rather than one replacing the other.
+  var autoOffsets = {};
+
+  // Module scope (not trapped inside initFreeLayoutEditor's closure) so
+  // redrawLines can also reposition a node outside of a user drag.
+  function applyOffset(el) {
+    var o = nodeOffsets[el.id] || { x: 0, y: 0 };
+    var a = autoOffsets[el.id] || { x: 0, y: 0 };
+    var x = o.x + a.x, y = o.y + a.y;
+    el.style.transform = (x || y) ? 'translate(' + x + 'px,' + y + 'px)' : '';
+  }
+
+  // Dragging starts locked - a stray tap-and-drag while just trying to
+  // scroll/tap a node for its details shouldn't silently rearrange the
+  // diagram. "Enable layout editing" (below) has to be turned on first;
+  // it's a toggle rather than a hold-to-drag gesture since this is meant
+  // for deliberately trying out arrangements, not a one-off nudge.
+  var layoutEditingEnabled = false;
+
+  function initFreeLayoutEditor() {
+    var DRAG_THRESHOLD_PX = 6;
+    var draggingEl = null, startPX = 0, startPY = 0, startOffset = { x: 0, y: 0 }, moved = false;
+
+    var draggable = document.querySelectorAll('.diagram-node, #node-junction');
+    draggable.forEach(function (el) {
+      applyOffset(el); // apply any pre-seeded default from nodeOffsets above before wiring drag handlers
+      el.addEventListener('pointerdown', function (e) {
+        if (!layoutEditingEnabled) return;
+        draggingEl = el;
+        startPX = e.clientX; startPY = e.clientY;
+        startOffset = nodeOffsets[el.id] || { x: 0, y: 0 };
+        moved = false;
+        el.setPointerCapture(e.pointerId);
+      });
+      el.addEventListener('pointermove', function (e) {
+        if (draggingEl !== el) return;
+        var dx = e.clientX - startPX, dy = e.clientY - startPY;
+        if (!moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+        moved = true;
+        el.classList.add('diagram-node--dragging');
+        nodeOffsets[el.id] = { x: startOffset.x + dx, y: startOffset.y + dy };
+        applyOffset(el);
+        if (lastScenario) redrawLines(lastScenario);
+      });
+      function endDrag(e) {
+        if (draggingEl !== el) return;
+        draggingEl = null;
+        el.classList.remove('diagram-node--dragging');
+        if (moved) el.dataset.suppressNextClick = '1';
+      }
+      el.addEventListener('pointerup', endDrag);
+      el.addEventListener('pointercancel', endDrag);
+    });
+
+    byId('toggle-layout-edit-btn').addEventListener('click', function () {
+      layoutEditingEnabled = !layoutEditingEnabled;
+      byId('toggle-layout-edit-btn').textContent = layoutEditingEnabled ? 'Lock layout' : 'Enable layout editing';
+      document.querySelector('.diagram').classList.toggle('layout-locked', !layoutEditingEnabled);
+    });
+
+    byId('reset-layout-btn').addEventListener('click', function () {
+      nodeOffsets = {};
+      Object.keys(DEFAULT_NODE_OFFSETS).forEach(function (id) { nodeOffsets[id] = { x: DEFAULT_NODE_OFFSETS[id].x, y: DEFAULT_NODE_OFFSETS[id].y }; });
+      draggable.forEach(applyOffset);
+      if (lastScenario) redrawLines(lastScenario);
+    });
+  }
+  initFreeLayoutEditor();
+
+  ['inverter-bus-side', 'grid-entry-side'].forEach(function (id) {
+    byId(id).addEventListener('change', function () {
+      anchorConfig.inverterBusSide = byId('inverter-bus-side').value;
+      anchorConfig.gridEntrySide = byId('grid-entry-side').value;
+      if (lastScenario) redrawLines(lastScenario);
+    });
+  });
+
+  // Exports the current arrangement (drag offsets + anchor-side picks) as
+  // JSON so it can be pasted back into chat - "a format understandable by
+  // you" per the request. Deliberately NOT scenario values (those are
+  // already editable/visible below) or absolute pixel positions (those
+  // depend on viewport size) - just the two things this editor actually
+  // changes relative to the default CSS grid layout.
+  byId('export-layout-btn').addEventListener('click', function () {
+    var out = byId('layout-export-output');
+    out.value = JSON.stringify({ nodeOffsets: nodeOffsets, anchorConfig: anchorConfig }, null, 2);
+    out.style.display = 'block';
+    out.focus();
+    out.select();
+  });
+
+  function onThresholdModeChange() {
+    var mode = document.querySelector('input[name="threshold-mode"]:checked').value;
+    byId('threshold-adaptive-controls').style.display = mode === 'adaptive' ? '' : 'none';
+    byId('threshold-adaptive-note').style.display = mode === 'adaptive' ? '' : 'none';
+    byId('threshold-constant-controls').style.display = mode === 'constant' ? '' : 'none';
+    byId('threshold-constant-note').style.display = mode === 'constant' ? '' : 'none';
+    byId('threshold-disabled-note').style.display = mode === 'disabled' ? '' : 'none';
+    if (lastScenario) render(lastScenario);
+  }
+  document.querySelectorAll('input[name="threshold-mode"]').forEach(function (radio) {
+    radio.addEventListener('change', onThresholdModeChange);
+  });
+  ['backup-threshold', 'adaptive-intercept', 'adaptive-slope', 'adaptive-margin'].forEach(function (id) {
+    byId(id).addEventListener('input', function () { if (lastScenario) render(lastScenario); });
+  });
+
+  function buildEditor(scenario) {
+    var grid = byId('editor-grid');
+    grid.innerHTML = '';
+    function walk(obj, path) {
+      Object.keys(obj).forEach(function (key) {
+        var value = obj[key];
+        var fieldPath = path ? path + '.' + key : key;
+        if (Array.isArray(value)) {
+          value.forEach(function (v, i) { addField(fieldPath + '[' + i + ']', v); });
+        } else if (value !== null && typeof value === 'object') {
+          walk(value, fieldPath);
+        } else {
+          addField(fieldPath, value);
+        }
+      });
+    }
+    function addField(path, value) {
+      var wrap = document.createElement('div');
+      wrap.className = 'editor-field';
+      var label = document.createElement('label');
+      label.textContent = path;
+      label.setAttribute('for', 'field-' + path);
+      var input = document.createElement('input');
+      input.id = 'field-' + path;
+      input.dataset.path = path;
+      if (typeof value === 'boolean') {
+        input.type = 'checkbox';
+        input.checked = value;
+      } else if (typeof value === 'number') {
+        input.type = 'number';
+        input.step = 'any';
+        input.value = value;
+      } else {
+        input.type = 'text';
+        input.value = value;
+      }
+      input.addEventListener('input', function () { applyEdit(path, input); });
+      wrap.appendChild(label);
+      wrap.appendChild(input);
+      grid.appendChild(wrap);
+    }
+    walk(scenario, '');
+  }
+
+  function applyEdit(path, input) {
+    var parts = path.replace(/\[(\d+)\]/g, '.$1').split('.');
+    var target = lastScenario;
+    for (var i = 0; i < parts.length - 1; i++) target = target[parts[i]];
+    var last = parts[parts.length - 1];
+    if (input.type === 'checkbox') target[last] = input.checked;
+    else if (input.type === 'number') target[last] = Number(input.value);
+    else target[last] = input.value;
+    render(lastScenario);
+  }
+
+  function cloneScenario(name) { return JSON.parse(JSON.stringify(SCENARIOS[name])); }
+
+  var bar = byId('scenario-bar');
+  Object.keys(SCENARIOS).forEach(function (name) {
+    var btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-outline-primary';
+    btn.textContent = name;
+    btn.addEventListener('click', function () {
+      var s = cloneScenario(name);
+      render(s);
+      buildEditor(s);
+    });
+    bar.appendChild(btn);
+  });
+
+  document.fonts.ready.then(function () {
+    var firstName = Object.keys(SCENARIOS)[0];
+    var s = cloneScenario(firstName);
+    render(s);
+    buildEditor(s);
+    setTimeout(function () { if (lastScenario) redrawLines(lastScenario); }, 150);
+  });
+
+  window.addEventListener('resize', function () { if (lastScenario) redrawLines(lastScenario); });
+
+  // --- Thickness-scale comparison chart + table --------------------------
+  // Static (doesn't depend on scenario data or live layout, so no need to
+  // wait for fonts.ready/resize like the diagram above) - just plots the
+  // three candidate watts->thickness-px formulas over the same domain this
+  // diagram actually uses them on, so they can be compared directly
+  // instead of only inferred from how a handful of scenario arrows look.
+  //
+  // Module scope (not trapped in renderThicknessChart's closure) so
+  // renderThicknessTable can read the exact same three functions - the
+  // table's ranges are only meaningful if they can't drift from what the
+  // chart (and arrowThickness itself) actually compute.
+  var THICKNESS_CHART_X_MAX = 8000;
+  // Same Math.max(MIN, ratio*MAX) shape as arrowThickness above for all
+  // three, so the comparison isolates the curve's shape (linear/sqrt/
+  // log) rather than mixing in the old additive-offset quantization bug
+  // for two of the three candidates.
+  var THICKNESS_SCALES = {
+    linear: { color: '#0d6efd', fn: function (w) { return w === 0 ? 0 : Math.max(MIN_THICKNESS_PX, Math.min(w / FULL_THICKNESS_WATTS, 1) * MAX_THICKNESS_PX); } },
+    sqrt: { color: '#28a745', fn: arrowThickness }, // this file's current pick
+    log: { color: '#fd7e14', fn: function (w) { return w === 0 ? 0 : Math.max(MIN_THICKNESS_PX, Math.min(Math.log1p(w) / Math.log1p(FULL_THICKNESS_WATTS), 1) * MAX_THICKNESS_PX); } },
+  };
+
+  function renderThicknessChart() {
+    var svg = byId('thickness-chart');
+    var W = 580, H = 240, padL = 34, padR = 12, padT = 12, padB = 28;
+    var xMax = THICKNESS_CHART_X_MAX, yMax = MAX_THICKNESS_PX + 1;
+    var scales = THICKNESS_SCALES;
+    function px(w) { return padL + (w / xMax) * (W - padL - padR); }
+    function py(t) { return H - padB - (t / yMax) * (H - padT - padB); }
+
+    // Axes
+    svg.appendChild(svgEl('line', { x1: px(0), y1: py(0), x2: px(xMax), y2: py(0), stroke: '#6c757d', 'stroke-width': 1 }));
+    svg.appendChild(svgEl('line', { x1: px(0), y1: py(0), x2: px(0), y2: py(yMax), stroke: '#6c757d', 'stroke-width': 1 }));
+    [0, 2000, 4000, 6000, 8000].forEach(function (w) {
+      svg.appendChild(svgEl('text', { x: px(w), y: py(0) + 16, fill: '#adb5bd', 'font-size': 10, 'text-anchor': 'middle' })).textContent = w;
+    });
+    [MIN_THICKNESS_PX, MAX_THICKNESS_PX].forEach(function (t) {
+      svg.appendChild(svgEl('text', { x: px(0) - 8, y: py(t) + 3, fill: '#adb5bd', 'font-size': 10, 'text-anchor': 'end' })).textContent = t;
+    });
+    // Reference line at FULL_THICKNESS_WATTS - where every scale converges
+    svg.appendChild(svgEl('line', { x1: px(FULL_THICKNESS_WATTS), y1: py(0), x2: px(FULL_THICKNESS_WATTS), y2: py(yMax), stroke: '#495057', 'stroke-width': 1, 'stroke-dasharray': '4,3' }));
+
+    var legendY = 20;
+    Object.keys(scales).forEach(function (name, i) {
+      var scale = scales[name];
+      // Quantized to whole px, same as the diagram's actual strokes -
+      // showing the continuous curve here would be prettier but wouldn't
+      // match what you actually see on an arrow, whose width can only ever
+      // step through integers. Each sample repeats its previous y before
+      // moving on, so a step reads as a flat run + a vertical jump rather
+      // than a smoothed diagonal - a true staircase, not just quantized
+      // dots joined by straight (and therefore still-sloped) segments.
+      var points = [];
+      var prevT = null;
+      for (var w = 0; w <= xMax; w += 25) {
+        var t = Math.round(scale.fn(w));
+        if (prevT !== null && t !== prevT) points.push(px(w) + ',' + py(prevT));
+        points.push(px(w) + ',' + py(t));
+        prevT = t;
+      }
+      svg.appendChild(svgEl('polyline', { points: points.join(' '), fill: 'none', stroke: scale.color, 'stroke-width': 2 }));
+
+      var lx = px(xMax) - 130, ly = legendY + i * 16;
+      svg.appendChild(svgEl('line', { x1: lx, y1: ly, x2: lx + 20, y2: ly, stroke: scale.color, 'stroke-width': 2 }));
+      var label = svgEl('text', { x: lx + 26, y: ly + 3, fill: '#e9ecef', 'font-size': 11 });
+      label.textContent = name + (name === 'sqrt' ? ' (current)' : '');
+      svg.appendChild(label);
+    });
+  }
+  renderThicknessChart();
+
+  // Turns each scale's watts->px function into the watt range that
+  // produces each integer px from MIN_THICKNESS_PX..MAX_THICKNESS_PX, by
+  // sampling the function directly (same technique the chart's own
+  // staircase already uses) rather than re-deriving/inverting each
+  // formula by hand - can't drift from what the function actually does,
+  // and works unchanged if a scale's formula is ever swapped out. Skips
+  // the w=0 bucket (no flow, not a line-thickness question). The top
+  // bucket's upper end is reported as "+" since every scale saturates at
+  // FULL_THICKNESS_WATTS and stays at MAX_THICKNESS_PX for any watts
+  // above it, all the way past this table's own sampling ceiling.
+  function thicknessBuckets(fn, xMax, step) {
+    var buckets = [], prevPx = null, startW = 0;
+    for (var w = 0; w <= xMax; w += step) {
+      var px = Math.round(fn(w));
+      if (px !== prevPx) {
+        if (prevPx !== null) buckets.push({ px: prevPx, minW: startW, maxW: w - step });
+        startW = w;
+        prevPx = px;
+      }
+    }
+    buckets.push({ px: prevPx, minW: startW, maxW: xMax });
+    return buckets;
+  }
+
+  function renderThicknessTable() {
+    var table = byId('thickness-table');
+    var scaleNames = Object.keys(THICKNESS_SCALES);
+    var bucketsByScale = {};
+    scaleNames.forEach(function (name) {
+      bucketsByScale[name] = thicknessBuckets(THICKNESS_SCALES[name].fn, THICKNESS_CHART_X_MAX, 1);
+    });
+
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['px width'].concat(scaleNames).forEach(function (label) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    for (var px = MIN_THICKNESS_PX; px <= MAX_THICKNESS_PX; px++) {
+      var row = document.createElement('tr');
+      var pxCell = document.createElement('td');
+      pxCell.textContent = px + 'px';
+      row.appendChild(pxCell);
+      scaleNames.forEach(function (name) {
+        var bucket = bucketsByScale[name].filter(function (b) { return b.px === px; })[0];
+        var cell = document.createElement('td');
+        cell.textContent = !bucket ? '-' : (bucket.maxW >= THICKNESS_CHART_X_MAX ? bucket.minW + 'W+' : bucket.minW + '-' + bucket.maxW + 'W');
+        row.appendChild(cell);
+      });
+      tbody.appendChild(row);
+    }
+    table.appendChild(tbody);
+  }
+  renderThicknessTable();
+</script>
+</body>
+</html>
