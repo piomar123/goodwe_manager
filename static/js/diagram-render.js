@@ -360,11 +360,23 @@
 
   // Backup can be fed via a straight bypass relay (Junction, when grid_mode
   // is Connected) or synthesized by the inverter itself (islanding/fault) -
-  // see DiagramCalc.backupSource. Combined with gridState's `crossed` here
-  // (not in diagram-calc.js) so backupState stays a pure function of
-  // Backup's own data.
-  function isBackupActive(backup, grid) {
-    return grid.crossed || backup.active;
+  // see DiagramCalc.backupSource. Combined with gridState's `crossed` and
+  // the raw work_mode here (not in diagram-calc.js) so backupState stays a
+  // pure function of Backup's own data.
+  //
+  // backup.active (the wattage threshold) only distinguishes real usage
+  // from CT-crosstalk noise while genuinely Normal (On-Grid) - it was only
+  // ever calibrated against samples in that mode (see
+  // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md).
+  // grid.crossed (Fault/Not-connected) already forces active regardless of
+  // wattage, but that alone misses Check Mode: grid_mode still reads
+  // Connected there (the bypass relay ties Backup straight to grid - see
+  // backupSource's own comment), so grid.crossed is false, yet Check Mode
+  // is just as "not normal" as Fault/Off-Grid for the threshold's purposes.
+  function isBackupActive(backup, grid, data) {
+    if (grid.crossed) return true;
+    var normalOnGrid = DiagramCalc.toNumber(data.work_mode) === DiagramCalc.WORK_MODE.NORMAL_ON_GRID;
+    return normalOnGrid ? backup.active : true;
   }
 
   var lastData = null;
@@ -398,27 +410,41 @@
     }
 
     var backup = calc.backupState(data);
-    var active = isBackupActive(backup, grid);
+    var active = isBackupActive(backup, grid, data);
     var backupColor = backupNodeColor(backup, active);
     var backupThickness = calc.arrowThickness(backup.watts);
-    // Battery discharge and PV are the two things that can actually feed
-    // Backup while inverter-fed (islanding) - same mix reused for the bus
-    // edge below, since both cases draw from the same pair.
+    // Battery discharge, PV, and grid import are the three things that can
+    // feed a plain sink drawing from the shared bus (Backup, Load, and the
+    // bus/grid edges when they're genuinely exporting) - one shared mix,
+    // not grid.color's own single-value summary of the *net* household
+    // meter. Safe to always include the grid-import stripe even where a
+    // given edge can't actually carry it (islanding: gridImportW is always
+    // 0, since grid_mode isn't Connected there; bus/grid-export: also
+    // always 0, since gridImportW is only nonzero when grid.color is
+    // 'orange', mutually exclusive with the 'green' those branches gate
+    // on) - a zero-watt stripe just contributes zero width.
     var battDischargeW = (!battery.noBattery && battery.direction === 'discharge') ? battery.watts : 0;
-    var sourceMix = [{ colorName: 'yellow', watts: battDischargeW }, { colorName: 'green', watts: pv.watts }];
+    var fullSourceMix = [
+      { colorName: 'yellow', watts: battDischargeW },
+      { colorName: 'green', watts: pv.watts },
+      { colorName: 'orange', watts: gridImportW },
+    ];
     if (calc.backupSource(data) === 'junction') {
-      // Grid-bypass: Backup taps the exact same grid-side line the Bus/
-      // Grid edges read below, so it follows the same rule they do -
-      // grid.color as the flat color (orange import / grey idle), or the
-      // PV+battery sourceMix when grid.color is green (net export) - not
-      // a separately-computed status color, which only reflects the
-      // node's own alert/idle state (fine for setNodeColor, wrong for an
-      // arrow - a status color isn't a flow color).
+      // Grid-bypass ties Backup's circuit straight to the same grid line
+      // Load draws from, so it's colored exactly like Load's arrow below -
+      // the full source mix, not grid.color (which reads 'grey' whenever
+      // the *whole house* nets to ~0, even while Backup itself is
+      // genuinely drawing real power from that line). Phase-overload red
+      // still takes priority, same as backupColor/backupNodeColor - a real
+      // overload shouldn't get masked by the source mix. Inactive (idle
+      // noise below the threshold) still reads grey with no stripes, same
+      // as everywhere else `active` gates.
       var eb = edges.backupBypass;
-      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, grid.color, backupThickness, false, true, 1, grid.color === 'green' ? sourceMix : null);
+      var bypassColor = backup.phaseAlerts.some(Boolean) ? 'red' : (active ? 'orange' : 'grey');
+      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, bypassColor, backupThickness, false, true, 1, active ? fullSourceMix : null);
     } else {
       var ei = edges.backupIslanding;
-      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? sourceMix : null);
+      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? fullSourceMix : null);
     }
 
     // The Inverter<->Junction ("bus") edge used to be approximated as
@@ -447,7 +473,7 @@
     var eBus = edges.bus;
     drawManhattanEdge(svg, eBus.p0, eBus.dir0, eBus.p1, eBus.dir1,
       grid.crossed ? 'red' : (netBus < 0 ? 'orange' : 'grey'), grid.crossed ? 0 : busThickness, netBus < 0, true, grid.crossed ? 0.5 : 1,
-      (!grid.crossed && netBus >= 0) ? sourceMix : null);
+      (!grid.crossed && netBus >= 0) ? fullSourceMix : null);
 
     // Same mix again for Grid's edge, only when actually exporting - an
     // import is already single-source (grid itself), correct as a plain
@@ -456,7 +482,7 @@
     var eGrid = edges.grid;
     drawManhattanEdge(svg, eGrid.p0, eGrid.dir0, eGrid.p1, eGrid.dir1,
       grid.color, gridThickness, grid.color === 'orange', grid.directionKnown, 1,
-      grid.color === 'green' ? sourceMix : null);
+      grid.color === 'green' ? fullSourceMix : null);
 
     // Load is the one sink that can genuinely draw from all three sources
     // at once (battery discharge, PV, grid import), and the stripe order
@@ -464,11 +490,7 @@
     // PV/Inverter center, Grid right).
     var loadThickness = calc.arrowThickness(load.watts);
     var eLoad = edges.load;
-    drawManhattanEdge(svg, eLoad.p0, eLoad.dir0, eLoad.p1, eLoad.dir1, load.watts > 0 ? 'orange' : 'grey', loadThickness, false, true, 1, [
-      { colorName: 'yellow', watts: battDischargeW },
-      { colorName: 'green', watts: pv.watts },
-      { colorName: 'orange', watts: gridImportW },
-    ]);
+    drawManhattanEdge(svg, eLoad.p0, eLoad.dir0, eLoad.p1, eLoad.dir1, load.watts > 0 ? 'orange' : 'grey', loadThickness, false, true, 1, fullSourceMix);
 
     if (grid.crossed) drawCross(svg, { x1: eBus.p0.x, y1: eBus.p0.y, x2: eBus.p1.x, y2: eBus.p1.y });
 

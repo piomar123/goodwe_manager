@@ -191,3 +191,8 @@ test('backupSource: grid-bypass (junction) when grid_mode is Connected, inverter
   assert.equal(backupSource({ grid_mode: '0' }), 'inverter');
   assert.equal(backupSource({ grid_mode: '2' }), 'inverter');
 });
+
+test('WORK_MODE exposes the numeric work_mode codes, matching WORK_MODE_COLORS ordering', () => {
+  const { WORK_MODE } = require('../../static/js/diagram-calc.js');
+  assert.deepEqual(WORK_MODE, { WAIT: 0, NORMAL_ON_GRID: 1, NORMAL_OFF_GRID: 2, FAULT: 3, FLASH: 4, CHECK: 5 });
+});
