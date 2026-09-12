@@ -418,22 +418,28 @@
     // edge below, since both cases draw from the same pair.
     var battDischargeW = (!battery.noBattery && battery.direction === 'discharge') ? battery.watts : 0;
     var sourceMix = [{ colorName: 'yellow', watts: battDischargeW }, { colorName: 'green', watts: pv.watts }];
+    // Backup and Load are both plain sinks drawing from whatever's on the
+    // shared bus at that instant (battery discharge, PV, grid import) - the
+    // full 3-way mix, not grid.color's own single-value summary of the
+    // *net* household meter. Grid-bypass in particular ties Backup's
+    // circuit straight to the same grid line Load draws from, so it should
+    // be colored exactly like Load's arrow, not derived from grid.color
+    // (which reads 'grey' whenever the *whole house* nets to ~0, even
+    // while Backup itself is genuinely drawing real power from that line -
+    // the mirror image of the original "idle Backup shows colored" bug).
+    var fullSourceMix = [
+      { colorName: 'yellow', watts: battDischargeW },
+      { colorName: 'green', watts: pv.watts },
+      { colorName: 'orange', watts: gridImportW },
+    ];
     if (calc.backupSource(data) === 'junction') {
-      // Grid-bypass: Backup taps the exact same grid-side line the Bus/
-      // Grid edges read below, so *while actually active* it follows the
-      // same rule they do - grid.color as the flat color (orange import /
-      // grey idle), or the PV+battery sourceMix when grid.color is green
-      // (net export). While inactive (idle noise below the threshold),
-      // the arrow must read grey regardless of grid.color - this used to
-      // draw grid.color unconditionally, so e.g. importing power to charge
-      // the battery (nothing to do with Backup's own circuit) made the
-      // Backup arrow light up orange even though Backup itself was idle.
       // Phase-overload red still takes priority, same as backupColor/
-      // backupNodeColor - a real overload shouldn't get masked by
-      // whatever the net grid meter happens to read.
+      // backupNodeColor - a real overload shouldn't get masked by the
+      // source mix. Inactive (idle noise below the threshold) still reads
+      // grey with no stripes, same as everywhere else `active` gates.
       var eb = edges.backupBypass;
-      var bypassColor = backup.phaseAlerts.some(Boolean) ? 'red' : (active ? grid.color : 'grey');
-      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, bypassColor, backupThickness, false, true, 1, (active && grid.color === 'green') ? sourceMix : null);
+      var bypassColor = backup.phaseAlerts.some(Boolean) ? 'red' : (active ? 'orange' : 'grey');
+      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, bypassColor, backupThickness, false, true, 1, active ? fullSourceMix : null);
     } else {
       var ei = edges.backupIslanding;
       drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? sourceMix : null);
@@ -482,11 +488,7 @@
     // PV/Inverter center, Grid right).
     var loadThickness = calc.arrowThickness(load.watts);
     var eLoad = edges.load;
-    drawManhattanEdge(svg, eLoad.p0, eLoad.dir0, eLoad.p1, eLoad.dir1, load.watts > 0 ? 'orange' : 'grey', loadThickness, false, true, 1, [
-      { colorName: 'yellow', watts: battDischargeW },
-      { colorName: 'green', watts: pv.watts },
-      { colorName: 'orange', watts: gridImportW },
-    ]);
+    drawManhattanEdge(svg, eLoad.p0, eLoad.dir0, eLoad.p1, eLoad.dir1, load.watts > 0 ? 'orange' : 'grey', loadThickness, false, true, 1, fullSourceMix);
 
     if (grid.crossed) drawCross(svg, { x1: eBus.p0.x, y1: eBus.p0.y, x2: eBus.p1.x, y2: eBus.p1.y });
 
