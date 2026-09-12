@@ -24,9 +24,23 @@ you have old `data-*.csv` files from before the switch to SQLite, run
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 
 and streaming data to the frontend using Server Sent Events (SSE) for real-time updates.
 Data is written into a SQLite database (`data.db`, `inverter_history` table) and can be processed later
-by some scripts calculating the cost savings; see `docs/superpowers/specs/2026-08-27-sqlite-storage-design.md`
-for the storage design. Older `data-xxxx-xx-xx_xx-xx-xx.csv` files are legacy/historical only - the app no
-longer writes to them (see "Upgrading" above for importing them).
+by some scripts calculating the cost savings. Older `data-xxxx-xx-xx_xx-xx-xx.csv` files are legacy/historical
+only - the app no longer writes to them (see "Upgrading" above for importing them).
+
+## Documentation conventions
+
+Design docs for a feature under development live in `docs/superpowers/{specs,plans,notes}/`
+(dated filenames, e.g. `docs/superpowers/notes/2026-09-11-diagram-mockup-checklist.md`).
+Once the feature is implemented and merged, its spec/plan get deleted in a follow-up
+commit - the code and tests are the source of truth for current behavior, and the
+design rationale/trade-offs stay recoverable via that PR's commit history rather than
+bloating `main`'s tree with docs that will otherwise silently go stale. `notes/` (recorded
+investigations/decisions, e.g. bug root-causes, calibration data) are longer-lived than
+`specs`/`plans` and are kept unless truly obsolete.
+
+**Caveat**: if you delete a spec/plan, grep the repo for links to it first (e.g. this
+file used to link straight to a since-deleted sqlite storage spec) - a dangling
+reference is easy to miss and won't fail any build.
 
 Scripts starting from underscore `_` are not used by the main application, they are some drafts, experiments or utils.
 Dates for script input can be specified in formats: `YYYY-MM-DD` or `DD.MM.YYYY`.
