@@ -867,7 +867,7 @@ This task has no automated tests (none of the DOM/SSE wiring is unit-testable wi
 
 - [ ] **Step 1: Run the app locally against the real inverter (or replay real historical data if `--dry-run`/offline)**
 
-Run: `python main.py` (drop `--dry-run` if you want live inverter data; the design's example values throughout this plan came from `raspberry4.local`'s production `data.db`, so replaying a few of those rows through a manual `EventSource`-shaped test message is an acceptable substitute if the inverter isn't reachable from your dev machine).
+Run: `python main.py` (drop `--dry-run` if you want live inverter data; the design's example values throughout this plan came from the production Pi's `data.db`, so replaying a few of those rows through a manual `EventSource`-shaped test message is an acceptable substitute if the inverter isn't reachable from your dev machine).
 
 - [ ] **Step 2: Verify each documented scenario renders correctly**
 

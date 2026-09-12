@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Power-flow diagram mockup v4</title>
+<!-- v4: four changes on top of v3's settled layout, plus a value editor.
+     1. Inverter box shrunk to the same width as the other nodes - its
+        status text ("Normal (Off-Grid)") moved out into a persistent line
+        above the diagram instead, so the box no longer needs extra room.
+        Border/icon color-coding (work_mode) is unchanged.
+     2. Backup shows grey at/below a threshold (default 30W - see the
+        threshold input's note) instead of grey-only-at-exactly-0W, since
+        production data shows a noisy 9-28W idle baseline even when backup
+        is genuinely unused.
+     3. Battery SoC-low (red) now fires on battery_discharge_limit == 0
+        (an amp value the inverter zeroes out at its configured reserve
+        floor) instead of the old soc<=discharge_limit comparison, which
+        was comparing a 0-100 SoC% against an amp value - a unit mismatch
+        bug caught while speccing this.
+     4. PV/Battery/Backup/Bus lines now run through the inverter box's
+        center instead of stopping at its border. A checkbox toggles
+        whether the box stays opaque (lines read as passing *behind* it)
+        or turns translucent (lines visibly cross *inside* it) - flip it
+        to compare both without needing two separate mockups.
+     Arrow thickness is now log-scaled (was linear-with-floor) so small
+     flows (the ~13W backup baseline, a ~30W battery trickle) stay
+     visually distinct from each other, not just from zero.
+     Every scenario value is editable live via the panel below the
+     diagram - editing resets are per-scenario (switching scenarios
+     reloads its defaults into the editor). -->
+<link href="../../../static/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<style>
+  body { padding: 24px; }
+
+  .diagram {
+    position: relative;
+    display: grid;
+    /* Inverter's column no longer gets extra width (1.4fr -> 1fr) now that
+       it only holds an icon, matching Battery/Grid. */
+    grid-template-columns: minmax(90px, 1fr) minmax(90px, 1fr) minmax(24px, 0.35fr) minmax(90px, 1fr);
+    grid-template-areas:
+      ".        pv         .          ."
+      "battery  inverter   junction   grid"
+      ".        bottomrow  bottomrow  .";
+    gap: 56px 32px;
+    max-width: 620px;
+    margin: 24px auto;
+  }
+
+  .bottom-row {
+    grid-area: bottomrow;
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+  }
+
+  .diagram-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+    z-index: 0;
+  }
+
+  .diagram-node {
+    position: relative;
+    z-index: 1;
+    overflow: hidden;
+    border: 2px solid #6c757d;
+    border-radius: 8px;
+    padding: 6px;
+    text-align: center;
+    font-size: 0.85rem;
+    background: var(--bs-body-bg, #272b30);
+    color: #6c757d;
+    cursor: pointer;
+  }
+
+  #node-pv { grid-area: pv; }
+  #node-battery { grid-area: battery; }
+  #node-inverter { grid-area: inverter; }
+  #node-grid { grid-area: grid; }
+  #node-backup, #node-load { flex: 1 1 0; min-width: 90px; max-width: 160px; }
+
+  /* Translucent mode (the "merge visibly inside" option) - background
+     alpha low enough that the SVG lines crossing behind it are visible,
+     border/icon colors untouched. */
+  #node-inverter.diagram-node--translucent { background: rgba(39, 43, 48, 0.35); }
+
+  #node-junction {
+    grid-area: junction;
+    border: none;
+    padding: 0;
+    width: 7px;
+    height: 7px;
+    justify-self: center;
+    align-self: center;
+    border-radius: 50%;
+    background: currentColor;
+    cursor: default;
+  }
+
+  .diagram-node-content { position: relative; z-index: 1; }
+  .diagram-icon { font-size: 1.5rem; color: inherit; display: block; }
+  .diagram-node-name { font-weight: 600; margin-bottom: 2px; }
+
+  .diagram-node--grey { color: #6c757d; border-color: #6c757d; }
+  .diagram-node--green { color: #28a745; border-color: #28a745; }
+  .diagram-node--orange { color: #fd7e14; border-color: #fd7e14; }
+  .diagram-node--red { color: #dc3545; border-color: #dc3545; }
+  .diagram-node--pink { color: #e83e8c; border-color: #e83e8c; }
+  .diagram-node--yellow { color: #ffc107; border-color: #ffc107; }
+
+  .battery-fill {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 0%;
+    background: currentColor;
+    opacity: 0.3;
+    z-index: 0;
+    transition: height 0.3s ease;
+  }
+  #node-battery .diagram-node-content,
+  #node-battery .diagram-node-content .diagram-details { color: #f1f3f5; }
+  .diagram-node--grey .diagram-icon { color: #6c757d; }
+  .diagram-node--green .diagram-icon { color: #28a745; }
+  .diagram-node--orange .diagram-icon { color: #fd7e14; }
+  .diagram-node--red .diagram-icon { color: #dc3545; }
+  .diagram-node--pink .diagram-icon { color: #e83e8c; }
+  .diagram-node--yellow .diagram-icon { color: #ffc107; }
+
+  .diagram-details { display: none; font-size: 0.75rem; margin-top: 4px; opacity: 0.85; }
+  .diagram-details--open { display: block; }
+  .diagram-alert { color: #dc3545 !important; font-weight: bold; }
+
+  @media (max-width: 400px) {
+    .diagram {
+      grid-template-columns: minmax(64px, 1fr) minmax(64px, 1fr) minmax(18px, 0.3fr) minmax(64px, 1fr);
+      gap: 44px 16px;
+      font-size: 0.7rem;
+    }
+    .bottom-row { gap: 16px; }
+  }
+
+  .scenario-bar { max-width: 620px; margin: 0 auto 8px; text-align: center; }
+  .scenario-bar button { margin: 2px; }
+  .viewport-note { max-width: 620px; margin: 0 auto 12px; font-size: 0.8rem; color: var(--bs-secondary-color, #adb5bd); text-align: center; }
+
+  .inverter-status-line { max-width: 620px; margin: 0 auto 12px; text-align: center; font-size: 1rem; font-weight: 600; }
+
+  .controls-bar { max-width: 620px; margin: 0 auto 16px; font-size: 0.85rem; display: flex; flex-wrap: wrap; gap: 12px 24px; justify-content: center; align-items: center; }
+  .controls-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .controls-bar input[type=number] { width: 80px; }
+
+  .editor { max-width: 620px; margin: 24px auto; }
+  .editor summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+  .editor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 12px; }
+  .editor-field label { display: block; font-size: 0.72rem; color: var(--bs-secondary-color, #adb5bd); margin-bottom: 2px; }
+  .editor-field input, .editor-field select { width: 100%; }
+</style>
+</head>
+<body>
+
+<h1 class="h4 text-center">Live power-flow diagram — mockup v4</h1>
+<p class="viewport-note">Builds on v3: shrunk inverter box (status text moved below), log-scale arrow width, fixed battery-low rule, backup idle-threshold coloring, and lines routed through the inverter box. Tap a node for its extra details. Edit any value at the bottom.</p>
+
+<div class="scenario-bar" id="scenario-bar"></div>
+
+<div class="inverter-status-line">
+  Inverter: <span id="inverter-status-line-text">-</span>
+</div>
+
+<div class="diagram">
+  <svg id="diagram-svg" class="diagram-svg"></svg>
+  <div id="node-pv" class="diagram-node" data-toggle-details="pv">
+    <i class="bi bi-sun diagram-icon"></i>
+    <div id="pv-watts">- W</div>
+    <div id="pv-details" class="diagram-details">
+      <div class="diagram-node-name">PV</div>
+      <div>PV1: <span id="pv-string1">-</span></div>
+      <div>PV2: <span id="pv-string2">-</span></div>
+    </div>
+  </div>
+  <div id="node-battery" class="diagram-node diagram-node--grey" data-toggle-details="battery">
+    <div id="battery-fill" class="battery-fill"></div>
+    <div class="diagram-node-content">
+      <i class="bi bi-battery-half diagram-icon"></i>
+      <div id="battery-soc">- %</div>
+      <div id="battery-watts">- W</div>
+      <div id="battery-details" class="diagram-details">
+        <div class="diagram-node-name">Battery</div>
+        <div><span id="battery-voltage">-</span> V</div>
+        <div><span id="battery-temp">-</span> °C</div>
+        <div>Discharge limit: <span id="battery-discharge-limit">-</span> A</div>
+      </div>
+    </div>
+  </div>
+  <!-- No status text inside anymore - just the color-coded icon. Name/label
+       only shows once tapped, same inline-expand pattern as the others. -->
+  <div id="node-inverter" class="diagram-node diagram-node--grey" data-toggle-details="inverter">
+    <i class="bi bi-cpu diagram-icon"></i>
+    <div id="inverter-details" class="diagram-details">
+      <div class="diagram-node-name">Inverter</div>
+      <div id="inverter-status">-</div>
+      <div>Air: <span id="inverter-temp-air">-</span> °C</div>
+      <div>Internal: <span id="inverter-temp">-</span> °C</div>
+    </div>
+  </div>
+  <div id="node-junction" class="diagram-node diagram-node--grey"></div>
+  <div id="node-grid" class="diagram-node diagram-node--grey" data-toggle-details="grid">
+    <i class="bi bi-broadcast-pin diagram-icon"></i>
+    <div id="grid-watts">- W</div>
+    <div id="grid-details" class="diagram-details">
+      <div class="diagram-node-name">Grid</div>
+      <div id="grid-meter">-</div>
+      <div id="grid-voltages">-</div>
+      <div id="grid-freqs">-</div>
+    </div>
+  </div>
+  <div class="bottom-row">
+    <div id="node-backup" class="diagram-node" data-toggle-details="backup">
+      <i class="bi bi-plug diagram-icon"></i>
+      <div id="backup-watts">- W</div>
+      <div id="backup-details" class="diagram-details">
+        <div class="diagram-node-name">Backup</div>
+        <div id="backup-line1">L1: <span id="backup-i1">-</span> A</div>
+        <div id="backup-line2">L2: <span id="backup-i2">-</span> A</div>
+        <div id="backup-line3">L3: <span id="backup-i3">-</span> A</div>
+      </div>
+    </div>
+    <div id="node-load" class="diagram-node" data-toggle-details="load">
+      <i class="bi bi-house diagram-icon"></i>
+      <div id="load-watts">- W</div>
+      <div id="load-details" class="diagram-details">
+        <div class="diagram-node-name">Load</div>
+        <div>L1: <span id="load-p1">-</span></div>
+        <div>L2: <span id="load-p2">-</span></div>
+        <div>L3: <span id="load-p3">-</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="controls-bar">
+  <label>
+    <input type="checkbox" id="translucent-toggle">
+    Translucent inverter box (see flows cross inside it)
+  </label>
+</div>
+<p class="viewport-note">
+  Backup "in use" is now two independent signals, not one wattage check:
+  <b>(1) off-grid/fault</b> - backup shows active whenever the inverter's
+  own grid_mode/work_mode reports Fault or Off-Grid (the same signal
+  driving the Grid node's crossed-out-bus/red-icon logic), regardless of
+  wattage, since that's a real physical voltage-loss detection, not a
+  derived estimate. This is confirmed against a real 21-day-window outage
+  (2026-08-20, vgrid dropped to 0V) - see the last scenario. <b>(2) On-grid
+  wattage threshold</b> - only used while the grid connection is normal,
+  to tell idle CT-crosstalk noise apart from genuine continuous backup
+  load (e.g. an install with backup permanently wired to a fridge/router).
+  Pick a mode below.
+</p>
+<div class="controls-bar" id="threshold-mode-bar">
+  <label><input type="radio" name="threshold-mode" value="adaptive" checked> Adaptive</label>
+  <label><input type="radio" name="threshold-mode" value="constant"> Constant</label>
+  <label><input type="radio" name="threshold-mode" value="disabled"> Disabled</label>
+</div>
+<div class="controls-bar" id="threshold-adaptive-controls">
+  <label>baseline <input type="number" id="adaptive-intercept" value="11.62" step="0.01"> W</label>
+  <label>+ <input type="number" id="adaptive-slope" value="0.000877" step="0.0001"> W per W of inverter output</label>
+  <label>+ margin <input type="number" id="adaptive-margin" value="7.5" step="0.5"> W</label>
+</div>
+<p class="viewport-note" id="threshold-adaptive-note">
+  Regression fit against 21 days of production data, fault/off-grid
+  periods excluded (n=870,728): backup_baseline(inv_output) = 11.62 +
+  0.000877*inv_output, residual std 1.50W. Margin defaults to 5x residual
+  std (~7.5W). At the observed range (0-7500W inverter output) this
+  threshold moves ~19W to ~26W - tune the fields above to compare.
+</p>
+<div class="controls-bar" id="threshold-constant-controls" style="display:none;">
+  <label>Backup "in use" threshold <input type="number" id="backup-threshold" value="30"> W</label>
+</div>
+<p class="viewport-note" id="threshold-constant-note" style="display:none;">
+  Fixed cutoff regardless of load. 30W default (above the observed 9-28W
+  idle-noise band over the last ~5.8 days); 15W as originally proposed
+  would flicker grey/orange during ordinary idle noise.
+</p>
+<p class="viewport-note" id="threshold-disabled-note" style="display:none;">
+  Disabled: any backup_ptotal &gt; 0W counts as active. For installs where
+  backup is wired to always carry real load - the idle-noise distinction
+  doesn't apply there, so the heuristic is just turned off.
+</p>
+
+<details class="editor" open>
+  <summary>Edit current scenario's values</summary>
+  <div class="editor-grid" id="editor-grid"></div>
+</details>
+
+<script>
+  // Hardcoded scenarios pulled from real data.db rows checked during the
+  // original design phase, now with a battery.dischargeLimit (amps) field
+  // added per scenario for the corrected SoC-low rule - see the file
+  // header comment. Not wired to SSE; for eyeballing colors/layout/spacing
+  // and comparing display-rule options before touching the real
+  // diagram-calc.js/diagram-render.js/diagram.css.
+  var SCENARIOS = {
+    'Day: charging': {
+      pv: 1367, pv1: 700, vpv1: 320, pv2: 667, vpv2: 318,
+      battery: { watts: 364, color: 'green', direction: 'charge', dischargeLimit: 25 }, soc: 52, vbat: 320.1, batTemp: 28,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 32, temp: 38, bus: 951,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 9, color: 'grey' }, gridV: [230.1, 231.4, 229.8], gridF: [50.01, 50.01, 50.0], meterP: [3, 3, 3],
+      load: 960, loadP: [320, 340, 300],
+    },
+    'Night: grid-covered, battery idle': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 31, color: 'grey', direction: 'none', dischargeLimit: 25 }, soc: 100, vbat: 200.9, batTemp: 18,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 15, temp: 20, bus: 0,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 385, color: 'orange' }, gridV: [229.0, 230.2, 228.6], gridF: [49.99, 49.99, 50.0], meterP: [128, 129, 128],
+      load: 382, loadP: [130, 125, 127],
+    },
+    'Grid Fault (blackout)': {
+      pv: 2100, pv1: 1050, vpv1: 330, pv2: 1050, vpv2: 328,
+      battery: { watts: 1500, color: 'orange', direction: 'discharge', dischargeLimit: 25 }, soc: 40, vbat: 195.2, batTemp: 30,
+      inverter: { color: 'pink', label: 'Normal (Off-Grid)' }, tempAir: 34, temp: 40, bus: 3200,
+      backup: 5500, backupI: [12.1, 14.0, 11.8], disconnected: true,
+      grid: { watts: 0, color: 'red' }, gridV: [0, 0, 0], gridF: [0, 0, 0], meterP: [0, 0, 0],
+      load: 3200, loadP: [1050, 1100, 1050],
+    },
+    'Single-phase grid failure (L2 dead)': {
+      pv: 42, pv1: 21, vpv1: 300, pv2: 21, vpv2: 298,
+      battery: { watts: 22, color: 'orange', direction: 'discharge', dischargeLimit: 25 }, soc: 11, vbat: 190.0, batTemp: 20,
+      inverter: { color: 'pink', label: 'Normal (Off-Grid)' }, tempAir: 22, temp: 28, bus: 316,
+      backup: 10, backupI: [0.2, 0.2, 0.3], disconnected: true,
+      grid: { watts: 144, color: 'red' }, gridV: [224.2, 0.0, 223.9], gridF: [50.0, 0.0, 50.0], meterP: [89, 0, 55],
+      load: 316, loadP: [95, 0, 221],
+    },
+    'Inverter Fault Mode (real event, grid-triggered)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 31, color: 'orange', direction: 'discharge', dischargeLimit: 25 }, soc: 16, vbat: 185.0, batTemp: 24,
+      inverter: { color: 'red', label: 'Fault Mode' }, tempAir: 24, temp: 30, bus: 0,
+      backup: 0, backupI: [0.0, 0.1, 0.0], disconnected: true,
+      grid: { watts: 95, color: 'red' }, gridV: [232.9, 0.0, 229.2], gridF: [50.0, 0.0, 50.0], meterP: [55, 0, 40],
+      load: 442, loadP: [140, 0, 302],
+    },
+    'Fault after backup overload (real behavior, unloggable event)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 0, color: 'grey', direction: 'none', dischargeLimit: 25 }, soc: 20, vbat: 188.0, batTemp: 30,
+      inverter: { color: 'red', label: 'Fault Mode' }, tempAir: 30, temp: 38, bus: 0,
+      backup: 0, backupI: [0.0, 0.0, 0.0], disconnected: true,
+      grid: { watts: 0, color: 'red' }, gridV: [0, 0, 0], gridF: [0, 0, 0], meterP: [0, 0, 0],
+      load: 0, loadP: [0, 0, 0],
+    },
+    'Grid Not Connected (inverter waiting)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 0, color: 'grey', direction: 'none', dischargeLimit: 25 }, soc: 88, vbat: 205.0, batTemp: 25,
+      inverter: { color: 'grey', label: 'Wait Mode' }, tempAir: 20, temp: 24, bus: 0,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: true,
+      grid: { watts: 300, color: 'orange' }, gridV: [230.4, 229.9, 230.1], gridF: [50.02, 50.01, 50.02], meterP: [100, 100, 100],
+      load: 300, loadP: [100, 100, 100],
+    },
+    'High power (thickness check)': {
+      pv: 7500, pv1: 3800, vpv1: 340, pv2: 3700, vpv2: 338,
+      battery: { watts: 4000, color: 'green', direction: 'charge', dischargeLimit: 25 }, soc: 61, vbat: 330.0, batTemp: 33,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 36, temp: 42, bus: 6000,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 2800, color: 'green' }, gridV: [231.0, 232.1, 230.5], gridF: [50.01, 50.0, 50.01], meterP: [933, 934, 933],
+      load: 3200, loadP: [1050, 1100, 1050],
+    },
+    'No battery installed': {
+      pv: 1800, pv1: 900, vpv1: 325, pv2: 900, vpv2: 322,
+      battery: { watts: 0, color: 'grey', direction: 'none', noBattery: true, dischargeLimit: 0 }, soc: 0, vbat: 0, batTemp: 0,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 28, temp: 34, bus: 1800,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 400, color: 'green' }, gridV: [230.5, 231.0, 229.9], gridF: [50.0, 50.01, 50.0], meterP: [133, 134, 133],
+      load: 1400, loadP: [460, 470, 470],
+    },
+    // Renamed from "Battery at SoC floor": the old red trigger (soc <=
+    // discharge_limit) was a unit-mismatch bug (SoC% vs. amps - see file
+    // header). The real-world trigger is the inverter zeroing the
+    // discharge-current limit once its configured reserve floor is hit -
+    // dischargeLimit: 0 here is what now drives the red state, soc is just
+    // along for display.
+    'Battery discharge limit at 0A (reserve floor hit)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 250, color: 'orange', direction: 'discharge', dischargeLimit: 0 }, soc: 10, vbat: 190.0, batTemp: 22,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 18, temp: 24, bus: 250,
+      backup: 13, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 150, color: 'orange' }, gridV: [230, 230, 230], gridF: [50, 50, 50], meterP: [50, 50, 50],
+      load: 400, loadP: [130, 140, 130],
+    },
+    // Backup-noise scenario: backup sitting at 22W, inside the idle noise
+    // band the DB query found (9-28W) but above the old spec's ~13W
+    // assumption - exists specifically to compare the 15W vs 30W
+    // threshold inputs against real noise, not a hand-picked round number.
+    'Backup idle noise (22W, no real usage)': {
+      pv: 1200, pv1: 600, vpv1: 318, pv2: 600, vpv2: 316,
+      battery: { watts: 200, color: 'green', direction: 'charge', dischargeLimit: 25 }, soc: 70, vbat: 315.0, batTemp: 26,
+      inverter: { color: 'green', label: 'Normal (On-Grid)' }, tempAir: 30, temp: 36, bus: 800,
+      backup: 22, backupI: [0.1, 0.1, 0.1], disconnected: false,
+      grid: { watts: 100, color: 'grey' }, gridV: [230, 230, 230], gridF: [50, 50, 50], meterP: [30, 30, 30],
+      load: 900, loadP: [300, 300, 300],
+    },
+    // Off-grid/fault backup engaged, ramping: reconstructed from the real
+    // 2026-08-20 04:11-06:44 outage found while investigating backup's
+    // jitter (grid_mode='Fault', vgrid=0V confirmed - a genuine grid loss,
+    // not a calculation artifact). During this the inverter stayed in
+    // work_mode 'Normal (Off-Grid)' with no PV and no load, yet
+    // backup_ptotal climbed steadily from ~30W to ~220W+ with backup
+    // current flowing - real backup usage, not noise. Exists to confirm
+    // the off-grid/fault indicator activates regardless of the on-grid
+    // wattage threshold mode.
+    'Off-grid: backup engaged, ramping (real event replay)': {
+      pv: 0, pv1: 0, vpv1: 0, pv2: 0, vpv2: 0,
+      battery: { watts: 0, color: 'grey', direction: 'none', dischargeLimit: 25 }, soc: 45, vbat: 210.0, batTemp: 20,
+      inverter: { color: 'pink', label: 'Normal (Off-Grid)' }, tempAir: 18, temp: 22, bus: 0,
+      backup: 220, backupI: [0.3, 0.3, 0.3], disconnected: true,
+      grid: { watts: 0, color: 'red' }, gridV: [0, 0, 0], gridF: [0, 0, 0], meterP: [0, 0, 0],
+      load: 0, loadP: [0, 0, 0],
+    },
+  };
+
+  var LINE_COLORS = { grey: '#6c757d', green: '#28a745', orange: '#fd7e14', red: '#dc3545', pink: '#e83e8c', yellow: '#ffc107' };
+  // FULL_THICKNESS_WATTS is now the log-scale reference point (same
+  // observed-range reasoning as before: PV up to ~7.5kW, battery charge up
+  // to ~4kW), not a linear cap.
+  var FULL_THICKNESS_WATTS = 6000, MIN_THICKNESS_PX = 2, MAX_THICKNESS_PX = 9;
+
+  // Log-scaled (was linear-with-floor in v3): ratio = log(1+w) / log(1+cap).
+  // At w=6000 this still normalizes to 1 (full thickness), but small flows
+  // now spread out instead of bunching up near MIN_THICKNESS_PX - e.g. a
+  // 13W backup baseline and a 200W battery trickle were nearly
+  // indistinguishable under the old linear scale (both close to the 2px
+  // floor); log-scale visibly separates them.
+  function arrowThickness(watts) {
+    var w = Math.abs(watts);
+    if (w === 0) return 0;
+    var ratio = Math.min(Math.log1p(w) / Math.log1p(FULL_THICKNESS_WATTS), 1);
+    return MIN_THICKNESS_PX + ratio * (MAX_THICKNESS_PX - MIN_THICKNESS_PX);
+  }
+
+  function fmtW(w) { return Math.round(w) + ' W'; }
+  function byId(id) { return document.getElementById(id); }
+
+  function setNodeColor(nodeId, colorName) {
+    var el = byId(nodeId);
+    el.className = el.className.replace(/\bdiagram-node--\w+\b/g, '').trim();
+    el.classList.add('diagram-node--' + colorName);
+  }
+
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS(SVG_NS, tag);
+    Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+    return el;
+  }
+
+  function diagramRect() { return document.querySelector('.diagram').getBoundingClientRect(); }
+  function centerX(el) { var c = diagramRect(), r = el.getBoundingClientRect(); return (r.left + r.right) / 2 - c.left; }
+  function centerY(el) { var c = diagramRect(), r = el.getBoundingClientRect(); return (r.top + r.bottom) / 2 - c.top; }
+  function edgeY(el, which) { var c = diagramRect(), r = el.getBoundingClientRect(); return (which === 'top' ? r.top : r.bottom) - c.top; }
+  function edgeX(el, which) { var c = diagramRect(), r = el.getBoundingClientRect(); return (which === 'left' ? r.left : r.right) - c.left; }
+
+  // Changed from v3: pv/battery/backup/bus used to stop at the inverter
+  // box's border (x2/y2 = edgeX/edgeY(inverter, ...)). They now extend all
+  // the way to the inverter's own center point, so the four lines
+  // literally cross inside the box - see the translucent-toggle CSS class
+  // for the "merge visibly inside" option vs. leaving the box opaque for
+  // "passes behind it".
+  function computeEdges() {
+    var pv = byId('node-pv'), battery = byId('node-battery'), inverter = byId('node-inverter'),
+        junction = byId('node-junction'), backup = byId('node-backup'), grid = byId('node-grid'), load = byId('node-load');
+    var invX = centerX(inverter), invY = centerY(inverter);
+    return {
+      pv: { x1: invX, y1: edgeY(pv, 'bottom'), x2: invX, y2: invY },
+      battery: { x1: edgeX(battery, 'right'), y1: invY, x2: invX, y2: invY },
+      backup: { x1: invX, y1: invY, x2: centerX(backup), y2: edgeY(backup, 'top') },
+      bus: { x1: invX, y1: invY, x2: edgeX(junction, 'left'), y2: invY },
+      grid: { x1: edgeX(junction, 'right'), y1: invY, x2: edgeX(grid, 'left'), y2: invY },
+      load: { x1: centerX(junction), y1: centerY(junction), x2: centerX(junction), y2: edgeY(load, 'top') },
+    };
+  }
+
+  function moveAlong(x, y, dir, amount) {
+    switch (dir) {
+      case 'right': return [x + amount, y];
+      case 'left': return [x - amount, y];
+      case 'down': return [x, y + amount];
+      case 'up': return [x, y - amount];
+    }
+  }
+
+  function arrowheadPolygonPoints(tipX, tipY, dir, size) {
+    var half = size * 0.6;
+    var back = moveAlong(tipX, tipY, dir, -size);
+    if (dir === 'right' || dir === 'left') return [[back[0], back[1] - half], [tipX, tipY], [back[0], back[1] + half]];
+    return [[back[0] - half, back[1]], [tipX, tipY], [back[0] + half, back[1]]];
+  }
+
+  function drawEdge(svg, geo, colorName, thicknessPx, reversed, opacity, directionKnown) {
+    var hasFlow = thicknessPx > 0;
+    var color = LINE_COLORS[colorName] || LINE_COLORS.grey;
+    var strokeWidth = hasFlow ? thicknessPx : 1;
+    var horizontal = geo.y1 === geo.y2;
+    var hasDirection = hasFlow && directionKnown !== false;
+    var arrowAtStart = hasDirection && reversed;
+    var arrowAtEnd = hasDirection && !reversed;
+    var alpha = opacity === undefined ? 1 : opacity;
+
+    var size = Math.max(8, 6 + strokeWidth * 2.2);
+    var endDir = horizontal ? (geo.x2 > geo.x1 ? 'right' : 'left') : (geo.y2 > geo.y1 ? 'down' : 'up');
+    var startDir = horizontal ? (endDir === 'right' ? 'left' : 'right') : (endDir === 'down' ? 'up' : 'down');
+
+    var endTip = [geo.x2, geo.y2];
+    var startTip = [geo.x1, geo.y1];
+    var lineEnd = arrowAtEnd ? moveAlong(endTip[0], endTip[1], endDir, -size) : [geo.x2, geo.y2];
+    var lineStart = arrowAtStart ? moveAlong(startTip[0], startTip[1], startDir, -size) : [geo.x1, geo.y1];
+
+    svg.appendChild(svgEl('line', {
+      x1: lineStart[0], y1: lineStart[1], x2: lineEnd[0], y2: lineEnd[1],
+      stroke: color, 'stroke-width': strokeWidth, 'stroke-linecap': 'round', opacity: alpha,
+    }));
+
+    if (!hasFlow) return;
+    if (arrowAtEnd) {
+      svg.appendChild(svgEl('polygon', { points: arrowheadPolygonPoints(endTip[0], endTip[1], endDir, size).map(function (p) { return p.join(','); }).join(' '), fill: color, opacity: alpha }));
+    }
+    if (arrowAtStart) {
+      svg.appendChild(svgEl('polygon', { points: arrowheadPolygonPoints(startTip[0], startTip[1], startDir, size).map(function (p) { return p.join(','); }).join(' '), fill: color, opacity: alpha }));
+    }
+  }
+
+  function drawCross(svg, geo) {
+    var midX = (geo.x1 + geo.x2) / 2, midY = (geo.y1 + geo.y2) / 2, r = 6;
+    var color = LINE_COLORS.red;
+    [[-r, -r, r, r], [-r, r, r, -r]].forEach(function (d) {
+      svg.appendChild(svgEl('line', {
+        x1: midX + d[0], y1: midY + d[1], x2: midX + d[2], y2: midY + d[3],
+        stroke: color, 'stroke-width': 2, 'stroke-linecap': 'round',
+      }));
+    });
+  }
+
+  // Two-signal backup "in use" logic (see the viewport-note above the
+  // controls): off-grid/fault is authoritative and bypasses wattage
+  // entirely; the wattage threshold (adaptive/constant/disabled) only
+  // applies while grid-connected, to separate idle CT-crosstalk noise
+  // from genuine continuous backup load.
+  function backupActive(s) {
+    if (s.disconnected) return true;
+    var mode = document.querySelector('input[name="threshold-mode"]:checked').value;
+    if (mode === 'disabled') return s.backup > 0;
+    if (mode === 'constant') return s.backup > (Number(byId('backup-threshold').value) || 0);
+    // adaptive: baseline + slope*inv_output + margin, fit against 21 days
+    // of real idle-only (fault-excluded) production data - see the note.
+    var intercept = Number(byId('adaptive-intercept').value) || 0;
+    var slope = Number(byId('adaptive-slope').value) || 0;
+    var margin = Number(byId('adaptive-margin').value) || 0;
+    var threshold = intercept + slope * (s.bus || 0) + margin;
+    return s.backup > threshold;
+  }
+
+  var lastScenario = null;
+  function render(s) {
+    lastScenario = s;
+
+    byId('pv-watts').textContent = fmtW(s.pv);
+    byId('pv-string1').textContent = fmtW(s.pv1) + ', ' + s.vpv1.toFixed(1) + ' V';
+    byId('pv-string2').textContent = fmtW(s.pv2) + ', ' + s.vpv2.toFixed(1) + ' V';
+    setNodeColor('node-pv', s.pv > 0 ? 'green' : 'grey');
+
+    byId('battery-soc').textContent = s.soc + ' %';
+    byId('battery-watts').textContent = fmtW(s.battery.watts);
+    byId('battery-voltage').textContent = s.vbat.toFixed(1);
+    byId('battery-temp').textContent = s.batTemp;
+    byId('battery-discharge-limit').textContent = s.battery.dischargeLimit;
+    // Corrected rule: red when the discharge-current limit itself is 0A
+    // (reserve floor hit), not soc <= dischargeLimit (unit mismatch - see
+    // file header). No-battery is excluded, same as before: soc/limit are
+    // meaningless with no battery installed.
+    var batColor = s.battery.color;
+    if (!s.battery.noBattery && s.battery.dischargeLimit === 0) batColor = 'red';
+    setNodeColor('node-battery', batColor);
+    byId('battery-fill').style.height = s.soc + '%';
+    byId('node-battery').style.opacity = s.battery.noBattery ? 0.5 : 1;
+
+    byId('inverter-status').textContent = s.inverter.label;
+    byId('inverter-status-line-text').textContent = s.inverter.label;
+    byId('inverter-status-line-text').className = '';
+    byId('inverter-status-line-text').style.color = LINE_COLORS[s.inverter.color] || '';
+    setNodeColor('node-inverter', s.inverter.color);
+    byId('inverter-temp-air').textContent = s.tempAir;
+    byId('inverter-temp').textContent = s.temp;
+
+    // Off-grid/fault is authoritative (bypasses wattage); otherwise the
+    // selected on-grid threshold mode decides - see backupActive() and the
+    // viewport-notes under the controls bar.
+    var isBackupActive = backupActive(s);
+    byId('backup-watts').textContent = fmtW(s.backup);
+    setNodeColor('node-backup', isBackupActive ? 'orange' : 'grey');
+    ['backup-i1', 'backup-i2', 'backup-i3'].forEach(function (id, i) {
+      byId(id).textContent = s.backupI[i].toFixed(1);
+      byId(id.replace('backup-i', 'backup-line')).classList.toggle('diagram-alert', s.backupI[i] >= 13.5);
+    });
+
+    byId('grid-watts').textContent = fmtW(s.grid.watts);
+    setNodeColor('node-grid', s.grid.color);
+    byId('grid-meter').textContent = s.meterP.map(function (v) { return Math.round(v); }).join(' / ') + ' W';
+    byId('grid-voltages').textContent = s.gridV.map(function (v) { return v.toFixed(1); }).join(' / ') + ' V';
+    byId('grid-freqs').textContent = s.gridF.map(function (v) { return v.toFixed(2); }).join(' / ') + ' Hz';
+
+    byId('load-watts').textContent = fmtW(s.load);
+    setNodeColor('node-load', s.load > 0 ? 'orange' : 'grey');
+    byId('load-p1').textContent = fmtW(s.loadP[0]);
+    byId('load-p2').textContent = fmtW(s.loadP[1]);
+    byId('load-p3').textContent = fmtW(s.loadP[2]);
+
+    redrawLines(s);
+  }
+
+  function redrawLines(s) {
+    var svg = byId('diagram-svg');
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var edges = computeEdges();
+    var isBackupActive = backupActive(s);
+
+    drawEdge(svg, edges.pv, s.pv > 0 ? 'green' : 'grey', arrowThickness(s.pv), false);
+    if (!s.battery.noBattery) {
+      drawEdge(svg, edges.battery, s.battery.color, arrowThickness(s.battery.watts), s.battery.direction === 'charge', 1, s.battery.direction !== 'none');
+    }
+    drawEdge(svg, edges.backup, isBackupActive ? 'orange' : 'grey', arrowThickness(s.backup), false);
+    drawEdge(svg, edges.bus, s.disconnected ? 'red' : 'grey', s.disconnected ? 0 : arrowThickness(s.load), false, s.disconnected ? 0.5 : 1);
+    drawEdge(svg, edges.grid, s.grid.color, arrowThickness(s.grid.watts), s.grid.color === 'orange', 1, s.grid.color !== 'red');
+    drawEdge(svg, edges.load, s.load > 0 ? 'orange' : 'grey', arrowThickness(s.load), false);
+    if (s.disconnected) drawCross(svg, edges.bus);
+  }
+
+  document.querySelectorAll('[data-toggle-details]').forEach(function (trigger) {
+    trigger.addEventListener('click', function () {
+      var key = trigger.getAttribute('data-toggle-details');
+      byId(key + '-details').classList.toggle('diagram-details--open');
+      if (lastScenario) redrawLines(lastScenario);
+    });
+  });
+
+  byId('translucent-toggle').addEventListener('change', function () {
+    byId('node-inverter').classList.toggle('diagram-node--translucent', this.checked);
+  });
+
+  // Shows only the controls/note relevant to the selected threshold mode,
+  // and re-renders so switching modes updates the diagram immediately.
+  function onThresholdModeChange() {
+    var mode = document.querySelector('input[name="threshold-mode"]:checked').value;
+    byId('threshold-adaptive-controls').style.display = mode === 'adaptive' ? '' : 'none';
+    byId('threshold-adaptive-note').style.display = mode === 'adaptive' ? '' : 'none';
+    byId('threshold-constant-controls').style.display = mode === 'constant' ? '' : 'none';
+    byId('threshold-constant-note').style.display = mode === 'constant' ? '' : 'none';
+    byId('threshold-disabled-note').style.display = mode === 'disabled' ? '' : 'none';
+    if (lastScenario) render(lastScenario);
+  }
+  document.querySelectorAll('input[name="threshold-mode"]').forEach(function (radio) {
+    radio.addEventListener('change', onThresholdModeChange);
+  });
+  ['backup-threshold', 'adaptive-intercept', 'adaptive-slope', 'adaptive-margin'].forEach(function (id) {
+    byId(id).addEventListener('input', function () { if (lastScenario) render(lastScenario); });
+  });
+
+  // --- Generic value editor -------------------------------------------
+  // Walks the current scenario object (deep-cloned so switching scenarios
+  // doesn't mutate SCENARIOS itself) and builds one labeled input per leaf
+  // number/string/boolean, plus one input per array element. data-path
+  // uses dot/bracket notation (e.g. "battery.dischargeLimit", "loadP[0]")
+  // resolved back onto the working copy on every edit, then re-rendered -
+  // avoids hand-writing ~35 fields per scenario by hand.
+  function buildEditor(scenario) {
+    var grid = byId('editor-grid');
+    grid.innerHTML = '';
+    function walk(obj, path) {
+      Object.keys(obj).forEach(function (key) {
+        var value = obj[key];
+        var fieldPath = path ? path + '.' + key : key;
+        if (Array.isArray(value)) {
+          value.forEach(function (v, i) { addField(fieldPath + '[' + i + ']', v); });
+        } else if (value !== null && typeof value === 'object') {
+          walk(value, fieldPath);
+        } else {
+          addField(fieldPath, value);
+        }
+      });
+    }
+    function addField(path, value) {
+      var wrap = document.createElement('div');
+      wrap.className = 'editor-field';
+      var label = document.createElement('label');
+      label.textContent = path;
+      label.setAttribute('for', 'field-' + path);
+      var input = document.createElement('input');
+      input.id = 'field-' + path;
+      input.dataset.path = path;
+      if (typeof value === 'boolean') {
+        input.type = 'checkbox';
+        input.checked = value;
+      } else if (typeof value === 'number') {
+        input.type = 'number';
+        input.step = 'any';
+        input.value = value;
+      } else {
+        input.type = 'text';
+        input.value = value;
+      }
+      input.addEventListener('input', function () { applyEdit(path, input); });
+      wrap.appendChild(label);
+      wrap.appendChild(input);
+      grid.appendChild(wrap);
+    }
+    walk(scenario, '');
+  }
+
+  // Resolves a "battery.dischargeLimit" / "loadP[0]" path onto
+  // lastScenario and sets it from the input's current value, coercing to
+  // the same type the field started as.
+  function applyEdit(path, input) {
+    var parts = path.replace(/\[(\d+)\]/g, '.$1').split('.');
+    var target = lastScenario;
+    for (var i = 0; i < parts.length - 1; i++) target = target[parts[i]];
+    var last = parts[parts.length - 1];
+    if (input.type === 'checkbox') target[last] = input.checked;
+    else if (input.type === 'number') target[last] = Number(input.value);
+    else target[last] = input.value;
+    render(lastScenario);
+  }
+
+  function cloneScenario(name) { return JSON.parse(JSON.stringify(SCENARIOS[name])); }
+
+  var bar = byId('scenario-bar');
+  Object.keys(SCENARIOS).forEach(function (name) {
+    var btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-outline-primary';
+    btn.textContent = name;
+    btn.addEventListener('click', function () {
+      var s = cloneScenario(name);
+      render(s);
+      buildEditor(s);
+    });
+    bar.appendChild(btn);
+  });
+
+  document.fonts.ready.then(function () {
+    var firstName = Object.keys(SCENARIOS)[0];
+    var s = cloneScenario(firstName);
+    render(s);
+    buildEditor(s);
+    setTimeout(function () { if (lastScenario) redrawLines(lastScenario); }, 150);
+  });
+
+  window.addEventListener('resize', function () { if (lastScenario) redrawLines(lastScenario); });
+</script>
+</body>
+</html>

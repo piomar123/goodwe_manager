@@ -5,34 +5,29 @@
    build step - matches this project's existing convention of loading
    everything via <link>/<script> tags. */
 
+/* Junction sits in its own row directly below Inverter, between it and
+   Load, with all four of its sides used by exactly one flow: top=
+   Inverter(bus in), left=Backup(grid-bypass), right=Grid, bottom=Load.
+   Backup shares Junction's row (immediately left of it), so the
+   grid-bypass edge is a plain straight line - only the inverter-fed case
+   (Inverter and Backup aren't adjacent) still bends (see
+   diagram-render.js's backupIslanding edge). Ported from the v5 mockup's
+   settled layout (docs/superpowers/mockups/live-power-flow-dashboard-
+   mockup-v5.html) - the earlier layout (Junction beside Inverter, Backup+
+   Load crammed into one flex row below) is what made every arrow near
+   Backup/Junction visually cramped and overlapping. */
 .diagram {
   position: relative;
   display: grid;
-  /* Inverter gets the most width (it has the longest status text, e.g.
-     "Normal (Off-Grid)"); Junction gets barely any (it's just a dot).
-     Backup/Load are a flex pair (see .bottom-row) spanning the merged
-     Inverter+Junction column space instead of individually inheriting
-     those columns' widths - neither needs Inverter's extra width or
-     Junction's narrowness, both have short content ("14 W", "1017 W").
-     This is safe even though the pair's centering can shift slightly
-     with content width, because the connecting lines are computed from
-     each box's own rendered position (see diagram-render.js), not from
-     column/flex alignment. */
-  grid-template-columns: minmax(90px, 1fr) minmax(130px, 1.4fr) minmax(24px, 0.35fr) minmax(90px, 1fr);
+  grid-template-columns: minmax(90px, 1fr) minmax(90px, 1fr) minmax(90px, 1fr);
   grid-template-areas:
-    ".        pv         .          ."
-    "battery  inverter   junction   grid"
-    ".        bottomrow  bottomrow  .";
+    ".        pv         ."
+    "battery  inverter   ."
+    "backup   junction   grid"
+    ".        load       .";
   gap: 56px 32px;
   max-width: 620px;
   margin: 24px auto;
-}
-
-.bottom-row {
-  grid-area: bottomrow;
-  display: flex;
-  justify-content: center;
-  gap: 32px;
 }
 
 .diagram-svg {
@@ -62,9 +57,44 @@
 
 #node-pv { grid-area: pv; }
 #node-battery { grid-area: battery; }
-#node-inverter { grid-area: inverter; }
+/* Shrunk to a small icon-only square, decoupled from its grid cell's width
+   (justify-self: center lets it sit smaller than the column) - status
+   text moved out to .inverter-status-line below the diagram, so this box
+   doesn't need the same footprint as the other nodes any more. */
+#node-inverter {
+  grid-area: inverter;
+  justify-self: center;
+  /* align-self: stretch is CSS Grid's default, but this box has an
+     explicit aspect-ratio, so the browser can't actually stretch it to
+     the row's full height - it falls back to top-aligning instead,
+     leaving the box (and everything diagram-render.js anchors to its
+     center) sitting well above the row's true vertical center, where
+     Battery still stretches to align. align-self: center restores a
+     shared centerY across the row that the battery/bus edges assume. */
+  align-self: center;
+  width: 46px;
+  aspect-ratio: 1;
+  padding: 4px;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+#node-inverter .diagram-icon { font-size: 1.15rem; }
+/* Grown back toward its pre-shrink footprint while its details are open -
+   a 46px square can't hold the status/temperature lines without severe
+   wrapping. :has() targets the inner details div's open state, so this
+   needs no new JS - the existing toggle handler already adds/removes
+   diagram-details--open and calls redrawLines(). */
+#node-inverter:has(.diagram-details--open) {
+  width: auto;
+  min-width: 90px;
+  aspect-ratio: auto;
+}
 #node-grid { grid-area: grid; }
-#node-backup, #node-load { flex: 1 1 0; min-width: 90px; max-width: 160px; }
+#node-backup { grid-area: backup; }
+#node-load { grid-area: load; }
 
 #node-junction {
   grid-area: junction;
@@ -141,11 +171,14 @@
 .diagram-details--open { display: block; }
 .diagram-alert { color: #dc3545 !important; font-weight: bold; }
 
+/* Status text pulled out of the (now icon-only) Inverter box - see
+   #node-inverter above. */
+.inverter-status-line { max-width: 620px; margin: 0 auto 24px; text-align: center; font-size: 1rem; font-weight: 600; }
+
 @media (max-width: 400px) {
   .diagram {
-    grid-template-columns: minmax(64px, 1fr) minmax(100px, 1.4fr) minmax(18px, 0.3fr) minmax(64px, 1fr);
+    grid-template-columns: minmax(64px, 1fr) minmax(64px, 1fr) minmax(64px, 1fr);
     gap: 44px 16px;
     font-size: 0.7rem;
   }
-  .bottom-row { gap: 16px; }
 }

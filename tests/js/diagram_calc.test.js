@@ -2,7 +2,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   toNumber, arrowThickness, pvState, inverterBusState, batteryState,
-  inverterState, gridState, loadState, backupState, BACKUP_CURRENT_ALERT_THRESHOLD_A,
+  inverterState, gridState, loadState, backupState, backupSource,
+  setBackupActiveThreshold, BACKUP_CURRENT_ALERT_THRESHOLD_A,
 } = require('../../static/js/diagram-calc.js');
 
 test('toNumber parses numeric strings', () => {
@@ -24,12 +25,12 @@ test('arrowThickness returns 0 for exactly 0W', () => {
 });
 
 test('arrowThickness never goes below the minimum floor for nonzero power', () => {
-  assert.ok(arrowThickness(1) >= 2);
-  assert.ok(arrowThickness(30) >= 2);
+  assert.ok(arrowThickness(1) >= 1);
+  assert.ok(arrowThickness(30) >= 1);
 });
 
 test('arrowThickness caps at the maximum for very large power', () => {
-  assert.equal(arrowThickness(50000), 9);
+  assert.equal(arrowThickness(50000), 12);
 });
 
 test('arrowThickness scales roughly linearly between the floor and cap', () => {
@@ -58,16 +59,17 @@ test('inverterBusState is inactive when the sum is 0', () => {
 
 test('batteryState: Charge mode is green, direction charge, magnitude from abs(pbattery1)', () => {
   const result = batteryState({ pbattery1: '-364', battery_mode: '3', battery_soc: '52', battery_discharge_limit: '10' });
-  assert.deepEqual(result, { watts: 364, direction: 'charge', color: 'green', noBattery: false });
+  assert.deepEqual(result, { watts: 364, direction: 'charge', color: 'green', flowColor: 'green', noBattery: false });
 });
 
-test('batteryState: Discharge mode is orange, direction discharge, sign of pbattery1 ignored', () => {
+test('batteryState: Discharge mode is yellow (not orange - orange means grid-import elsewhere), direction discharge, sign of pbattery1 ignored', () => {
   // Both a "Charge" and "Discharge" sample can carry a negative pbattery1
   // (verified against production data - see spec) - direction/color must
   // come purely from battery_mode, never the raw sign.
   const result = batteryState({ pbattery1: '-33', battery_mode: '2', battery_soc: '50', battery_discharge_limit: '10' });
   assert.equal(result.direction, 'discharge');
-  assert.equal(result.color, 'orange');
+  assert.equal(result.color, 'yellow');
+  assert.equal(result.flowColor, 'yellow');
   assert.equal(result.watts, 33);
 });
 
@@ -78,7 +80,7 @@ test('batteryState: To be charged / to be discharged map to charge/discharge', (
 
 test('batteryState: Standby is grey with no direction, even with real nonzero wattage', () => {
   const standby = batteryState({ pbattery1: '-30', battery_mode: '1', battery_soc: '100', battery_discharge_limit: '10' });
-  assert.deepEqual(standby, { watts: 30, direction: 'none', color: 'grey', noBattery: false });
+  assert.deepEqual(standby, { watts: 30, direction: 'none', color: 'grey', flowColor: 'grey', noBattery: false });
 });
 
 test('batteryState: No battery is grey/none and flags noBattery', () => {
@@ -88,10 +90,22 @@ test('batteryState: No battery is grey/none and flags noBattery', () => {
   assert.equal(result.noBattery, true);
 });
 
-test('batteryState: red overrides charge/discharge color at/below the SoC floor', () => {
-  const result = batteryState({ pbattery1: '50', battery_mode: '2', battery_soc: '10', battery_discharge_limit: '10' });
+test('batteryState: red (status only) overrides discharge color when battery_discharge_limit is 0A (reserve floor hit)', () => {
+  // battery_discharge_limit is amperes, not a SoC % - comparing it against
+  // battery_soc was a units-mismatch bug (see
+  // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md).
+  // The reserve floor is hit when dischargeLimit itself reads 0A.
+  const result = batteryState({ pbattery1: '50', battery_mode: '2', battery_soc: '10', battery_discharge_limit: '0' });
   assert.equal(result.color, 'red');
+  assert.equal(result.flowColor, 'yellow');
   assert.equal(result.direction, 'discharge');
+});
+
+test('batteryState: a low but nonzero discharge_limit does not falsely trip red', () => {
+  // Old buggy check (`soc <= dischargeLimit`) would have tripped here
+  // (11 <= 25) despite the reserve floor not being hit at all.
+  const result = batteryState({ pbattery1: '50', battery_mode: '2', battery_soc: '11', battery_discharge_limit: '25' });
+  assert.equal(result.color, 'yellow');
 });
 
 test('inverterState maps each work_mode code to its color, keeps the label as-is', () => {
@@ -159,4 +173,21 @@ test('backupState flags a phase red at/above the 13.5A threshold', () => {
 
 test('backupState is inactive at 0W', () => {
   assert.equal(backupState({ backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0' }).active, false);
+});
+
+test('backupState treats output at/below the active threshold (default 35W) as noise, not real usage', () => {
+  assert.equal(backupState({ backup_ptotal: '22', backup_i1: '0', backup_i2: '0', backup_i3: '0' }).active, false);
+  assert.equal(backupState({ backup_ptotal: '36', backup_i1: '0', backup_i2: '0', backup_i3: '0' }).active, true);
+});
+
+test('setBackupActiveThreshold overrides the default threshold', () => {
+  setBackupActiveThreshold(100);
+  assert.equal(backupState({ backup_ptotal: '50', backup_i1: '0', backup_i2: '0', backup_i3: '0' }).active, false);
+  setBackupActiveThreshold(35); // restore default for any other test relying on it
+});
+
+test('backupSource: grid-bypass (junction) when grid_mode is Connected, inverter-fed otherwise', () => {
+  assert.equal(backupSource({ grid_mode: '1' }), 'junction');
+  assert.equal(backupSource({ grid_mode: '0' }), 'inverter');
+  assert.equal(backupSource({ grid_mode: '2' }), 'inverter');
 });

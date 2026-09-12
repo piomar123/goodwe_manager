@@ -180,7 +180,7 @@ grid_mode:       0 Not connected to grid | 1 Connected to grid | 2 Fault
 
 ## Idle-battery investigation (background finding)
 
-Checked production `data.db` on `raspberry4.local` (not the small local dev
+Checked production `data.db` on the production Pi (not the small local dev
 copy, which had no idle/full-battery samples). At `battery_soc = 100%`,
 `ppv = 0`: `pbattery1` reads -31 to -33 W, and `ibattery1` is a genuine
 nonzero -0.1 A at ~201 V — a real current draw, not a rounding/display
@@ -197,7 +197,7 @@ not a "discharge" arrow specifically.)
 ## Verified data mappings (resolved against production `data.db`)
 
 Two sign/field-meaning questions were resolved by pulling real samples from
-`raspberry4.local`'s production `data.db` rather than assumed:
+the production Pi's `data.db` rather than assumed:
 
 - **`pbattery1`'s sign is reliable at real power levels, but noisy near
   zero — use `battery_mode` for direction anyway, to avoid flicker.**
