@@ -1,10 +1,9 @@
-// Pure calculation functions for the live power-flow diagram (see
-// docs/superpowers/specs/2026-09-03-live-power-flow-dashboard-design.md
-// and its accompanying mockups under docs/superpowers/mockups/). No DOM
-// access here on purpose - this file is loaded both in the browser (as a
-// plain <script>, exposing window.DiagramCalc) and under Node for
-// `node --test tests/js`, so it stays testable without adding any build
-// tooling or npm dependency to the project.
+// Pure calculation functions for the live power-flow diagram (see the
+// mockups under docs/superpowers/mockups/ for the visual design this was
+// ported from). No DOM access here on purpose - this file is loaded both
+// in the browser (as a plain <script>, exposing window.DiagramCalc) and
+// under Node for `node --test tests/js`, so it stays testable without
+// adding any build tooling or npm dependency to the project.
 (function (root) {
   'use strict';
 
@@ -59,14 +58,20 @@
     return { watts: watts, active: watts > 0 };
   }
 
+  // Not used by the production render any more - diagram-render.js derives
+  // the Inverter<->Junction bus edge via Kirchhoff's law instead (bus =
+  // load - meterSigned), since pgrid/pgrid2/pgrid3 read near-zero during
+  // both off-grid islanding and grid-bypass. Kept for the mockup, which
+  // still uses it standalone; its still-passing tests only cover this
+  // function in isolation, not whether the shipped diagram is correct.
   function inverterBusState(data) {
     var watts = toNumber(data.pgrid) + toNumber(data.pgrid2) + toNumber(data.pgrid3);
     return { watts: watts, active: watts > 0 };
   }
 
   // Direction/color come from the numeric battery_mode, never from the
-  // sign of pbattery1 - verified unreliable against production data (see
-  // spec). Standby/No-battery get direction 'none': Standby's ~-30W idle
+  // sign of pbattery1 - verified unreliable against production data.
+  // Standby/No-battery get direction 'none': Standby's ~-30W idle
   // trickle is real (BMS self-consumption), but has no defined direction,
   // and there's no trustworthy way to know which way it's flowing -
   // diagram-render.js renders 'none' as an undirected line, not a
