@@ -132,18 +132,26 @@
     var watts = Math.abs(toNumber(data.meter_active_power_total));
     var inOut = toNumber(data.grid_in_out);
     var mode = toNumber(data.grid_mode);
-    var color = 'grey';
-    if (inOut === GRID_IN_OUT.EXPORTING) color = 'green';
-    else if (inOut === GRID_IN_OUT.IMPORTING) color = 'orange';
-    var crossed = false;
-    if (mode === GRID_MODE.FAULT) {
-      color = 'red';
-      crossed = true;
-    } else if (mode === GRID_MODE.NOT_CONNECTED) {
-      color = 'grey';
-      crossed = true;
-    }
-    return { watts: watts, color: color, crossed: crossed, directionKnown: mode !== GRID_MODE.FAULT };
+    var crossed = mode === GRID_MODE.FAULT || mode === GRID_MODE.NOT_CONNECTED;
+    // importing/exporting are the semantic source of truth other code
+    // should read (calc.gridState(data).importing, not
+    // calc.gridState(data).color === 'orange') - direction is only
+    // meaningful while the grid is actually connected and not faulted:
+    // grid_in_out can still read Importing/Exporting during a Fault
+    // (verified against production data), and is meaningless while
+    // disconnected, so both crossed cases force both flags false rather
+    // than trusting the raw code.
+    var importing = !crossed && inOut === GRID_IN_OUT.IMPORTING;
+    var exporting = !crossed && inOut === GRID_IN_OUT.EXPORTING;
+    var color = mode === GRID_MODE.FAULT ? 'red' : importing ? 'orange' : exporting ? 'green' : 'grey';
+    return {
+      watts: watts,
+      color: color,
+      crossed: crossed,
+      importing: importing,
+      exporting: exporting,
+      directionKnown: mode !== GRID_MODE.FAULT,
+    };
   }
 
   function loadState(data) {
@@ -190,7 +198,7 @@
     var load = loadState(data);
     var backup = backupState(data);
     var backupBypassW = backupSource(data) === 'junction' ? backup.watts : 0;
-    var meterSigned = grid.color === 'orange' ? grid.watts : -grid.watts;
+    var meterSigned = grid.importing ? grid.watts : -grid.watts;
     return { netBus: load.watts + backupBypassW - meterSigned, backupBypassW: backupBypassW };
   }
 

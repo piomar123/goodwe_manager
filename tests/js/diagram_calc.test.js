@@ -127,17 +127,17 @@ test('inverterState falls back to grey for an unrecognized code', () => {
 
 test('gridState: Exporting is green, magnitude from abs(meter_active_power_total)', () => {
   const result = gridState({ meter_active_power_total: '-500', grid_in_out: '1', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 500, color: 'green', crossed: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 500, color: 'green', crossed: false, importing: false, exporting: true, directionKnown: true });
 });
 
 test('gridState: Importing is orange', () => {
   const result = gridState({ meter_active_power_total: '385', grid_in_out: '2', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 385, color: 'orange', crossed: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 385, color: 'orange', crossed: false, importing: true, exporting: false, directionKnown: true });
 });
 
 test('gridState: Idle is grey', () => {
   const result = gridState({ meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: false, importing: false, exporting: false, directionKnown: true });
 });
 
 test('gridState: Fault forces red and crossed, and direction becomes unknown', () => {
@@ -145,13 +145,15 @@ test('gridState: Fault forces red and crossed, and direction becomes unknown', (
   // correctly override to red, and directionKnown must go false too
   // (this was the bug: defaulting to the "export" arrow whenever color
   // wasn't 'orange', which silently asserted export during a fault).
+  // importing/exporting must both go false too - a Fault makes direction
+  // itself unreliable, not just the color.
   const result = gridState({ meter_active_power_total: '200', grid_in_out: '2', grid_mode: '2' });
-  assert.deepEqual(result, { watts: 200, color: 'red', crossed: true, directionKnown: false });
+  assert.deepEqual(result, { watts: 200, color: 'red', crossed: true, importing: false, exporting: false, directionKnown: false });
 });
 
 test('gridState: Not connected forces grey and crossed, direction stays known', () => {
   const result = gridState({ meter_active_power_total: '0', grid_in_out: '1', grid_mode: '0' });
-  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: true, directionKnown: true });
+  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: true, importing: false, exporting: false, directionKnown: true });
 });
 
 test('loadState reports total load watts', () => {

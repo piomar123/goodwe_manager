@@ -24,13 +24,28 @@
     el.classList.add('diagram-node--' + colorName);
   }
 
-  // Shared by render() (node color) and redrawLines() (arrow color) so
-  // Backup's own arrow can never drift from the node it feeds - the arrow
-  // used to be colored by a separately re-derived orange/grey-only
-  // expression that never accounted for the phase-overload case, so the
-  // node could show red while its arrow still read plain orange.
+  // Node status color - a real phase overload always turns the Backup
+  // node red as an alert flag. The arrow itself deliberately never uses
+  // this: it represents the physical source mix (which sources are
+  // feeding it, not whether it's in alarm), so it always falls through to
+  // backupArrowFallbackColor below instead. (An earlier version unified
+  // the two so the arrow also read red on overload - reverted, since a
+  // solid-red arrow reads as "nothing is flowing," the opposite of what's
+  // actually happening during a real overload.)
   function backupNodeColor(backup, isBackupActive) {
     return backup.phaseAlerts.some(Boolean) ? 'red' : (isBackupActive ? 'orange' : 'grey');
+  }
+
+  // Backup arrow's flat fallback color, used only when there's no source
+  // mix to stripe (inactive/idle - see isBackupActive). Never red: unlike
+  // the node, the arrow communicates what's flowing, not alarm status. In
+  // practice a real overload is always `active` (its wattage is far above
+  // the noise threshold), so drawManhattanEdge draws the striped mix in
+  // place of this fallback entirely as soon as that's true - this
+  // function only matters for the rare/nonsensical active=false-yet-
+  // alerting case, but it's still the right color to fall back to.
+  function backupArrowFallbackColor(isBackupActive) {
+    return isBackupActive ? 'orange' : 'grey';
   }
 
   // --- Hand-drawn SVG connections ------------------------------------
@@ -390,7 +405,7 @@
     // their own source mixes) - none of grid/load/backup depend on
     // anything computed below.
     var grid = calc.gridState(data);
-    var gridImportW = grid.color === 'orange' ? grid.watts : 0;
+    var gridImportW = grid.importing ? grid.watts : 0;
     var load = calc.loadState(data);
     var backup = calc.backupState(data);
     var active = isBackupActive(backup, grid, data);
@@ -440,8 +455,8 @@
     // meter. Safe to always include the grid-import stripe even where a
     // given edge can't actually carry it (islanding: gridImportW is always
     // 0, since grid_mode isn't Connected there; bus/grid-export: also
-    // always 0, since gridImportW is only nonzero when grid.color is
-    // 'orange', mutually exclusive with the 'green' those branches gate
+    // always 0, since gridImportW is only nonzero when grid.importing is
+    // true, mutually exclusive with the grid.exporting those branches gate
     // on) - a zero-watt stripe just contributes zero width.
     var battDischargeW = (!battery.noBattery && battery.direction === 'discharge') ? battery.watts : 0;
     // Two source mixes, not one - they cover physically different edges.
@@ -473,13 +488,13 @@
       // the full source mix, not grid.color (which reads 'grey' whenever
       // the *whole house* nets to ~0, even while Backup itself is
       // genuinely drawing real power from that line). Phase-overload red
-      // still takes priority, same as backupColor/backupNodeColor - a real
-      // overload shouldn't get masked by the source mix. Inactive (idle
-      // noise below the threshold) still reads grey with no stripes, same
-      // as everywhere else `active` gates.
+      // is a node-only status flag (see backupNodeColor) - the arrow keeps
+      // showing the source mix even during a real overload, since that's
+      // still exactly what's flowing. Inactive (idle noise below the
+      // threshold) still reads grey with no stripes, same as everywhere
+      // else `active` gates.
       var eb = edges.backupBypass;
-      var bypassColor = backup.phaseAlerts.some(Boolean) ? 'red' : (active ? 'orange' : 'grey');
-      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, bypassColor, backupThickness, false, true, 1, active ? fullSourceMix : null);
+      drawManhattanEdge(svg, eb.p0, eb.dir0, eb.p1, eb.dir1, backupArrowFallbackColor(active), backupThickness, false, true, 1, active ? fullSourceMix : null);
     } else {
       // Inverter-fed (islanding/fault): Backup is synthesized by the
       // inverter itself, same PV+battery-discharge-only source as the bus
@@ -487,7 +502,7 @@
       // branch when grid_mode isn't Connected, so gridImportW is always 0
       // here anyway, but inverterOutputMix says so directly).
       var ei = edges.backupIslanding;
-      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupColor, backupThickness, false, true, 1, active ? inverterOutputMix : null);
+      drawManhattanEdge(svg, ei.p0, ei.dir0, ei.p1, ei.dir1, backupArrowFallbackColor(active), backupThickness, false, true, 1, active ? inverterOutputMix : null);
     }
 
     // The Inverter<->Junction ("bus") edge used to be approximated as
@@ -521,8 +536,8 @@
     var gridThickness = calc.arrowThickness(grid.watts);
     var eGrid = edges.grid;
     drawManhattanEdge(svg, eGrid.p0, eGrid.dir0, eGrid.p1, eGrid.dir1,
-      grid.color, gridThickness, grid.color === 'orange', grid.directionKnown, 1,
-      grid.color === 'green' ? fullSourceMix : null);
+      grid.color, gridThickness, grid.importing, grid.directionKnown, 1,
+      grid.exporting ? fullSourceMix : null);
 
     // Load is the one sink that can genuinely draw from all three sources
     // at once (battery discharge, PV, grid import), and the stripe order
