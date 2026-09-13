@@ -5,7 +5,8 @@ const {
   inverterState, gridState, loadState, backupState, backupSource,
   setBackupActiveThreshold, BACKUP_CURRENT_ALERT_THRESHOLD_A,
   busFlow, batteryChargeGridWatts, isBackupActive, backupNodeColor,
-  backupArrowFallbackColor, edgeStates,
+  backupArrowFallbackColor, edgeStates, backupIslandingShiftPx,
+  BACKUP_ISLANDING_SHIFT_PX,
 } = require('../../static/js/diagram-calc.js');
 
 test('toNumber parses numeric strings', () => {
@@ -194,6 +195,20 @@ test('backupSource: grid-bypass (junction) when grid_mode is Connected, inverter
   assert.equal(backupSource({ grid_mode: '1' }), 'junction');
   assert.equal(backupSource({ grid_mode: '0' }), 'inverter');
   assert.equal(backupSource({ grid_mode: '2' }), 'inverter');
+});
+
+// The bus edge and the inverter-fed Backup edge both leave Inverter's
+// bottom border - without an offset between them, the islanding edge (which
+// then runs straight down through Junction's position before bending into
+// Backup) draws exactly on top of the bus/backupBypass edges, making an
+// inverter-fed Backup visually indistinguishable from a grid-bypassed one.
+// Real Pi sample confirming this state (2026-09-13 19:57:52, grid_mode
+// Fault/work_mode Off-Grid): load 725W, backup 726W, battery discharging
+// 700W, meter/pgrid all ~0W.
+test('backupIslandingShiftPx: nonzero only while Backup is inverter-fed (islanding)', () => {
+  assert.equal(backupIslandingShiftPx({ grid_mode: '1' }), 0); // grid-bypass
+  assert.equal(backupIslandingShiftPx({ grid_mode: '0' }), BACKUP_ISLANDING_SHIFT_PX); // not connected
+  assert.equal(backupIslandingShiftPx({ grid_mode: '2' }), BACKUP_ISLANDING_SHIFT_PX); // fault
 });
 
 test('busFlow: real Pi sample (2026-09-13 08:08:23) - PV covers the whole battery charge while grid imports for something else', () => {

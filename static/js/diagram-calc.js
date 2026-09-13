@@ -190,6 +190,29 @@
     return toNumber(data.grid_mode) === GRID_MODE.CONNECTED ? 'junction' : 'inverter';
   }
 
+  // The bus edge (Inverter->Junction) and the inverter-fed Backup edge
+  // both leave Inverter's bottom border, and the islanding edge then runs
+  // straight down through Junction's own position before bending into
+  // Backup - without an offset between the two exit points, they draw on
+  // exactly the same pixels, making an inverter-fed Backup visually
+  // indistinguishable from a grid-bypassed one (confirmed against a real
+  // Pi sample, 2026-09-13 19:57:52: grid_mode Fault/work_mode Off-Grid,
+  // load 725W, backup 726W, battery discharging 700W - the diagram drew
+  // Backup's flow as if it came from Junction even though grid_mode
+  // wasn't Connected). Ported from the v5 mockup's BACKUP_ISLANDING_SHIFT
+  // (docs/superpowers/mockups/live-power-flow-dashboard-mockup-v5.html),
+  // which offsets the bus's exit point right and the islanding edge's own
+  // exit point left by this same amount, and shifts Junction/Load right
+  // by it too, so the two lines run alongside each other instead of on
+  // top of each other - see diagram-render.js's computeEdges/redrawLines,
+  // which apply the actual pixel offsets (DOM geometry, not testable
+  // here).
+  var BACKUP_ISLANDING_SHIFT_PX = 10;
+
+  function backupIslandingShiftPx(data) {
+    return backupSource(data) === 'inverter' ? BACKUP_ISLANDING_SHIFT_PX : 0;
+  }
+
   // Kirchhoff's law at the Junction node: whatever the Inverter->Junction
   // ("bus") edge brings in must equal what Junction's other edges take
   // out. Junction has *four* edges, not three, whenever Backup is
@@ -367,6 +390,8 @@
     loadState: loadState,
     backupState: backupState,
     backupSource: backupSource,
+    BACKUP_ISLANDING_SHIFT_PX: BACKUP_ISLANDING_SHIFT_PX,
+    backupIslandingShiftPx: backupIslandingShiftPx,
     busFlow: busFlow,
     batteryChargeGridWatts: batteryChargeGridWatts,
     isBackupActive: isBackupActive,
