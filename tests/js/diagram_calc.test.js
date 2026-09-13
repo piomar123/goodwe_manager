@@ -207,7 +207,7 @@ test('busFlow: real Pi sample (2026-09-13 08:08:23) - PV covers the whole batter
     load_ptotal: '435', backup_ptotal: '9', backup_i1: '0', backup_i2: '0', backup_i3: '0',
   };
   assert.equal(busFlow(data).netBus, 435 + 9 - 73);
-  assert.equal(batteryChargeGridWatts(data), 0);
+  assert.equal(batteryChargeGridWatts(busFlow(data).netBus), 0);
 });
 
 test('busFlow: Junction has four edges, not three - backupBypassW must count toward netBus when Backup is grid-bypass-fed', () => {
@@ -241,7 +241,13 @@ test('batteryChargeGridWatts: genuine grid-charging (netBus negative) is reporte
     load_ptotal: '100', backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0',
   };
   assert.equal(busFlow(data).netBus, -800);
-  assert.equal(batteryChargeGridWatts(data), 800);
+  assert.equal(batteryChargeGridWatts(busFlow(data).netBus), 800);
+});
+
+test('batteryChargeGridWatts: pure function of netBus - 0 when the bus is exporting (netBus >= 0), -netBus when reversed', () => {
+  assert.equal(batteryChargeGridWatts(371), 0);
+  assert.equal(batteryChargeGridWatts(0), 0);
+  assert.equal(batteryChargeGridWatts(-800), 800);
 });
 
 test('WORK_MODE exposes the numeric work_mode codes, matching WORK_MODE_COLORS ordering', () => {

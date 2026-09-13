@@ -426,7 +426,7 @@
         // (verified against real history: PV 2584W covering a 2209W
         // charge with 73W of unrelated grid import happening at the same
         // moment - see the 2026-09-13 orange-sliver-on-battery-arrow bug).
-        var chargeMix = [{ colorName: 'green', watts: pv.watts }, { colorName: 'orange', watts: calc.batteryChargeGridWatts(data) }];
+        var chargeMix = [{ colorName: 'green', watts: pv.watts }, { colorName: 'orange', watts: calc.batteryChargeGridWatts(netBus) }];
         drawManhattanEdge(svg, eBattery.p0, eBattery.dir0, eBattery.p1, eBattery.dir1, battery.flowColor, calc.arrowThickness(battery.watts), true, true, 1, chargeMix);
       } else {
         drawManhattanEdge(svg, eBattery.p0, eBattery.dir0, eBattery.p1, eBattery.dir1, battery.flowColor, calc.arrowThickness(battery.watts), false, battery.direction !== 'none');

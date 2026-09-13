@@ -202,8 +202,12 @@
   // covered a 2209W charge while 73W of unrelated grid import was
   // happening at the same time - crediting that 73W to the charge arrow
   // painted a grid stripe on what was actually a 100%-PV charge.
-  function batteryChargeGridWatts(data) {
-    return Math.max(0, -busFlow(data).netBus);
+  // Takes the already-computed netBus (from busFlow(data).netBus) rather
+  // than data itself, so callers that also need netBus for the bus edge
+  // (diagram-render.js does) don't re-derive gridState/loadState/
+  // backupState a second time for the same immutable data.
+  function batteryChargeGridWatts(netBus) {
+    return Math.max(0, -netBus);
   }
 
   var DiagramCalc = {
