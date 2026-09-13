@@ -128,6 +128,12 @@
   // whenever the state wasn't explicitly 'orange', which is a fabricated
   // direction during a fault, the same class of bug as the battery one
   // above - see the mockup's Junction-Grid arrow fix).
+  //
+  // directionKnown stays true during NOT_CONNECTED (deliberate, since
+  // PR #9) even though crossed/importing/exporting are all forced false
+  // for that state below - confirmed against the full production history
+  // that NOT_CONNECTED has never actually occurred on this install, see
+  // docs/superpowers/notes/2026-09-13-grid-not-connected-investigation.md.
   function gridState(data) {
     var watts = Math.abs(toNumber(data.meter_active_power_total));
     var inOut = toNumber(data.grid_in_out);
