@@ -4,6 +4,8 @@ const {
   toNumber, arrowThickness, pvState, inverterBusState, batteryState,
   inverterState, gridState, loadState, backupState, backupSource,
   setBackupActiveThreshold, BACKUP_CURRENT_ALERT_THRESHOLD_A,
+  busFlow, batteryChargeGridWatts, isBackupActive, backupNodeColor,
+  backupArrowFallbackColor, edgeStates,
 } = require('../../static/js/diagram-calc.js');
 
 test('toNumber parses numeric strings', () => {
@@ -126,17 +128,17 @@ test('inverterState falls back to grey for an unrecognized code', () => {
 
 test('gridState: Exporting is green, magnitude from abs(meter_active_power_total)', () => {
   const result = gridState({ meter_active_power_total: '-500', grid_in_out: '1', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 500, color: 'green', crossed: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 500, color: 'green', crossed: false, importing: false, exporting: true, directionKnown: true });
 });
 
 test('gridState: Importing is orange', () => {
   const result = gridState({ meter_active_power_total: '385', grid_in_out: '2', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 385, color: 'orange', crossed: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 385, color: 'orange', crossed: false, importing: true, exporting: false, directionKnown: true });
 });
 
 test('gridState: Idle is grey', () => {
   const result = gridState({ meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: false, importing: false, exporting: false, directionKnown: true });
 });
 
 test('gridState: Fault forces red and crossed, and direction becomes unknown', () => {
@@ -144,13 +146,15 @@ test('gridState: Fault forces red and crossed, and direction becomes unknown', (
   // correctly override to red, and directionKnown must go false too
   // (this was the bug: defaulting to the "export" arrow whenever color
   // wasn't 'orange', which silently asserted export during a fault).
+  // importing/exporting must both go false too - a Fault makes direction
+  // itself unreliable, not just the color.
   const result = gridState({ meter_active_power_total: '200', grid_in_out: '2', grid_mode: '2' });
-  assert.deepEqual(result, { watts: 200, color: 'red', crossed: true, directionKnown: false });
+  assert.deepEqual(result, { watts: 200, color: 'red', crossed: true, importing: false, exporting: false, directionKnown: false });
 });
 
 test('gridState: Not connected forces grey and crossed, direction stays known', () => {
   const result = gridState({ meter_active_power_total: '0', grid_in_out: '1', grid_mode: '0' });
-  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: true, directionKnown: true });
+  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: true, importing: false, exporting: false, directionKnown: true });
 });
 
 test('loadState reports total load watts', () => {
@@ -192,7 +196,177 @@ test('backupSource: grid-bypass (junction) when grid_mode is Connected, inverter
   assert.equal(backupSource({ grid_mode: '2' }), 'inverter');
 });
 
+test('busFlow: real Pi sample (2026-09-13 08:08:23) - PV covers the whole battery charge while grid imports for something else', () => {
+  // PV 2584W, battery charging 2209W, grid importing 73W, load 435W,
+  // backup 9W (grid-bypass-fed). netBus must be positive (inverter is
+  // exporting onto the bus, sourced entirely by PV) - the 73W import is
+  // going straight to Load/Backup at Junction, never through the
+  // inverter, so it must NOT show up as a grid contribution to the
+  // battery charge. This is the exact data that exposed the bug: the
+  // battery-charge arrow rendered a spurious orange sliver even though
+  // PV (2584W) alone exceeds the charge (2209W).
+  const data = {
+    meter_active_power_total: '73', grid_in_out: '2', grid_mode: '1',
+    load_ptotal: '435', backup_ptotal: '9', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).netBus, 435 + 9 - 73);
+  assert.equal(batteryChargeGridWatts(busFlow(data).netBus), 0);
+});
+
+test('busFlow: Junction has four edges, not three - backupBypassW must count toward netBus when Backup is grid-bypass-fed', () => {
+  // Old (buggy) formula was netBus = load - meterSigned, silently
+  // dropping backup's own wattage whenever it's tied straight to the
+  // grid line (junction-fed). With grid idle (meterSigned 0), the bus
+  // must carry load AND backup's draw, not just load.
+  const data = {
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1',
+    load_ptotal: '200', backup_ptotal: '100', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).backupBypassW, 100);
+  assert.equal(busFlow(data).netBus, 300);
+});
+
+test('busFlow: backupBypassW is 0 when Backup is inverter-fed (islanding/fault), even with real backup wattage', () => {
+  const data = {
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '0',
+    load_ptotal: '200', backup_ptotal: '100', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).backupBypassW, 0);
+  assert.equal(busFlow(data).netBus, 200);
+});
+
+test('batteryChargeGridWatts: genuine grid-charging (netBus negative) is reported, capped to the actual reversed-bus amount', () => {
+  // Load 100W, grid importing 900W, no backup draw - far more import than
+  // the house needs, so the surplus must be flowing backward across the
+  // bus to charge the battery (the only other thing at Junction).
+  const data = {
+    meter_active_power_total: '900', grid_in_out: '2', grid_mode: '1',
+    load_ptotal: '100', backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).netBus, -800);
+  assert.equal(batteryChargeGridWatts(busFlow(data).netBus), 800);
+});
+
+test('batteryChargeGridWatts: pure function of netBus - 0 when the bus is exporting (netBus >= 0), -netBus when reversed', () => {
+  assert.equal(batteryChargeGridWatts(371), 0);
+  assert.equal(batteryChargeGridWatts(0), 0);
+  assert.equal(batteryChargeGridWatts(-800), 800);
+});
+
 test('WORK_MODE exposes the numeric work_mode codes, matching WORK_MODE_COLORS ordering', () => {
   const { WORK_MODE } = require('../../static/js/diagram-calc.js');
   assert.deepEqual(WORK_MODE, { WAIT: 0, NORMAL_ON_GRID: 1, NORMAL_OFF_GRID: 2, FAULT: 3, FLASH: 4, CHECK: 5 });
+});
+
+test('isBackupActive: grid.crossed forces true regardless of wattage', () => {
+  const backup = { active: false };
+  assert.equal(isBackupActive(backup, { crossed: true }, { work_mode: '1' }), true);
+});
+
+test('isBackupActive: gates on backup.active only in Normal (On-Grid); every other work_mode forces true', () => {
+  const grid = { crossed: false };
+  assert.equal(isBackupActive({ active: false }, grid, { work_mode: '1' }), false);
+  assert.equal(isBackupActive({ active: true }, grid, { work_mode: '1' }), true);
+  // Check Mode (5) still reads grid_mode Connected (grid.crossed false),
+  // but isn't "normal" - the threshold shouldn't apply there.
+  assert.equal(isBackupActive({ active: false }, grid, { work_mode: '5' }), true);
+});
+
+test('backupNodeColor: a phase alert is red regardless of active, otherwise active/inactive maps to orange/grey', () => {
+  assert.equal(backupNodeColor({ phaseAlerts: [false, true, false] }, false), 'red');
+  assert.equal(backupNodeColor({ phaseAlerts: [false, false, false] }, true), 'orange');
+  assert.equal(backupNodeColor({ phaseAlerts: [false, false, false] }, false), 'grey');
+});
+
+test('backupArrowFallbackColor: never red, unlike backupNodeColor - just active/inactive', () => {
+  assert.equal(backupArrowFallbackColor(true), 'orange');
+  assert.equal(backupArrowFallbackColor(false), 'grey');
+});
+
+test('edgeStates: real Pi sample (2026-09-13 08:08:23) - battery charge and bus are 100% green, no spurious grid stripe', () => {
+  // Same data as the busFlow regression test above: PV 2584W, battery
+  // charging 2209W, grid importing 73W (unrelated to charging), load
+  // 435W, backup 9W (grid-bypass-fed).
+  const data = {
+    ppv: '2584', pbattery1: '-2209', battery_mode: '3', battery_soc: '52', battery_discharge_limit: '25',
+    meter_active_power_total: '73', grid_in_out: '2', grid_mode: '1',
+    load_ptotal: '435', backup_ptotal: '9', backup_i1: '0.1', backup_i2: '0.1', backup_i3: '0.1',
+    work_mode: '1',
+  };
+  const e = edgeStates(data);
+  assert.deepEqual(e.battery.stripes, [{ colorName: 'green', watts: 2584 }, { colorName: 'orange', watts: 0 }]);
+  assert.equal(e.bus.colorName, 'grey'); // exporting onto the bus (netBus >= 0), not grid-sourced
+  assert.deepEqual(e.bus.stripes, [{ colorName: 'yellow', watts: 0 }, { colorName: 'green', watts: 2584 }]);
+  assert.equal(e.grid.colorName, 'orange');
+  assert.equal(e.backup.isJunction, true);
+  // 9W is below the default 35W noise threshold - inactive, no stripes.
+  assert.equal(e.backup.stripes, null);
+  assert.equal(e.backup.colorName, 'grey');
+});
+
+test('edgeStates: genuine grid-charging (netBus negative) puts the grid stripe on both battery and bus', () => {
+  // Load 100W, grid importing 900W, no PV/backup - the surplus must be
+  // flowing backward across the bus to charge the battery.
+  const data = {
+    ppv: '0', pbattery1: '-800', battery_mode: '3', battery_soc: '50', battery_discharge_limit: '25',
+    meter_active_power_total: '900', grid_in_out: '2', grid_mode: '1',
+    load_ptotal: '100', backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+    work_mode: '1',
+  };
+  const e = edgeStates(data);
+  assert.deepEqual(e.battery.stripes, [{ colorName: 'green', watts: 0 }, { colorName: 'orange', watts: 800 }]);
+  assert.equal(e.bus.colorName, 'orange');
+  assert.equal(e.bus.stripes, null); // single-color flat orange, not striped
+});
+
+test('edgeStates: a real phase overload never turns the Backup arrow red - only the node', () => {
+  // High phase current (>= 13.5A alert threshold) with plenty of real
+  // wattage (well above the 35W active threshold).
+  const data = {
+    ppv: '0', pbattery1: '0', battery_mode: '0', battery_soc: '0', battery_discharge_limit: '0',
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1',
+    load_ptotal: '0', backup_ptotal: '3000', backup_i1: '14.0', backup_i2: '13.0', backup_i3: '13.0',
+    work_mode: '1',
+  };
+  const e = edgeStates(data);
+  assert.equal(e.backup.nodeColor, 'red');
+  assert.notEqual(e.backup.colorName, 'red');
+  assert.equal(e.backup.colorName, 'orange');
+});
+
+test('edgeStates: Backup inverter-fed (islanding/fault) never stripes in a grid contribution', () => {
+  const data = {
+    ppv: '1000', pbattery1: '-500', battery_mode: '2', battery_soc: '50', battery_discharge_limit: '25',
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '0', // not connected
+    load_ptotal: '200', backup_ptotal: '800', backup_i1: '1', backup_i2: '1', backup_i3: '1',
+    work_mode: '2',
+  };
+  const e = edgeStates(data);
+  assert.equal(e.backup.isJunction, false);
+  assert.deepEqual(e.backup.stripes, [{ colorName: 'yellow', watts: 500 }, { colorName: 'green', watts: 1000 }]);
+});
+
+test('edgeStates: grid Fault forces the bus edge to a crossed, half-opacity red line with no flow', () => {
+  const data = {
+    ppv: '500', pbattery1: '0', battery_mode: '1', battery_soc: '50', battery_discharge_limit: '25',
+    meter_active_power_total: '200', grid_in_out: '2', grid_mode: '2', // fault
+    load_ptotal: '300', backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+    work_mode: '3',
+  };
+  const e = edgeStates(data);
+  assert.equal(e.bus.colorName, 'red');
+  assert.equal(e.bus.crossed, true);
+  assert.equal(e.bus.thicknessPx, 0);
+  assert.equal(e.bus.opacity, 0.5);
+  assert.equal(e.bus.stripes, null);
+});
+
+test('edgeStates: no battery installed means no battery edge to draw', () => {
+  const data = {
+    ppv: '500', pbattery1: '0', battery_mode: '0', battery_soc: '0', battery_discharge_limit: '0',
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1',
+    load_ptotal: '500', backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+    work_mode: '1',
+  };
+  assert.equal(edgeStates(data).battery, null);
 });

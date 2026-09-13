@@ -132,18 +132,26 @@
     var watts = Math.abs(toNumber(data.meter_active_power_total));
     var inOut = toNumber(data.grid_in_out);
     var mode = toNumber(data.grid_mode);
-    var color = 'grey';
-    if (inOut === GRID_IN_OUT.EXPORTING) color = 'green';
-    else if (inOut === GRID_IN_OUT.IMPORTING) color = 'orange';
-    var crossed = false;
-    if (mode === GRID_MODE.FAULT) {
-      color = 'red';
-      crossed = true;
-    } else if (mode === GRID_MODE.NOT_CONNECTED) {
-      color = 'grey';
-      crossed = true;
-    }
-    return { watts: watts, color: color, crossed: crossed, directionKnown: mode !== GRID_MODE.FAULT };
+    var crossed = mode === GRID_MODE.FAULT || mode === GRID_MODE.NOT_CONNECTED;
+    // importing/exporting are the semantic source of truth other code
+    // should read (calc.gridState(data).importing, not
+    // calc.gridState(data).color === 'orange') - direction is only
+    // meaningful while the grid is actually connected and not faulted:
+    // grid_in_out can still read Importing/Exporting during a Fault
+    // (verified against production data), and is meaningless while
+    // disconnected, so both crossed cases force both flags false rather
+    // than trusting the raw code.
+    var importing = !crossed && inOut === GRID_IN_OUT.IMPORTING;
+    var exporting = !crossed && inOut === GRID_IN_OUT.EXPORTING;
+    var color = mode === GRID_MODE.FAULT ? 'red' : importing ? 'orange' : exporting ? 'green' : 'grey';
+    return {
+      watts: watts,
+      color: color,
+      crossed: crossed,
+      importing: importing,
+      exporting: exporting,
+      directionKnown: mode !== GRID_MODE.FAULT,
+    };
   }
 
   function loadState(data) {
@@ -176,6 +184,166 @@
     return toNumber(data.grid_mode) === GRID_MODE.CONNECTED ? 'junction' : 'inverter';
   }
 
+  // Kirchhoff's law at the Junction node: whatever the Inverter->Junction
+  // ("bus") edge brings in must equal what Junction's other edges take
+  // out. Junction has *four* edges, not three, whenever Backup is
+  // grid-bypass-fed (bus, grid, load, backupBypass) - omitting
+  // backupBypassW here previously under-reported the bus's real flow by
+  // Backup's own wattage whenever grid-bypass was active. Extracted as a
+  // pure function (rather than left inline in diagram-render.js, which
+  // only draws the result) specifically so it's covered by a plain
+  // node --test regression test - this is arithmetic, not DOM.
+  function busFlow(data) {
+    var grid = gridState(data);
+    var load = loadState(data);
+    var backup = backupState(data);
+    var backupBypassW = backupSource(data) === 'junction' ? backup.watts : 0;
+    var meterSigned = grid.importing ? grid.watts : -grid.watts;
+    return { netBus: load.watts + backupBypassW - meterSigned, backupBypassW: backupBypassW };
+  }
+
+  // Grid power can only ever reach the battery by first flowing backward
+  // over the bus edge (netBus < 0) - never by being credited wholesale
+  // just because the household happens to be net-importing somewhere
+  // else (Load/Backup, served directly at Junction) at the same moment.
+  // Verified against real history (2026-09-13 08:08:23): PV 2584W alone
+  // covered a 2209W charge while 73W of unrelated grid import was
+  // happening at the same time - crediting that 73W to the charge arrow
+  // painted a grid stripe on what was actually a 100%-PV charge.
+  // Takes the already-computed netBus (from busFlow(data).netBus) rather
+  // than data itself, so callers that also need netBus for the bus edge
+  // (diagram-render.js does) don't re-derive gridState/loadState/
+  // backupState a second time for the same immutable data.
+  function batteryChargeGridWatts(netBus) {
+    return Math.max(0, -netBus);
+  }
+
+  // backup.active (the wattage threshold) only distinguishes real usage
+  // from CT-crosstalk noise while genuinely Normal (On-Grid) - it was only
+  // ever calibrated against samples in that mode (see
+  // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md).
+  // grid.crossed (Fault/Not-connected) already forces active regardless of
+  // wattage, but that alone misses Check Mode: grid_mode still reads
+  // Connected there (the bypass relay ties Backup straight to grid - see
+  // backupSource's own comment), so grid.crossed is false, yet Check Mode
+  // is just as "not normal" as Fault/Off-Grid for the threshold's purposes.
+  function isBackupActive(backup, grid, data) {
+    if (grid.crossed) return true;
+    var normalOnGrid = toNumber(data.work_mode) === WORK_MODE.NORMAL_ON_GRID;
+    return normalOnGrid ? backup.active : true;
+  }
+
+  // Node status color - a real phase overload always turns the Backup
+  // node red as an alert flag. The arrow itself deliberately never uses
+  // this (see backupArrowFallbackColor): it represents the physical
+  // source mix, not alarm status.
+  function backupNodeColor(backup, isBackupActive) {
+    return backup.phaseAlerts.some(Boolean) ? 'red' : (isBackupActive ? 'orange' : 'grey');
+  }
+
+  // Backup arrow's flat fallback color, used only when there's no source
+  // mix to stripe (inactive/idle). Never red: unlike the node, the arrow
+  // communicates what's flowing, not alarm status.
+  function backupArrowFallbackColor(isBackupActive) {
+    return isBackupActive ? 'orange' : 'grey';
+  }
+
+  // Full per-edge draw decisions (color/thickness/direction/opacity/
+  // stripes) for every arrow in the diagram - previously computed inline
+  // in diagram-render.js's redrawLines(), intermixed with the actual SVG
+  // drawing calls, which meant none of it could be tested without a
+  // browser (only the underlying netBus/mix arithmetic was covered).
+  // Pulled out here as a single pure function of `data` so every arrow's
+  // exact decision is covered by node --test - diagram-render.js now
+  // just maps this onto computeEdges()'s DOM geometry and calls
+  // drawManhattanEdge. thicknessPx already has arrowThickness applied
+  // (including edge-specific overrides, e.g. the bus edge forcing 0
+  // while grid.crossed), so callers don't need arrowThickness at all.
+  function edgeStates(data) {
+    var grid = gridState(data);
+    var gridImportW = grid.importing ? grid.watts : 0;
+    var load = loadState(data);
+    var pv = pvState(data);
+    var battery = batteryState(data);
+    var backup = backupState(data);
+    var active = isBackupActive(backup, grid, data);
+    var netBus = busFlow(data).netBus;
+
+    // See fullSourceMix/inverterOutputMix in the old redrawLines() for
+    // the full "why two mixes, not one" writeup: fullSourceMix covers
+    // anything tied to the shared grid line at Junction (Load, Backup's
+    // grid-bypass, Grid's own export), inverterOutputMix covers the
+    // inverter's own output (the bus edge, Backup's inverter-fed path) -
+    // never grid-sourced, since grid reaches Junction via its own edge.
+    var battDischargeW = (!battery.noBattery && battery.direction === 'discharge') ? battery.watts : 0;
+    var inverterOutputMix = [
+      { colorName: 'yellow', watts: battDischargeW },
+      { colorName: 'green', watts: pv.watts },
+    ];
+    var fullSourceMix = [
+      { colorName: 'yellow', watts: battDischargeW },
+      { colorName: 'green', watts: pv.watts },
+      { colorName: 'orange', watts: gridImportW },
+    ];
+
+    var pvEdge = { colorName: pv.active ? 'green' : 'grey', thicknessPx: arrowThickness(pv.watts), reversed: false, directionKnown: true, opacity: 1, stripes: null };
+
+    var batteryEdge = null;
+    if (!battery.noBattery) {
+      if (battery.direction === 'charge') {
+        // The grid stripe is capped to -netBus (the bus edge actually
+        // running backward), not the household's whole gridImportW - see
+        // batteryChargeGridWatts.
+        var chargeMix = [{ colorName: 'green', watts: pv.watts }, { colorName: 'orange', watts: batteryChargeGridWatts(netBus) }];
+        batteryEdge = { colorName: battery.flowColor, thicknessPx: arrowThickness(battery.watts), reversed: true, directionKnown: true, opacity: 1, stripes: chargeMix };
+      } else {
+        batteryEdge = { colorName: battery.flowColor, thicknessPx: arrowThickness(battery.watts), reversed: false, directionKnown: battery.direction !== 'none', opacity: 1, stripes: null };
+      }
+    }
+
+    var backupIsJunction = backupSource(data) === 'junction';
+    var backupEdge = {
+      isJunction: backupIsJunction,
+      nodeColor: backupNodeColor(backup, active),
+      colorName: backupArrowFallbackColor(active),
+      thicknessPx: arrowThickness(backup.watts),
+      reversed: false,
+      directionKnown: true,
+      opacity: 1,
+      stripes: active ? (backupIsJunction ? fullSourceMix : inverterOutputMix) : null,
+    };
+
+    var busEdge = {
+      colorName: grid.crossed ? 'red' : (netBus < 0 ? 'orange' : 'grey'),
+      thicknessPx: grid.crossed ? 0 : arrowThickness(netBus),
+      reversed: netBus < 0,
+      directionKnown: true,
+      opacity: grid.crossed ? 0.5 : 1,
+      stripes: (!grid.crossed && netBus >= 0) ? inverterOutputMix : null,
+      crossed: grid.crossed,
+    };
+
+    var gridEdge = {
+      colorName: grid.color,
+      thicknessPx: arrowThickness(grid.watts),
+      reversed: grid.importing,
+      directionKnown: grid.directionKnown,
+      opacity: 1,
+      stripes: grid.exporting ? fullSourceMix : null,
+    };
+
+    var loadEdge = {
+      colorName: load.watts > 0 ? 'orange' : 'grey',
+      thicknessPx: arrowThickness(load.watts),
+      reversed: false,
+      directionKnown: true,
+      opacity: 1,
+      stripes: fullSourceMix,
+    };
+
+    return { pv: pvEdge, battery: batteryEdge, backup: backupEdge, bus: busEdge, grid: gridEdge, load: loadEdge };
+  }
+
   var DiagramCalc = {
     BATTERY_MODE: BATTERY_MODE,
     GRID_IN_OUT: GRID_IN_OUT,
@@ -193,6 +361,12 @@
     loadState: loadState,
     backupState: backupState,
     backupSource: backupSource,
+    busFlow: busFlow,
+    batteryChargeGridWatts: batteryChargeGridWatts,
+    isBackupActive: isBackupActive,
+    backupNodeColor: backupNodeColor,
+    backupArrowFallbackColor: backupArrowFallbackColor,
+    edgeStates: edgeStates,
   };
 
   if (typeof module !== 'undefined' && module.exports) {
