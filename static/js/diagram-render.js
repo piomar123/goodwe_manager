@@ -386,33 +386,53 @@
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     var edges = computeEdges();
 
-    // Hoisted ahead of battery/backup (both need it for their own source
-    // mixes) - grid.color/watts don't depend on anything computed below.
+    // Hoisted ahead of battery/backup (all three need pieces of this for
+    // their own source mixes) - none of grid/load/backup depend on
+    // anything computed below.
     var grid = calc.gridState(data);
     var gridImportW = grid.color === 'orange' ? grid.watts : 0;
+    var load = calc.loadState(data);
+    var backup = calc.backupState(data);
+    var active = isBackupActive(backup, grid, data);
+    var backupColor = backupNodeColor(backup, active);
+    var backupThickness = calc.arrowThickness(backup.watts);
+    // Kirchhoff balance at Junction (netBus = what the bus edge carries)
+    // lives in diagram-calc.js as calc.busFlow, since it's pure
+    // arithmetic covered by node --test - see that function for the
+    // four-edges-not-three writeup. Computed once up here because
+    // chargeMix (battery) needs it too, ahead of the bus edge itself.
+    var netBus = calc.busFlow(data).netBus;
 
     var pv = calc.pvState(data);
     drawManhattanEdge(svg, edges.pv.p0, edges.pv.dir0, edges.pv.p1, edges.pv.dir1, pv.active ? 'green' : 'grey', calc.arrowThickness(pv.watts), false, true);
 
     var battery = calc.batteryState(data);
+    // netBus/chargeGridW above assume battery discharge doesn't also
+    // reach the bus, which holds: discharge and charge are mutually
+    // exclusive per batteryState().
     if (!battery.noBattery) {
       var eBattery = edges.battery;
       if (battery.direction === 'charge') {
         // Battery-as-sink: charging can be PV-sourced, grid-sourced (e.g.
         // the cheap-tariff overnight case), or both at once - stripe it
         // the same way Load's arrow does, instead of a flat green that
-        // implies "always from PV."
-        var chargeMix = [{ colorName: 'green', watts: pv.watts }, { colorName: 'orange', watts: gridImportW }];
+        // implies "always from PV." The grid stripe is capped to -netBus
+        // (the bus edge actually running backward), not the household's
+        // whole gridImportW - PV can (and often does) cover the entire
+        // charge on its own while the grid also imports for unrelated
+        // load/backup consumption served directly at Junction; crediting
+        // the full household import to charging here double-counted that
+        // and painted a grid stripe even when charging was 100% PV
+        // (verified against real history: PV 2584W covering a 2209W
+        // charge with 73W of unrelated grid import happening at the same
+        // moment - see the 2026-09-13 orange-sliver-on-battery-arrow bug).
+        var chargeMix = [{ colorName: 'green', watts: pv.watts }, { colorName: 'orange', watts: calc.batteryChargeGridWatts(data) }];
         drawManhattanEdge(svg, eBattery.p0, eBattery.dir0, eBattery.p1, eBattery.dir1, battery.flowColor, calc.arrowThickness(battery.watts), true, true, 1, chargeMix);
       } else {
         drawManhattanEdge(svg, eBattery.p0, eBattery.dir0, eBattery.p1, eBattery.dir1, battery.flowColor, calc.arrowThickness(battery.watts), false, battery.direction !== 'none');
       }
     }
 
-    var backup = calc.backupState(data);
-    var active = isBackupActive(backup, grid, data);
-    var backupColor = backupNodeColor(backup, active);
-    var backupThickness = calc.arrowThickness(backup.watts);
     // Battery discharge, PV, and grid import are the three things that can
     // feed a plain sink drawing from the shared bus (Backup, Load, and the
     // bus/grid edges when they're genuinely exporting) - one shared mix,
@@ -476,16 +496,13 @@
     // battery from grid power), and a vanishing arrow whenever load
     // happens to be 0 even though real power is crossing the bus (e.g. all
     // surplus going to grid export/backup/battery-charge, none via Load).
-    // Fixed with Kirchhoff's law at the Junction node: it only has three
-    // edges (bus, grid, load), so whatever the bus brings in must equal
-    // what grid and load take out - bus = load - meterSigned. (pgrid/
-    // pgrid2/pgrid3 measure the inverter's grid-tie AC port specifically,
+    // Fixed with Kirchhoff's law at the Junction node - see calc.busFlow
+    // in diagram-calc.js for the derivation (netBus computed up top,
+    // since chargeMix needs it too). (pgrid/pgrid2/pgrid3 measure the
+    // inverter's grid-tie AC port specifically,
     // which is near-zero during both off-grid islanding and grid-bypass -
     // exactly when Backup is fed via one of its two other paths - so
     // they're the wrong signal for this edge.)
-    var load = calc.loadState(data);
-    var meterSigned = grid.color === 'orange' ? grid.watts : -grid.watts;
-    var netBus = load.watts - meterSigned;
     var busThickness = grid.crossed ? 0 : calc.arrowThickness(netBus);
     // When the inverter is genuinely exporting onto the bus (netBus>=0),
     // that flow is exactly the PV+battery-discharge mix - stripe it, same

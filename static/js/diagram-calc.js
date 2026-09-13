@@ -176,6 +176,36 @@
     return toNumber(data.grid_mode) === GRID_MODE.CONNECTED ? 'junction' : 'inverter';
   }
 
+  // Kirchhoff's law at the Junction node: whatever the Inverter->Junction
+  // ("bus") edge brings in must equal what Junction's other edges take
+  // out. Junction has *four* edges, not three, whenever Backup is
+  // grid-bypass-fed (bus, grid, load, backupBypass) - omitting
+  // backupBypassW here previously under-reported the bus's real flow by
+  // Backup's own wattage whenever grid-bypass was active. Extracted as a
+  // pure function (rather than left inline in diagram-render.js, which
+  // only draws the result) specifically so it's covered by a plain
+  // node --test regression test - this is arithmetic, not DOM.
+  function busFlow(data) {
+    var grid = gridState(data);
+    var load = loadState(data);
+    var backup = backupState(data);
+    var backupBypassW = backupSource(data) === 'junction' ? backup.watts : 0;
+    var meterSigned = grid.color === 'orange' ? grid.watts : -grid.watts;
+    return { netBus: load.watts + backupBypassW - meterSigned, backupBypassW: backupBypassW };
+  }
+
+  // Grid power can only ever reach the battery by first flowing backward
+  // over the bus edge (netBus < 0) - never by being credited wholesale
+  // just because the household happens to be net-importing somewhere
+  // else (Load/Backup, served directly at Junction) at the same moment.
+  // Verified against real history (2026-09-13 08:08:23): PV 2584W alone
+  // covered a 2209W charge while 73W of unrelated grid import was
+  // happening at the same time - crediting that 73W to the charge arrow
+  // painted a grid stripe on what was actually a 100%-PV charge.
+  function batteryChargeGridWatts(data) {
+    return Math.max(0, -busFlow(data).netBus);
+  }
+
   var DiagramCalc = {
     BATTERY_MODE: BATTERY_MODE,
     GRID_IN_OUT: GRID_IN_OUT,
@@ -193,6 +223,8 @@
     loadState: loadState,
     backupState: backupState,
     backupSource: backupSource,
+    busFlow: busFlow,
+    batteryChargeGridWatts: batteryChargeGridWatts,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

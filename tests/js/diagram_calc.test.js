@@ -4,6 +4,7 @@ const {
   toNumber, arrowThickness, pvState, inverterBusState, batteryState,
   inverterState, gridState, loadState, backupState, backupSource,
   setBackupActiveThreshold, BACKUP_CURRENT_ALERT_THRESHOLD_A,
+  busFlow, batteryChargeGridWatts,
 } = require('../../static/js/diagram-calc.js');
 
 test('toNumber parses numeric strings', () => {
@@ -190,6 +191,57 @@ test('backupSource: grid-bypass (junction) when grid_mode is Connected, inverter
   assert.equal(backupSource({ grid_mode: '1' }), 'junction');
   assert.equal(backupSource({ grid_mode: '0' }), 'inverter');
   assert.equal(backupSource({ grid_mode: '2' }), 'inverter');
+});
+
+test('busFlow: real Pi sample (2026-09-13 08:08:23) - PV covers the whole battery charge while grid imports for something else', () => {
+  // PV 2584W, battery charging 2209W, grid importing 73W, load 435W,
+  // backup 9W (grid-bypass-fed). netBus must be positive (inverter is
+  // exporting onto the bus, sourced entirely by PV) - the 73W import is
+  // going straight to Load/Backup at Junction, never through the
+  // inverter, so it must NOT show up as a grid contribution to the
+  // battery charge. This is the exact data that exposed the bug: the
+  // battery-charge arrow rendered a spurious orange sliver even though
+  // PV (2584W) alone exceeds the charge (2209W).
+  const data = {
+    meter_active_power_total: '73', grid_in_out: '2', grid_mode: '1',
+    load_ptotal: '435', backup_ptotal: '9', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).netBus, 435 + 9 - 73);
+  assert.equal(batteryChargeGridWatts(data), 0);
+});
+
+test('busFlow: Junction has four edges, not three - backupBypassW must count toward netBus when Backup is grid-bypass-fed', () => {
+  // Old (buggy) formula was netBus = load - meterSigned, silently
+  // dropping backup's own wattage whenever it's tied straight to the
+  // grid line (junction-fed). With grid idle (meterSigned 0), the bus
+  // must carry load AND backup's draw, not just load.
+  const data = {
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1',
+    load_ptotal: '200', backup_ptotal: '100', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).backupBypassW, 100);
+  assert.equal(busFlow(data).netBus, 300);
+});
+
+test('busFlow: backupBypassW is 0 when Backup is inverter-fed (islanding/fault), even with real backup wattage', () => {
+  const data = {
+    meter_active_power_total: '0', grid_in_out: '0', grid_mode: '0',
+    load_ptotal: '200', backup_ptotal: '100', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).backupBypassW, 0);
+  assert.equal(busFlow(data).netBus, 200);
+});
+
+test('batteryChargeGridWatts: genuine grid-charging (netBus negative) is reported, capped to the actual reversed-bus amount', () => {
+  // Load 100W, grid importing 900W, no backup draw - far more import than
+  // the house needs, so the surplus must be flowing backward across the
+  // bus to charge the battery (the only other thing at Junction).
+  const data = {
+    meter_active_power_total: '900', grid_in_out: '2', grid_mode: '1',
+    load_ptotal: '100', backup_ptotal: '0', backup_i1: '0', backup_i2: '0', backup_i3: '0',
+  };
+  assert.equal(busFlow(data).netBus, -800);
+  assert.equal(batteryChargeGridWatts(data), 800);
 });
 
 test('WORK_MODE exposes the numeric work_mode codes, matching WORK_MODE_COLORS ordering', () => {
