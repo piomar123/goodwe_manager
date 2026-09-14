@@ -2,9 +2,10 @@
 
 > **Amended 2026-09-14** (after live-testing with a real Solcast key): §1's chart now aggregates
 > Solcast to hourly instead of its native 30-minute resolution (fixes a kWh-comparability issue and
-> a Chart.js tooltip misalignment bug), and §3's daily summary gained an accuracy delta against real
-> inverter production. Original implementation (Tasks 1-7, everything except these two amendments)
-> is already committed on this branch.
+> a Chart.js tooltip misalignment bug); §3's daily summary gained an accuracy delta against real
+> inverter production and now shows Meteosource/Solcast on separate lines instead of one
+> `·`-joined line. Original implementation (Tasks 1-7, everything except these amendments) is
+> already committed on this branch.
 
 ## Goal
 
@@ -104,10 +105,16 @@ chart (§1) shows the real 30-minute values for anyone who wants the precise fig
 
 ### 3. Daily summary line
 
-Replaces today's `90°: X kWh / 270°: X kWh / Total: X kWh`:
+Replaces today's `90°: X kWh / 270°: X kWh / Total: X kWh`. **Amended 2026-09-14** (readability
+feedback during live testing): Meteosource and Solcast are shown on separate lines rather than
+joined with `·` on one line - easier to scan, and leaves room for the accuracy delta below without
+the line growing unwieldy. Rendered with CSS `white-space: pre-line` on the summary `<p>` (so a
+literal `\n` in the server-built string renders as a line break) rather than `| safe` + `<br>` -
+avoids opting the template out of Jinja's autoescaping for a plain two-line label.
 
 ```
-Meteosource: X kWh · Solcast: Y (Z-W) kWh
+Meteosource: X kWh
+Solcast: Y (Z-W) kWh
 ```
 
 Z-W is Solcast's c10-c90 range for the day total.
@@ -123,7 +130,8 @@ compare against a forecast, when a real measurement is sitting right there, adde
 accuracy benefit. `forecast_prefetch.py`'s schedule and call budget are unchanged by this addition.
 
 ```
-Meteosource: X kWh (Δ +N% vs actual) · Solcast: Y (Z-W) kWh (Δ +N% vs actual)
+Meteosource: X kWh (Δ +N% vs actual)
+Solcast: Y (Z-W) kWh (Δ +N% vs actual)
 ```
 
 `Δ = round((forecast_total - actual_total) / actual_total * 100)`, signed (a positive Δ means the
