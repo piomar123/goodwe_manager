@@ -216,8 +216,10 @@
         // §1's amendment. solcastByHour is already built above (table
         // section) from the same ForecastCalc.aggregateSolcastHourly call;
         // reused here instead of a second aggregation pass. A missing hour
-        // (e.g. the very edge of a merged snapshot window) reads as 0,
-        // same convention the table's row-building already uses.
+        // (e.g. the very edge of a merged snapshot window) is deliberately
+        // pinned to 0 here - unlike the table, which shows '—' for the same
+        // case - because a filled band needs a numeric y at every x
+        // position; it can't skip a point the way a table cell can.
         const points = key => hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastByHour[t] || {})[key] ?? 0 }));
         return [
           { type: 'line', label: 'Solcast c10', data: points('c10'), borderWidth: 0, pointRadius: 0, fill: false, order: 3 },

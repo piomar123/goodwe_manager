@@ -100,8 +100,10 @@ either forecast's day total as production unfolds).
 Solcast's row values are the **sum of its two 30-minute periods** for that hour (`c50` sums
 cleanly, since it's a normal expected value). `c10`/`c90` are also just summed the same way for
 display simplicity, even though summing two independent percentile estimates isn't statistically
-exact (percentiles aren't additive in general) - close enough for a hobbyist dashboard table; the
-chart (§1) shows the real 30-minute values for anyone who wants the precise figures.
+exact (percentiles aren't additive in general) - close enough for a hobbyist dashboard table. Since
+the §1 amendment, the chart no longer shows native 30-minute values either - it renders the same
+hourly-aggregated data as this table (raw 30-minute data is still fetched and stored, just not
+displayed anywhere).
 
 ### 3. Daily summary line
 
@@ -137,9 +139,17 @@ Solcast: Y (Z-W) kWh (Δ +N% vs actual)
 `Δ = round((forecast_total - actual_total) / actual_total * 100)`, signed (a positive Δ means the
 forecast overestimated; negative means it underestimated). On any date that doesn't meet the
 "fully elapsed, no gaps" condition above (today, future dates, or a past date with incomplete
-telemetry), the summary falls back to the plain `Meteosource: X kWh · Solcast: Y (Z-W) kWh` form
-with no `Δ` - showing a delta against an incomplete or nonexistent actual total would be misleading
-rather than informative.
+telemetry), or when viewing a specific historical forecast snapshot rather than the merged "Latest"
+view (a snapshot may itself only cover part of the day - see §4's "Specific snapshot" read mode),
+the summary falls back to the plain two-line `\n`-joined form from above with no `Δ`:
+
+```
+Meteosource: X kWh
+Solcast: Y (Z-W) kWh
+```
+
+showing a delta against an incomplete or nonexistent actual total, or against a partial forecast
+snapshot, would be misleading rather than informative.
 
 ### 4. Data model: fetch history, not a TTL cache
 

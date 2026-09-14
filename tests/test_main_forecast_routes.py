@@ -1,7 +1,102 @@
+import os
+import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
+import forecast_history
+import history
+import storage
+from sensors import sensor_columns
+
 import main
+
+
+class ForecastSummaryAccuracyDeltaGatingTest(unittest.TestCase):
+    """Covers the /forecast route's actual_total gating in get_forecast():
+    the accuracy delta (Δ) must only be shown for the merged "Latest" view
+    (fetched_at omitted), never for a specific historical snapshot - a
+    snapshot fetched early in the day may only cover that day's remaining
+    hours (Solcast/Meteosource fetches are forward-looking), so comparing
+    its partial forecast total against the full-day actual total would be
+    misleading. Uses real temp DBs (not mocks) for both data.db and
+    forecast_history.db so this exercises get_forecast()'s actual gating
+    logic end to end, same spirit as test_main_backfill.py's DB setup.
+    """
+
+    DATE = '2026-01-05'  # a fully elapsed past date relative to "today" in tests
+
+    def setUp(self):
+        main.app.testing = True
+        self.client = main.app.test_client()
+
+        fd, self.data_db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.data_db_path)
+        storage.init_db_sync(self.data_db_path, sensor_columns()).close()
+        self._orig_data_db_path = storage.DATA_DB_PATH
+        storage.DATA_DB_PATH = self.data_db_path
+
+        fd, self.forecast_db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.forecast_db_path)
+        self._orig_forecast_db_path = forecast_history.FORECAST_HISTORY_DB_PATH
+        forecast_history.FORECAST_HISTORY_DB_PATH = self.forecast_db_path
+        forecast_history.init_db(self.forecast_db_path).close()
+
+        # Complete (24h) actual telemetry for DATE, straight into
+        # hourly_summary (the only table _get_actual_hourly_pv_kwh reads).
+        conn = storage.init_db_sync(self.data_db_path, sensor_columns())
+        try:
+            day = datetime.strptime(self.DATE, '%Y-%m-%d').date()
+            day_start_epoch, _ = history.date_range_to_epoch(day, day)
+            for hour in range(24):
+                conn.execute(
+                    "INSERT INTO hourly_summary (hour_start, pv_kwh) VALUES (?, ?)",
+                    (day_start_epoch + hour * 3600, 1.0),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Two forecast_history snapshots for Meteosource: an early one that
+        # only covers the first 6 hours of the day (a realistic
+        # forward-looking partial fetch), and a later one that covers all
+        # 24 - so the merged "Latest" view is complete, but the early
+        # snapshot alone (queried via fetched_at) stays partial.
+        fh_conn = forecast_history.init_db(self.forecast_db_path)
+        try:
+            partial_payload = {f'{h:02d}:00': 1.0 for h in range(6)}
+            full_payload = {f'{h:02d}:00': 1.0 for h in range(24)}
+            self.partial_fetched_at = forecast_history.write_snapshot(
+                fh_conn, 'meteosource', self.DATE, partial_payload, now=1000)
+            forecast_history.write_snapshot(fh_conn, 'meteosource', self.DATE, full_payload, now=2000)
+        finally:
+            fh_conn.close()
+
+    def tearDown(self):
+        storage.DATA_DB_PATH = self._orig_data_db_path
+        forecast_history.FORECAST_HISTORY_DB_PATH = self._orig_forecast_db_path
+        for path in (self.data_db_path, self.forecast_db_path):
+            for suffix in ('', '-wal', '-shm'):
+                p = path + suffix
+                if os.path.exists(p):
+                    os.remove(p)
+
+    def test_specific_historical_snapshot_shows_no_delta(self):
+        resp = self.client.get(f'/forecast?date={self.DATE}&fetched_at={self.partial_fetched_at}')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertNotIn('Δ', body)
+
+    def test_latest_merged_view_shows_delta_for_the_same_date(self):
+        # Companion case, same date/data, just without fetched_at - pins
+        # that it's specifically `fetched_at is None` gating the delta,
+        # not something else (e.g. forecast completeness alone).
+        resp = self.client.get(f'/forecast?date={self.DATE}')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn('Δ', body)
 
 
 class ForecastHourlyJsonRouteTest(unittest.TestCase):

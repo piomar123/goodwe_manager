@@ -565,7 +565,7 @@ def _accuracy_delta_pct(forecast_total, actual_total):
 
 
 def _build_forecast_summary(meteosource_total, solcast_totals, actual_total):
-    """meteosource_total: day-total Meteosource kWh. solcast_totals:
+    r"""meteosource_total: day-total Meteosource kWh. solcast_totals:
     (c10_total, c50_total, c90_total) tuple, or None if Solcast has no data
     for this date. actual_total: day-total real Actual kWh if the accuracy
     delta is computable for this date (a fully elapsed past day with all 24
@@ -610,10 +610,18 @@ def get_forecast():
     # Accuracy delta only for a fully elapsed past date with complete
     # telemetry - see this plan's Global Constraints and spec §3's
     # amendment for why (a partial/incomplete actual total would make the
-    # delta misleading, not informative).
+    # delta misleading, not informative). Also only for the merged "Latest"
+    # view (fetched_at is None): a specific historical snapshot may only
+    # cover part of the day (Solcast/Meteosource fetches are forward-looking),
+    # so its forecast total is itself partial and comparing it to the full-day
+    # actual total would be just as misleading.
     is_past_date = date_yyyymmdd < datetime.now().strftime('%Y-%m-%d')
     actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd) if is_past_date else {}
-    actual_total = round(sum(actual_by_hour.values()), 1) if is_past_date and len(actual_by_hour) == 24 else None
+    actual_total = (
+        round(sum(actual_by_hour.values()), 1)
+        if fetched_at is None and is_past_date and len(actual_by_hour) == 24
+        else None
+    )
 
     summary = _build_forecast_summary(meteosource_total, solcast_totals, actual_total)
     return flask.render_template('forecast.html', date=date_yyyymmdd, fetched_at=fetched_at, summary=summary)
