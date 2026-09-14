@@ -31,12 +31,13 @@ needs to be re-fetched anywhere near request time to stay useful.
   ([docs.solcast.com.au](https://docs.solcast.com.au/))
 - One call returns a **rolling multi-day forecast** (today + several days ahead), not just one date
   — so one fetch per site refreshes many calendar days at once.
-- **Assumption to verify at implementation time:** the API accepts a `period=PT60M` query param to
-  get native hourly granularity (matching Meteosource/the existing chart) instead of the default
-  30-minute periods. If unavailable, hourly aggregation (summing two half-hour periods) will be
-  needed in `solcast.py`.
-- Forward-looking only — no historical/past-date data. A date outside the fetched window (past, or
-  beyond how far ahead the API returned) simply has no Solcast data.
+- Requested at its native **30-minute** period (not aggregated to hourly at fetch time) so the
+  chart can show Solcast at higher resolution than Meteosource/Actual - see §1 and §4.
+- Forward-looking only — no historical/past-date data, and a given call only returns periods from
+  roughly "now" onward, not the rest of today's already-elapsed periods either. A period outside
+  the fetched window (past a call's start time, or beyond how far ahead it returned) simply has no
+  Solcast data *from that call* - see §4's read-path merge for how today's already-elapsed periods
+  still get shown from earlier calls.
 - Neither Solcast nor Meteosource publish a "cheap update window" worth chasing: Solcast reissues
   NWP-based forecasts hourly (satellite nowcast every 5-15 min); Meteosource updates roughly every
   10 min. Both are near-continuously fresh — refresh cadence here is bound by Solcast's call quota,
@@ -55,6 +56,13 @@ Solcast band `order: 3` < Solcast c50 line `order: 2` < Actual `order: -1` (top,
 today). Without explicit `order` values, Chart.js does not use dataset array position for z-order
 once any dataset sets one, so every dataset needs one set explicitly.
 
+**Mixed resolution:** Solcast's line/band plot at its native 30-minute points (48/day) while
+Meteosource's bars and the Actual line stay hourly (24/day) - Solcast is genuinely higher-resolution
+data and the chart should show that instead of throwing it away. This works on the same linear,
+fractional x-axis already used for bar/line alignment (see `forecast.html`'s existing
+hour-as-numeric-axis approach): a 14:30 Solcast point sits at `x = 14.5`, same axis Meteosource's
+bar at hour 14 already spans `[14, 15)` on.
+
 A working mockup comparing this against two rejected alternatives (three plain lines; c50-as-bars
 with error-bar whiskers) lives in `docs/superpowers/mockups/solcast-chart-options/` (not committed
 - see that directory's own throwaway-mockup convention already used by
@@ -67,6 +75,12 @@ forecast cumulative columns are dropped. With two forecast sources plus the dail
 (below) already showing each source's day total, a running forecast total per hour added little;
 the cumulative column that matters is Actual's (the one figure people actually compare against
 either forecast's day total as production unfolds).
+
+Solcast's row values are the **sum of its two 30-minute periods** for that hour (`c50` sums
+cleanly, since it's a normal expected value). `c10`/`c90` are also just summed the same way for
+display simplicity, even though summing two independent percentile estimates isn't statistically
+exact (percentiles aren't additive in general) - close enough for a hobbyist dashboard table; the
+chart (§1) shows the real 30-minute values for anyone who wants the precise figures.
 
 ### 3. Daily summary line
 
@@ -95,8 +109,9 @@ CREATE TABLE forecast_snapshots (
 
 `payload` shape per source:
 - `meteosource`: `{"HH:00": kwh, ...}` (already-summed east+west, matching the new single-series
-  chart/table)
-- `solcast`: `{"HH:00": {"c10": kwh, "c50": kwh, "c90": kwh}, ...}` (already-summed east+west)
+  chart/table; still hourly - Meteosource's own resolution)
+- `solcast`: `{"HH:00": {"c10": kwh, "c50": kwh, "c90": kwh}, "HH:30": {...}, ...}`
+  (already-summed east+west, at Solcast's native 30-minute resolution - see §1)
 
 **Write path:** every fetch (scheduled or fallback-live, see §5/§7) computes its payload and
 compares it (rounded to the same 2-decimal precision already used for display) against the most
@@ -105,9 +120,21 @@ now. Different (or no prior snapshot) -> insert a new row with `fetched_at = val
 Nothing is ever deleted, so every past date's forecast history stays queryable.
 
 **Read path:** `/forecast` and `/forecast/hourly.json` query this table instead of the old
-in-process `_forecast_cache` dict, which is removed entirely. Default read is each source's latest
-snapshot (`MAX(fetched_at)`) for the requested date; the fetch-time dropdown (§6) can request a
-specific `fetched_at` instead.
+in-process `_forecast_cache` dict, which is removed entirely. Two read modes:
+
+- **Specific snapshot** (fetch-time dropdown, §6, set to anything other than "latest"): return that
+  `(source, date, fetched_at)` row's payload exactly as stored, gaps included. A snapshot fetched
+  mid-morning genuinely has no periods for the hours before it ran - showing that gap is accurate
+  history, not a bug.
+- **"Latest" (the default view):** *merge per period across all of that date's snapshots*, taking
+  each period's value from the most recent snapshot that actually reported one - not just the
+  single newest `fetched_at`'s payload wholesale. This is what makes "today" work: Solcast's calls
+  are forward-looking from call time (see free-tier facts above), so at 14:00 the 06:00 snapshot is
+  the only one that ever covered 07:00-09:30, the 10:00 snapshot covers 10:00-13:30, and only
+  14:00-onward comes from the freshest (14:15) snapshot. Rendering "latest" as a single snapshot's
+  payload would show those earlier periods as missing even though they were legitimately forecast
+  earlier in the day. Same merge logic applies to Meteosource, for consistency, even though its own
+  scheduled+fallback fetches make gaps less likely there in practice.
 
 ### 5. Fetch scheduling
 
