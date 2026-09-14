@@ -26,7 +26,7 @@
     </div>
     <div class="row">
       <div class="col">
-        <p>{{ summary }}</p>
+        <p id="forecast-summary">{{ summary }}</p>
       </div>
     </div>
     <div class="row">
@@ -65,6 +65,11 @@
   <style>
     #forecast-chart { height: 400px; }
     @media (max-width: 576px) { #forecast-chart { height: 260px; } }
+    /* main.py's _build_forecast_summary joins Meteosource/Solcast with a
+       literal \n - this renders that as a real line break without opting
+       the template out of Jinja's autoescaping (no `| safe` + `<br>`
+       needed for a plain two-line label). */
+    #forecast-summary { white-space: pre-line; }
     /* Sticky header that sticks to the *page's* scroll (no more fixed-height
        inner scroll box) - needs its own opaque background (matching
        Bootstrap's table-dark bg) since a sticky element is otherwise
@@ -205,9 +210,15 @@
 
       function solcastDatasets() {
         if (!data.solcast.available) return [];
-        // Native 30-minute points, unlike Meteosource's hourly bars - see
-        // spec §1 "Mixed resolution".
-        const points = key => data.solcast.periods.map(p => ({ x: ForecastCalc.solcastPeriodToX(p.time), y: p[key] }));
+        // Hourly-aggregated, same resolution and same x-positions
+        // (idx + 0.5) as the Meteosource bar - see
+        // docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md
+        // §1's amendment. solcastByHour is already built above (table
+        // section) from the same ForecastCalc.aggregateSolcastHourly call;
+        // reused here instead of a second aggregation pass. A missing hour
+        // (e.g. the very edge of a merged snapshot window) reads as 0,
+        // same convention the table's row-building already uses.
+        const points = key => hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastByHour[t] || {})[key] ?? 0 }));
         return [
           { type: 'line', label: 'Solcast c10', data: points('c10'), borderWidth: 0, pointRadius: 0, fill: false, order: 3 },
           { type: 'line', label: 'Solcast c10–c90 range', data: points('c90'), borderWidth: 0, pointRadius: 0, fill: '-1', backgroundColor: ChartTheme.withAlpha(c50Color, 0.18), order: 3 },
@@ -394,7 +405,6 @@
             scales: {
               x: xScale,
               y: {
-                stacked: true,
                 beginAtZero: true,
                 ticks: {
                   color: ChartTheme.axisTickColor,
