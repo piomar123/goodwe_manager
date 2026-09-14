@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Any, Mapping
+from typing import Optional, Any, Mapping, Tuple
 
 import aiosqlite
 import dotenv
@@ -552,6 +552,46 @@ def _solcast_daily_totals(periods_dict):
     return round(c10, 1), round(c50, 1), round(c90, 1)
 
 
+def _accuracy_delta_pct(forecast_total, actual_total):
+    """Δ = round((forecast_total - actual_total) / actual_total * 100),
+    signed - positive means the forecast overestimated, negative means it
+    underestimated. None if actual_total is falsy (0 or None) - a real
+    zero-production day (e.g. total snow cover) can't be divided into, and
+    get_forecast() already only passes a real actual_total when one is
+    computable (see its own gating logic)."""
+    if not actual_total:
+        return None
+    return round((forecast_total - actual_total) / actual_total * 100)
+
+
+def _build_forecast_summary(meteosource_total, solcast_totals, actual_total):
+    """meteosource_total: day-total Meteosource kWh. solcast_totals:
+    (c10_total, c50_total, c90_total) tuple, or None if Solcast has no data
+    for this date. actual_total: day-total real Actual kWh if the accuracy
+    delta is computable for this date (a fully elapsed past day with all 24
+    hours recorded - see get_forecast's gating), else None to omit deltas
+    entirely. Returns the summary string - one line if Solcast has no data,
+    two `\n`-joined lines otherwise; forecast.html renders it with CSS
+    `white-space: pre-line` so the `\n` becomes a real line break without
+    needing `| safe` + `<br>`.
+    """
+    meteosource_line = f"Meteosource: {meteosource_total} kWh"
+    meteosource_delta = _accuracy_delta_pct(meteosource_total, actual_total)
+    if meteosource_delta is not None:
+        meteosource_line += f" (Δ {meteosource_delta:+d}% vs actual)"
+    lines = [meteosource_line]
+
+    if solcast_totals is not None:
+        c10_total, c50_total, c90_total = solcast_totals
+        solcast_line = f"Solcast: {c50_total} ({c10_total}-{c90_total}) kWh"
+        solcast_delta = _accuracy_delta_pct(c50_total, actual_total)
+        if solcast_delta is not None:
+            solcast_line += f" (Δ {solcast_delta:+d}% vs actual)"
+        lines.append(solcast_line)
+
+    return "\n".join(lines)
+
+
 @app.get('/forecast')
 def get_forecast():
     date_param = request.args.get('date', default='t')
@@ -565,10 +605,17 @@ def get_forecast():
         solcast_periods = _read_forecast_payload(conn, 'solcast', date_yyyymmdd, fetched_at)
 
     meteosource_total = round(sum(meteosource.values()), 1)
-    c10_total, c50_total, c90_total = _solcast_daily_totals(solcast_periods)
-    summary = f"Meteosource: {meteosource_total} kWh"
-    if solcast_periods:
-        summary += f" · Solcast: {c50_total} ({c10_total}-{c90_total}) kWh"
+    solcast_totals = _solcast_daily_totals(solcast_periods) if solcast_periods else None
+
+    # Accuracy delta only for a fully elapsed past date with complete
+    # telemetry - see this plan's Global Constraints and spec §3's
+    # amendment for why (a partial/incomplete actual total would make the
+    # delta misleading, not informative).
+    is_past_date = date_yyyymmdd < datetime.now().strftime('%Y-%m-%d')
+    actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd) if is_past_date else {}
+    actual_total = round(sum(actual_by_hour.values()), 1) if is_past_date and len(actual_by_hour) == 24 else None
+
+    summary = _build_forecast_summary(meteosource_total, solcast_totals, actual_total)
     return flask.render_template('forecast.html', date=date_yyyymmdd, fetched_at=fetched_at, summary=summary)
 
 
