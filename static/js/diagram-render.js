@@ -85,17 +85,29 @@
   // bends, entering Backup's *right* border (reads as "fed from the
   // left," consistent with the grid-bypass case, which also enters via
   // Backup's right since Junction sits to its right).
-  function computeEdges() {
+  // islandingShiftPx offsets the bus edge's exit point right and the
+  // islanding edge's own exit point left by the same amount (see
+  // DiagramCalc.backupIslandingShiftPx) - both otherwise leave Inverter's
+  // bottom border at the identical pixel, and the islanding edge then runs
+  // straight down through Junction's position before bending into Backup,
+  // so without this offset the two edges draw on top of each other,
+  // making an inverter-fed Backup indistinguishable from a grid-bypassed
+  // one. Junction/Load are shifted right by the same amount (via
+  // redrawLines, before this runs) so the bus edge - now anchored on
+  // Junction's shifted top border - stays a straight vertical line rather
+  // than picking up a spurious bend of its own.
+  function computeEdges(islandingShiftPx) {
     var pv = byId('node-pv'), battery = byId('node-battery'), inverter = byId('node-inverter'),
         junction = byId('node-junction'), backup = byId('node-backup'), grid = byId('node-grid'), load = byId('node-load');
+    var busExit = sideAnchor(inverter, 'bottom');
     return {
       pv: { p0: sideAnchor(pv, 'bottom'), dir0: 'down', p1: sideAnchor(inverter, 'top'), dir1: enterDir('top') },
       battery: { p0: sideAnchor(battery, 'right'), dir0: 'right', p1: sideAnchor(inverter, 'left'), dir1: enterDir('left') },
-      bus: { p0: sideAnchor(inverter, 'bottom'), dir0: 'down', p1: sideAnchor(junction, 'top'), dir1: enterDir('top') },
+      bus: { p0: { x: busExit.x + islandingShiftPx, y: busExit.y }, dir0: 'down', p1: sideAnchor(junction, 'top'), dir1: enterDir('top') },
       grid: { p0: sideAnchor(junction, 'right'), dir0: 'right', p1: sideAnchor(grid, 'left'), dir1: enterDir('left') },
       load: { p0: sideAnchor(junction, 'bottom'), dir0: 'down', p1: sideAnchor(load, 'top'), dir1: enterDir('top') },
       backupBypass: { p0: sideAnchor(junction, 'left'), dir0: 'left', p1: sideAnchor(backup, 'right'), dir1: enterDir('right') },
-      backupIslanding: { p0: sideAnchor(inverter, 'bottom'), dir0: 'down', p1: sideAnchor(backup, 'right'), dir1: enterDir('right') },
+      backupIslanding: { p0: { x: busExit.x - islandingShiftPx, y: busExit.y }, dir0: 'down', p1: sideAnchor(backup, 'right'), dir1: enterDir('right') },
     };
   }
 
@@ -362,7 +374,21 @@
   function redrawLines(calc, data) {
     var svg = byId('diagram-svg');
     while (svg.firstChild) svg.removeChild(svg.firstChild);
-    var edges = computeEdges();
+
+    // Junction and Load both sit in Inverter's own column; whenever Backup
+    // is fed straight from the Inverter (islanding - see
+    // calc.backupIslandingShiftPx), shift them right by the same amount
+    // computeEdges() offsets the bus/islanding exit points by, so the bus
+    // edge stays straight and the two edges run side by side instead of on
+    // top of each other. Applied before computeEdges() so it reads the
+    // already-shifted live positions; resets to no shift otherwise, so
+    // reconnecting to the grid-bypass path snaps the layout back.
+    var islandingShiftPx = calc.backupIslandingShiftPx(data);
+    var shiftTransform = islandingShiftPx ? 'translateX(' + islandingShiftPx + 'px)' : '';
+    byId('node-junction').style.transform = shiftTransform;
+    byId('node-load').style.transform = shiftTransform;
+
+    var edges = computeEdges(islandingShiftPx);
     var e = calc.edgeStates(data);
 
     drawEdgeState(svg, edges.pv, e.pv);
