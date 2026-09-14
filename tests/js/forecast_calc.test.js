@@ -1,13 +1,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  solcastPeriodToX, aggregateSolcastHourly,
+  aggregateSolcastHourly,
 } = require('../../static/js/forecast-calc.js');
-
-test('solcastPeriodToX converts HH:MM to a fractional hour', () => {
-  assert.equal(solcastPeriodToX('14:00'), 14);
-  assert.equal(solcastPeriodToX('14:30'), 14.5);
-});
 
 test('aggregateSolcastHourly sums each hour\'s two 30-minute periods', () => {
   const periods = [

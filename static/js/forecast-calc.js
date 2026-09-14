@@ -4,16 +4,15 @@
 // <script> in forecast.html (browser global ForecastCalc), and required
 // directly in tests (Node's CommonJS module.exports below).
 
-function solcastPeriodToX(hhmm) {
-  const [h, m] = hhmm.split(':').map(Number);
-  return h + m / 60;
-}
-
-// Sums each hour's two 30-minute Solcast periods into one hourly row - the
-// table shows hourly figures even though the chart (forecast.html) plots
-// Solcast at its native 30-minute resolution. A missing half (e.g. the
-// very first/last period of a fetch window) is treated as 0, same
-// convention forecast.py/solcast.py already use for a missing orientation.
+// Sums each hour's two 30-minute Solcast periods into one hourly row - both
+// the table and the chart (forecast.html) render Solcast at this hourly
+// resolution, even though the underlying data is fetched/stored at
+// Solcast's native 30-minute period (see
+// docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md §1's
+// amendment for why the chart no longer plots the native resolution
+// directly). A missing half (e.g. the very first/last period of a fetch
+// window) is treated as 0, same convention forecast.py/solcast.py already
+// use for a missing orientation.
 function aggregateSolcastHourly(periods) {
   const byHour = {};
   for (const p of periods) {
@@ -27,7 +26,7 @@ function aggregateSolcastHourly(periods) {
   return Object.keys(byHour).sort().map(h => byHour[h]);
 }
 
-const ForecastCalc = { solcastPeriodToX, aggregateSolcastHourly };
+const ForecastCalc = { aggregateSolcastHourly };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = ForecastCalc;
 } else {
