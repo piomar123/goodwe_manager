@@ -25,6 +25,13 @@ from rce import parse_date
 # place: this constant.
 HOURLY_VALUE_TO_KWH = 1
 
+# The app's east+west PV string assumption, centralized here (forecast.py
+# is the module that actually talks to Meteosource per-orientation) rather
+# than in main.py, so both the scheduled prefetch (forecast_prefetch.py)
+# and main.py's on-demand fallback fetch share one implementation instead
+# of duplicating the east+west sum.
+ORIENTATIONS = (90, 270)
+
 
 def _fetch_pv_production_forecast_raw(date, orientation):
     """Scrape meteosource.com and return its raw per-hour entries: list of
@@ -93,6 +100,22 @@ def fetch_pv_production_forecast_hourly_kwh(date, orientation):
     return [(entry['date'], entry['value'] * HOURLY_VALUE_TO_KWH) for entry in data]
 
 
+def fetch_pv_production_forecast_combined_hourly_kwh(date):
+    """Same source as fetch_pv_production_forecast_hourly_kwh, summed
+    across ORIENTATIONS (east+west) into one series. Returns {"HH:00": kwh}
+    - a plain dict keyed by local hour label, ready to hand to
+    forecast_history.write_snapshot. An hour missing from one orientation's
+    series (shouldn't normally happen - see
+    _fetch_pv_production_forecast_local_day_raw) is treated as 0 for that
+    orientation, same as main.py's old per-request merge already did."""
+    by_hour = {}
+    for orientation in ORIENTATIONS:
+        for timestamp_ms, kwh in fetch_pv_production_forecast_hourly_kwh(date, orientation):
+            hour_label = datetime.utcfromtimestamp(timestamp_ms / 1000).strftime('%H:%M')
+            by_hour[hour_label] = round(by_hour.get(hour_label, 0) + kwh, 2)
+    return by_hour
+
+
 async def main():
     date_in = await asyncio.to_thread(input, "Date (or [t]oday, [y]esterday, [n]tomorrow): ")
     date = parse_date(date_in)
@@ -100,7 +123,7 @@ async def main():
     print(f"Fetching forecast for {date_yyyymmdd}")
 
     total_kwh = 0
-    orientations = (90, 270)
+    orientations = ORIENTATIONS
     forecasts = await asyncio.gather(*[asyncio.to_thread(fetch_pv_production_forecast_kwh, date_yyyymmdd, orientation) for orientation in orientations])
     for orientation, forecast in zip(orientations, forecasts):
         total_kwh += forecast
