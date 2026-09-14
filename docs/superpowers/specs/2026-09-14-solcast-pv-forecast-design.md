@@ -1,5 +1,11 @@
 # Solcast PV production forecast — design
 
+> **Amended 2026-09-14** (after live-testing with a real Solcast key): §1's chart now aggregates
+> Solcast to hourly instead of its native 30-minute resolution (fixes a kWh-comparability issue and
+> a Chart.js tooltip misalignment bug), and §3's daily summary gained an accuracy delta against real
+> inverter production. Original implementation (Tasks 1-7, everything except these two amendments)
+> is already committed on this branch.
+
 ## Goal
 
 Add Solcast as a second PV production forecast source alongside the existing Meteosource scrape,
@@ -31,8 +37,9 @@ needs to be re-fetched anywhere near request time to stay useful.
   ([docs.solcast.com.au](https://docs.solcast.com.au/))
 - One call returns a **rolling multi-day forecast** (today + several days ahead), not just one date
   — so one fetch per site refreshes many calendar days at once.
-- Requested at its native **30-minute** period (not aggregated to hourly at fetch time) so the
-  chart can show Solcast at higher resolution than Meteosource/Actual - see §1 and §4.
+- Requested at its native **30-minute** period (not aggregated to hourly at fetch time) - fetched
+  and stored at that resolution for the history's sake, but always aggregated to hourly before
+  display; see §1's amendment for why.
 - Forward-looking only — no historical/past-date data, and a given call only returns periods from
   roughly "now" onward, not the rest of today's already-elapsed periods either. A period outside
   the fetched window (past a call's start time, or beyond how far ahead it returned) simply has no
@@ -56,17 +63,30 @@ Solcast band `order: 3` < Solcast c50 line `order: 2` < Actual `order: -1` (top,
 today). Without explicit `order` values, Chart.js does not use dataset array position for z-order
 once any dataset sets one, so every dataset needs one set explicitly.
 
-**Mixed resolution:** Solcast's line/band plot at its native 30-minute points (48/day) while
-Meteosource's bars and the Actual line stay hourly (24/day) - Solcast is genuinely higher-resolution
-data and the chart should show that instead of throwing it away. This works on the same linear,
-fractional x-axis already used for bar/line alignment (see `forecast.html`'s existing
-hour-as-numeric-axis approach): a 14:30 Solcast point sits at `x = 14.5`, same axis Meteosource's
-bar at hour 14 already spans `[14, 15)` on.
+**Uniform hourly resolution (amended 2026-09-14, after live testing):** the original design plotted
+Solcast at its native 30-minute points (48/day) while Meteosource's bars and the Actual line stayed
+hourly (24/day). Live testing against a real Solcast key surfaced two problems this caused: (1) a
+30-minute period's kWh is naturally half of an hourly bar's kWh for the same average power, making
+Solcast look artificially smaller than Meteosource/Actual at a glance even when the underlying power
+forecast agreed; and (2) Chart.js's `interaction: {mode: 'index'}` tooltip aligns datasets by array
+*index*, not by x-value - with Solcast holding 48 points against the other two datasets' 24, the
+tooltip's `dataIndex` lookup picked mismatched hours across series.
+
+Solcast's chart datasets (band + c50 line) are now built from the same hourly-aggregated data as
+the table (`ForecastCalc.aggregateSolcastHourly`, already used there), plotted at `x = idx + 0.5`
+- the same points Meteosource's bar uses. All three chart series now share one 24-point index
+space, fixing both problems: kWh values are directly comparable (every series is a full-hour sum),
+and tooltip alignment is correct again. Raw 30-minute Solcast data is still fetched and stored in
+`forecast_history` unchanged (see the free-tier facts above) - only the chart/table's rendering
+resolution changed, not what's persisted. `ForecastCalc.solcastPeriodToX`, which computed the old
+native-resolution x positions, is removed as dead code.
 
 A working mockup comparing this against two rejected alternatives (three plain lines; c50-as-bars
 with error-bar whiskers) lives in `docs/superpowers/mockups/solcast-chart-options/` (not committed
 - see that directory's own throwaway-mockup convention already used by
-`live-power-flow-dashboard-mockup*.html`).
+`live-power-flow-dashboard-mockup*.html`). That mockup predates the resolution amendment above and
+still shows the rejected native-30-minute rendering for the chart shape/z-order comparison itself -
+the shape (band + c50 line, same z-order) is unchanged by this amendment, only the x-positions are.
 
 ### 2. Table columns
 
@@ -91,6 +111,27 @@ Meteosource: X kWh · Solcast: Y (Z-W) kWh
 ```
 
 Z-W is Solcast's c10-c90 range for the day total.
+
+**Accuracy delta (amended 2026-09-14, after live testing):** when the viewed date is a **fully
+elapsed past day** (strictly before today) **and** has all 24 actual hours recorded (no
+inverter-downtime gaps that day), each source's total also shows its delta against real measured
+production - the app's own inverter telemetry (`_get_actual_hourly_pv_kwh`, the same data backing
+the existing "Actual" chart line/table column), not a second Solcast API call. This was chosen over
+fetching Solcast's `estimated_actuals` endpoint specifically because real inverter data is already
+fetched, stored, and free - spending part of the 10-calls/day Solcast budget on a second estimate to
+compare against a forecast, when a real measurement is sitting right there, added cost for no
+accuracy benefit. `forecast_prefetch.py`'s schedule and call budget are unchanged by this addition.
+
+```
+Meteosource: X kWh (Δ +N% vs actual) · Solcast: Y (Z-W) kWh (Δ +N% vs actual)
+```
+
+`Δ = round((forecast_total - actual_total) / actual_total * 100)`, signed (a positive Δ means the
+forecast overestimated; negative means it underestimated). On any date that doesn't meet the
+"fully elapsed, no gaps" condition above (today, future dates, or a past date with incomplete
+telemetry), the summary falls back to the plain `Meteosource: X kWh · Solcast: Y (Z-W) kWh` form
+with no `Δ` - showing a delta against an incomplete or nonexistent actual total would be misleading
+rather than informative.
 
 ### 4. Data model: fetch history, not a TTL cache
 
@@ -213,3 +254,7 @@ here reads or displays the key's value.
 - Dynamic (season-aware) prefetch slot times based on real sunrise/sunset - the 4 fixed times are a
   reasonable static approximation; revisit only if real usage shows it matters.
 - Automating Solcast rooftop site creation via its API.
+- Fetching Solcast's `estimated_actuals` endpoint - considered for §3's accuracy delta, rejected in
+  favor of the app's own free, already-stored real inverter telemetry (see §3's amendment); revisit
+  only if a future need specifically requires Solcast's own retrospective estimate rather than real
+  measured production (e.g. comparing Solcast's internal forecast-vs-nowcast consistency).
