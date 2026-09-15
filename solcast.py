@@ -63,6 +63,37 @@ def fetch_solcast_forecast_30min(resource_id: str) -> Dict[str, Dict[str, Dict[s
     return result
 
 
+def fetch_solcast_estimated_actuals_30min(resource_id: str, hours: int = 168) -> Dict[str, Dict[str, float]]:
+    """Calls GET /rooftop_sites/{resource_id}/estimated_actuals at Solcast's
+    native 30-minute period, covering the trailing `hours` hours (max 168 -
+    7 days, Solcast's own cap; a >168 request gets a 400). Returns
+    {"YYYY-MM-DD": {"HH:MM": kwh}} - flat per-period kWh, unlike
+    fetch_solcast_forecast_30min's {c10,c50,c90} nesting, since a historical
+    estimate isn't a probabilistic range. Same period_end-fractional-
+    seconds-strip and period-start-local conversion as
+    fetch_solcast_forecast_30min - see
+    docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md.
+    """
+    api_key = os.environ.get('SOLCAST_API_KEY')
+    assert api_key, "SOLCAST_API_KEY environment variable not set"
+    response = requests.get(
+        f"{SOLCAST_API_BASE}/rooftop_sites/{resource_id}/estimated_actuals",
+        params={'format': 'json', 'period': 'PT30M', 'hours': hours, 'api_key': api_key},
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    result: Dict[str, Dict[str, float]] = {}
+    for period in data.get('estimated_actuals', []):
+        period_end_str = period['period_end'].split('.')[0] + '+00:00'
+        period_end_utc = datetime.fromisoformat(period_end_str)
+        period_start_local = (period_end_utc - timedelta(minutes=30)).astimezone()
+        date_str = period_start_local.strftime('%Y-%m-%d')
+        hhmm = period_start_local.strftime('%H:%M')
+        result.setdefault(date_str, {})[hhmm] = round(period['pv_estimate'] * PERIOD_KW_TO_KWH, 2)
+    return result
+
+
 def sum_sites(*site_forecasts: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Sums 2+ fetch_solcast_forecast_30min() results (east+west) into one
     combined forecast, same nested shape. A date/period present in only
@@ -76,4 +107,23 @@ def sum_sites(*site_forecasts: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[s
                 period_bucket = date_bucket.setdefault(hhmm, {'c10': 0.0, 'c50': 0.0, 'c90': 0.0})
                 for key in ('c10', 'c50', 'c90'):
                     period_bucket[key] = round(period_bucket[key] + values[key], 2)
+    return combined
+
+
+def sum_sites_flat(*site_payloads: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    """Sums 2+ fetch_solcast_estimated_actuals_30min() results (east+west)
+    into one combined payload, same nested {date: {time: kwh}} shape. A
+    date/period present in only some sites sums whichever sites have it,
+    treating a missing site's period as 0kWh - same missing-orientation
+    convention as sum_sites. Kept separate from sum_sites rather than
+    generalizing one function across both shapes - sum_sites is typed
+    specifically around {c10,c50,c90} and the summing loop itself is three
+    lines, so a shape-detection branch would add more complexity than it
+    removes."""
+    combined: Dict[str, Dict[str, float]] = {}
+    for site in site_payloads:
+        for date_str, periods in site.items():
+            date_bucket = combined.setdefault(date_str, {})
+            for hhmm, kwh in periods.items():
+                date_bucket[hhmm] = round(date_bucket.get(hhmm, 0.0) + kwh, 2)
     return combined
