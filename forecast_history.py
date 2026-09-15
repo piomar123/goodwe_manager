@@ -85,9 +85,12 @@ def get_snapshot(conn: sqlite3.Connection, source: str, date: str, fetched_at: i
 
 
 def get_fetch_times(conn: sqlite3.Connection, date: str) -> List[int]:
-    """Distinct fetched_at values across BOTH sources for `date`, newest
-    first - backs the single shared fetch-time dropdown (both sources fetch
-    on the same schedule, so in practice they share timestamps)."""
+    """Distinct fetched_at values across every source for `date`, newest
+    first - backs the single shared fetch-time dropdown. Sources are
+    fetched independently (see forecast_prefetch.py's wake schedule) and do
+    not actually share timestamps in practice, despite feeding one shared
+    dropdown - selecting a timestamp only one source has data for is a
+    known, pre-existing UX gap (not addressed here)."""
     rows = conn.execute(
         "SELECT DISTINCT fetched_at FROM forecast_snapshots WHERE date = ? ORDER BY fetched_at DESC",
         (date,),
