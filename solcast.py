@@ -8,10 +8,21 @@ docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md.
 import os
 from datetime import datetime, timedelta
 from typing import Dict
+from zoneinfo import ZoneInfo
 
 import requests
 
 SOLCAST_API_BASE = 'https://api.solcast.com.au'
+
+# The PV site is a single fixed physical location in Poland (see PV_LAT/
+# PV_LON's real-world defaults, and the RCE-price/PGE-tariff logic
+# elsewhere, which already assume Poland) - period_end is converted to
+# *this* timezone explicitly, not datetime.astimezone()'s implicit "the
+# OS/process's own timezone". Relying on the ambient OS timezone silently
+# passed local runs (developer machines here happen to be set to CET/CEST)
+# but failed on CI runners (UTC by default), producing HH:MM buckets 2
+# hours off in summer - caught via a real CI failure, not by design.
+SITE_TIMEZONE = ZoneInfo('Europe/Warsaw')
 
 # Solcast's rooftop_sites/forecasts pv_estimate*/pv_estimate10/pv_estimate90
 # fields are documented as average power (kW) over the period, not energy
@@ -30,9 +41,9 @@ def fetch_solcast_forecast_30min(resource_id: str) -> Dict[str, Dict[str, Dict[s
     kwh, "c90": kwh}}} covering whatever calendar dates Solcast's rolling,
     forward-looking-from-call-time forecast returned - there is no
     date/count guarantee here, callers just use whatever comes back.
-    HH:MM is each period's *start* time, in local time (period_end from the
-    API, a real UTC ISO8601 timestamp - unlike Meteosource's quirky epoch
-    field - minus 30 minutes, converted via datetime.astimezone()).
+    HH:MM is each period's *start* time, in the site's local time (period_end
+    from the API, a real UTC ISO8601 timestamp - unlike Meteosource's quirky
+    epoch field - minus 30 minutes, converted to SITE_TIMEZONE).
     """
     api_key = os.environ.get('SOLCAST_API_KEY')
     assert api_key, "SOLCAST_API_KEY environment variable not set"
@@ -52,7 +63,7 @@ def fetch_solcast_forecast_30min(resource_id: str) -> Dict[str, Dict[str, Dict[s
         # is irrelevant at 30-minute resolution.
         period_end_str = period['period_end'].split('.')[0] + '+00:00'
         period_end_utc = datetime.fromisoformat(period_end_str)
-        period_start_local = (period_end_utc - timedelta(minutes=30)).astimezone()
+        period_start_local = (period_end_utc - timedelta(minutes=30)).astimezone(SITE_TIMEZONE)
         date_str = period_start_local.strftime('%Y-%m-%d')
         hhmm = period_start_local.strftime('%H:%M')
         result.setdefault(date_str, {})[hhmm] = {
@@ -70,7 +81,7 @@ def fetch_solcast_estimated_actuals_30min(resource_id: str, hours: int = 168) ->
     {"YYYY-MM-DD": {"HH:MM": kwh}} - flat per-period kWh, unlike
     fetch_solcast_forecast_30min's {c10,c50,c90} nesting, since a historical
     estimate isn't a probabilistic range. Same period_end-fractional-
-    seconds-strip and period-start-local conversion as
+    seconds-strip and period-start-in-SITE_TIMEZONE conversion as
     fetch_solcast_forecast_30min - see
     docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md.
     """
@@ -87,7 +98,7 @@ def fetch_solcast_estimated_actuals_30min(resource_id: str, hours: int = 168) ->
     for period in data.get('estimated_actuals', []):
         period_end_str = period['period_end'].split('.')[0] + '+00:00'
         period_end_utc = datetime.fromisoformat(period_end_str)
-        period_start_local = (period_end_utc - timedelta(minutes=30)).astimezone()
+        period_start_local = (period_end_utc - timedelta(minutes=30)).astimezone(SITE_TIMEZONE)
         date_str = period_start_local.strftime('%Y-%m-%d')
         hhmm = period_start_local.strftime('%H:%M')
         result.setdefault(date_str, {})[hhmm] = round(period['pv_estimate'] * PERIOD_KW_TO_KWH, 2)
