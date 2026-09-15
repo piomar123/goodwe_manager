@@ -684,9 +684,11 @@ def get_forecast_hourly_json():
         solcast_periods = _read_forecast_payload(conn, 'solcast', date_yyyymmdd, fetched_at)
         # Solcast's estimated_actuals is only ever meaningful for a fully
         # elapsed past day (see
-        # docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md
-        # §4) - skip the read entirely for today/future dates rather than
-        # showing an estimate of an estimate next to the real Actual line.
+        # https://github.com/piomar123/goodwe_manager/pull/26 for the
+        # design rationale - the design spec doc itself was removed from
+        # the tree, but is still visible in that PR's history) - skip the
+        # read entirely for today/future dates rather than showing an
+        # estimate of an estimate next to the real Actual line.
         solcast_actuals_periods = (
             _read_forecast_payload(conn, 'solcast_actuals', date_yyyymmdd, fetched_at)
             if is_past_date else {}

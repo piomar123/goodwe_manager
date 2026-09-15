@@ -3,10 +3,10 @@ forecast_prefetch.py
 Background thread that refreshes all three PV forecast/actuals sources
 (Meteosource forecast, Solcast forecast, Solcast estimated_actuals) on two
 independent schedules, writing every fetch into forecast_history's snapshot
-table - see
-docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md section 5
-and docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md
-section 3 (this schedule).
+table - see https://github.com/piomar123/goodwe_manager/pull/26 for the
+design rationale (both the original schedule and this one's rework) - the
+design spec docs were removed from the tree, but are still visible in that
+PR's history.
 
 Forecast wake-times (Meteosource + Solcast forecast, both orientations):
 06:00 (dawn, satellite imagery becomes usable), 11:00 (fresh, with margin

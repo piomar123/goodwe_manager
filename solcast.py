@@ -2,8 +2,9 @@
 solcast.py
 Fetches PV production forecasts from Solcast's free Hobbyist API
 (https://docs.solcast.com.au/). Free tier: 10 calls/day, max 2 rooftop
-sites, no historical data - see
-docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md.
+sites - see https://github.com/piomar123/goodwe_manager/pull/26 for the
+design rationale (the design spec doc itself was removed from the tree,
+but is still visible in that PR's history).
 """
 import os
 from datetime import datetime, timedelta
@@ -83,7 +84,9 @@ def fetch_solcast_estimated_actuals_30min(resource_id: str, hours: int = 168) ->
     estimate isn't a probabilistic range. Same period_end-fractional-
     seconds-strip and period-start-in-SITE_TIMEZONE conversion as
     fetch_solcast_forecast_30min - see
-    docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md.
+    https://github.com/piomar123/goodwe_manager/pull/26 for the design
+    rationale (the design spec doc itself was removed from the tree, but is
+    still visible in that PR's history).
     """
     api_key = os.environ.get('SOLCAST_API_KEY')
     assert api_key, "SOLCAST_API_KEY environment variable not set"

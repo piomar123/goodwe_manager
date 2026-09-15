@@ -8,9 +8,10 @@
 // the table and the chart (forecast.html) render Solcast at this hourly
 // resolution, even though the underlying data is fetched/stored at
 // Solcast's native 30-minute period (see
-// docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md §1's
-// amendment for why the chart no longer plots the native resolution
-// directly). A missing half (e.g. the very first/last period of a fetch
+// https://github.com/piomar123/goodwe_manager/pull/26 for why the chart no
+// longer plots the native resolution directly - the design spec doc itself
+// was removed from the tree, but is still visible in that PR's history).
+// A missing half (e.g. the very first/last period of a fetch
 // window) is treated as 0, same convention forecast.py/solcast.py already
 // use for a missing orientation.
 function aggregateSolcastHourly(periods) {
@@ -31,7 +32,9 @@ function aggregateSolcastHourly(periods) {
 // is a single value, not a {c10,c50,c90} range) - kept as a separate
 // function rather than generalizing one aggregator across both shapes, for
 // the same reason solcast.py's sum_sites/sum_sites_flat stay separate. See
-// docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md §5.
+// https://github.com/piomar123/goodwe_manager/pull/26 for the design
+// rationale (the design spec doc itself was removed from the tree, but is
+// still visible in that PR's history).
 function aggregateSolcastActualsHourly(periods) {
   const byHour = {};
   for (const p of periods) {

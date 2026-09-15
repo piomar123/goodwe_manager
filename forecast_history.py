@@ -3,9 +3,10 @@ forecast_history.py
 SQLite-backed fetch history for PV production forecasts (forecast_history.db)
 - one row per distinct forecast snapshot per (source, date), instead of a
 single overwritten cache entry. See
-docs/superpowers/specs/2026-09-14-solcast-pv-forecast-design.md section 4
-for the design rationale (why history, not a TTL cache; why the merge in
-get_latest_merged is needed).
+https://github.com/piomar123/goodwe_manager/pull/26 for the design rationale
+(why history, not a TTL cache; why the merge in get_latest_merged is
+needed) - the design spec doc itself was removed from the tree, but is
+still visible in that PR's history.
 """
 import json
 import sqlite3
