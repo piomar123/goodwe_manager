@@ -6,6 +6,12 @@
 > inverter production and now shows Meteosource/Solcast on separate lines instead of one
 > `·`-joined line. Original implementation (Tasks 1-7, everything except these amendments) is
 > already committed on this branch.
+>
+> **Superseded 2026-09-15:** see
+> `docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md` - §5's fetch schedule
+> (including the `rce_prefetch.WAKE_TIME`-aligned slot) is replaced by that spec's new wake-time
+> schedule, and "Out of scope"'s rejection of the `estimated_actuals` endpoint is revisited there
+> (for a different purpose than the one rejected here - see that spec's Goal section).
 
 ## Goal
 
