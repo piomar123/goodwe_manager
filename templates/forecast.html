@@ -155,13 +155,21 @@
 
       const solcastHourly = ForecastCalc.aggregateSolcastHourly(data.solcast.periods);
       const solcastByHour = Object.fromEntries(solcastHourly.map(h => [h.time, h]));
+      const solcastActualsHourly = ForecastCalc.aggregateSolcastActualsHourly(data.solcast_actuals.periods);
+      const solcastActualsByHour = Object.fromEntries(solcastActualsHourly.map(h => [h.time, h]));
 
-      const columns = ['Hour', 'Meteosource', 'Solcast', 'Actual', 'Actual cumul.'];
+      const columns = ['Hour', 'Meteosource', 'Solcast'];
+      if (data.solcast_actuals.available) columns.push('Solcast Estimated Actual');
+      columns.push('Actual', 'Actual cumul.');
       let cumActualKwh = 0;
       const rows = hourLabels.map((t, idx) => {
         const row = { Hour: t, Meteosource: (meteosourceByHour[t] || 0).toFixed(2) };
         const s = solcastByHour[t];
         row['Solcast'] = s ? `${s.c50.toFixed(2)} (${s.c10.toFixed(2)}–${s.c90.toFixed(2)})` : '—';
+        if (data.solcast_actuals.available) {
+          const sa = solcastActualsByHour[t];
+          row['Solcast Estimated Actual'] = sa ? sa.kwh.toFixed(2) : '—';
+        }
         if (actualByHour[t] != null) {
           cumActualKwh += actualByHour[t];
           row['Actual'] = actualByHour[t].toFixed(2);
@@ -195,6 +203,34 @@
       // faint dashed line did.
 
       const c50Color = '#e0a458';
+      const solcastActualsColor = ChartTheme.seriesColor(3); // teal - distinct from Meteosource's blue-purple, Solcast's amber, and Actual's green
+
+      function solcastActualsDatasets() {
+        if (!data.solcast_actuals.available) return [];
+        // Hourly-aggregated, same x-positions (idx + 0.5) as Meteosource/
+        // Solcast forecast - see
+        // docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md
+        // §5. Dashed border to visually read as "estimate", not a
+        // measurement - deliberately its own color/label (not reusing the
+        // real "Actual" line's green) so the two are never confused. A
+        // missing hour is pinned to 0, same convention solcastDatasets()
+        // uses for the same reason (a line dataset needs a numeric y at
+        // every x).
+        const points = hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastActualsByHour[t] || {}).kwh ?? 0 }));
+        return [
+          {
+            type: 'line',
+            label: 'Solcast Estimated Actual',
+            data: points,
+            borderColor: solcastActualsColor,
+            borderDash: [6, 4],
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            order: 1, // above Solcast forecast (order 2/3), below real Actual (order -1)
+          },
+        ];
+      }
 
       function meteosourceBarDataset() {
         return {
@@ -324,7 +360,7 @@
       function buildChart() {
         if (chart) chart.destroy();
 
-        const datasets = [meteosourceBarDataset(), ...solcastDatasets(), actualLineDataset()];
+        const datasets = [meteosourceBarDataset(), ...solcastDatasets(), ...solcastActualsDatasets(), actualLineDataset()];
 
         // A real numeric axis so forecast bars (centered at hour+0.5) and
         // the line (points at the interval's left edge, hour) can genuinely
