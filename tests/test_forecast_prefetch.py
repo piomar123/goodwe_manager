@@ -20,6 +20,23 @@ class NextWakeTimeTest(unittest.TestCase):
         self.assertEqual(result, datetime(2026, 1, 2, 6, 0))
 
 
+class LastWakeTimeTest(unittest.TestCase):
+    def test_picks_the_most_recent_slot_already_passed_today(self):
+        now = datetime(2026, 1, 1, 12, 0)
+        result = forecast_prefetch.last_wake_time(now, wake_times=(dtime(6, 0), dtime(10, 0), dtime(14, 15), dtime(18, 0)))
+        self.assertEqual(result, datetime(2026, 1, 1, 10, 0))
+
+    def test_rolls_back_to_yesterdays_last_slot_before_any_slot_today(self):
+        now = datetime(2026, 1, 1, 3, 0)
+        result = forecast_prefetch.last_wake_time(now, wake_times=(dtime(6, 0), dtime(10, 0), dtime(14, 15), dtime(18, 0)))
+        self.assertEqual(result, datetime(2025, 12, 31, 18, 0))
+
+    def test_a_slot_exactly_at_now_counts_as_already_passed(self):
+        now = datetime(2026, 1, 1, 6, 0)
+        result = forecast_prefetch.last_wake_time(now, wake_times=(dtime(6, 0), dtime(10, 0)))
+        self.assertEqual(result, datetime(2026, 1, 1, 6, 0))
+
+
 class WakeScheduleTest(unittest.TestCase):
     def test_forecast_wake_times_has_three_slots(self):
         self.assertEqual(len(forecast_prefetch.FORECAST_WAKE_TIMES), 3)
@@ -93,6 +110,68 @@ class FetchAndStoreTest(unittest.TestCase):
             forecast_history.get_snapshot(self.conn, 'solcast_actuals', '2026-01-01', times[0]),
             {'07:00': 0.75},
         )
+
+    @patch.dict(os.environ, {'SOLCAST_SITE_EAST_ID': 'east-1', 'SOLCAST_SITE_WEST_ID': 'west-1'})
+    @patch('forecast_prefetch.solcast.fetch_solcast_estimated_actuals_30min')
+    def test_fetch_and_store_solcast_actuals_with_max_date_excludes_dates_at_or_after_it(self, mock_fetch):
+        def fake_fetch(resource_id):
+            return {'2026-01-01': {'07:00': 0.5}, '2026-01-02': {'07:00': 0.5}}
+        mock_fetch.side_effect = fake_fetch
+
+        forecast_prefetch.fetch_and_store_solcast_actuals(self.conn, max_date='2026-01-02')
+
+        self.assertEqual(forecast_history.get_latest_merged(self.conn, 'solcast_actuals', '2026-01-01'), {'07:00': 1.0})
+        self.assertEqual(forecast_history.get_latest_merged(self.conn, 'solcast_actuals', '2026-01-02'), {})
+
+
+class RunCatchUpTest(unittest.TestCase):
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.db_path)
+        self.conn = forecast_history.init_db(self.db_path)
+        self.now = datetime(2026, 1, 2, 8, 0)  # between the 06:00 and 11:00 forecast slots
+
+    def tearDown(self):
+        self.conn.close()
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                os.remove(path)
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_fetches_everything_when_nothing_is_fresh(self, mock_meteosource, mock_solcast, mock_actuals):
+        forecast_prefetch.run_catch_up(self.conn, self.now)
+        mock_meteosource.assert_called_once_with(self.conn, '2026-01-02')
+        mock_solcast.assert_called_once_with(self.conn)
+        mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02')
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_skips_sources_already_fresh_since_the_last_passed_wake_time(self, mock_meteosource, mock_solcast, mock_actuals):
+        # A snapshot written after last_wake_time(now, FORECAST_WAKE_TIMES)
+        # (today's 06:00) means meteosource/solcast are fresh; only actuals
+        # (last passed slot: yesterday's 23:00) is still stale.
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-02', {'07:00': 1.0}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
+        forecast_history.write_snapshot(self.conn, 'solcast', '2026-01-02', {'07:00': {'c10': 1, 'c50': 2, 'c90': 3}}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
+
+        forecast_prefetch.run_catch_up(self.conn, self.now)
+
+        mock_meteosource.assert_not_called()
+        mock_solcast.assert_not_called()
+        mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02')
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_fetch_failure_is_logged_and_does_not_stop_the_other_catch_up_fetches(self, mock_meteosource, mock_solcast, mock_actuals):
+        mock_meteosource.side_effect = RuntimeError("boom")
+        forecast_prefetch.run_catch_up(self.conn, self.now)
+        mock_solcast.assert_called_once()
+        mock_actuals.assert_called_once()
 
 
 if __name__ == '__main__':

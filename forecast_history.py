@@ -99,6 +99,22 @@ def get_fetch_times(conn: sqlite3.Connection, date: str) -> List[int]:
     return [r[0] for r in rows]
 
 
+def has_fetched_since(conn: sqlite3.Connection, source: str, since_epoch: int) -> bool:
+    """True if `source` has any snapshot (any date) with fetched_at >=
+    since_epoch. Checked across all dates rather than one - a single fetch
+    call can write snapshots for several dates at once (e.g. Solcast
+    estimated_actuals' 7-day trailing window), so "was this source touched
+    recently at all" is the meaningful question, not "does today have a
+    row". Backs forecast_prefetch.py's startup catch-up: a quick restart
+    minutes after a real fetch finds this True and skips the extra call; a
+    genuine cold start finds it False and fetches immediately."""
+    row = conn.execute(
+        "SELECT 1 FROM forecast_snapshots WHERE source = ? AND fetched_at >= ? LIMIT 1",
+        (source, since_epoch),
+    ).fetchone()
+    return row is not None
+
+
 def get_latest_merged(conn: sqlite3.Connection, source: str, date: str) -> Dict:
     """The default ("latest") read: merges every snapshot for (source,
     date) period-by-period, oldest to newest, so a newer snapshot's periods

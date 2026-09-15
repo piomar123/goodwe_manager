@@ -78,6 +78,29 @@ class ForecastHistoryTest(unittest.TestCase):
     def test_get_latest_merged_with_no_snapshots_returns_empty_dict(self):
         self.assertEqual(forecast_history.get_latest_merged(self.conn, 'solcast', '2026-01-01'), {})
 
+    def test_has_fetched_since_true_when_a_snapshot_is_at_or_after_the_threshold(self):
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=2000)
+        self.assertTrue(forecast_history.has_fetched_since(self.conn, 'meteosource', 2000))
+        self.assertTrue(forecast_history.has_fetched_since(self.conn, 'meteosource', 1000))
+
+    def test_has_fetched_since_false_when_latest_snapshot_is_older_than_the_threshold(self):
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=1000)
+        self.assertFalse(forecast_history.has_fetched_since(self.conn, 'meteosource', 2000))
+
+    def test_has_fetched_since_false_when_source_has_no_snapshots_at_all(self):
+        self.assertFalse(forecast_history.has_fetched_since(self.conn, 'meteosource', 0))
+
+    def test_has_fetched_since_checks_across_all_dates_for_the_source(self):
+        # A single fetch call writes snapshots for several dates at once
+        # (e.g. Solcast actuals' 7-day trailing window) - a snapshot for
+        # any date should count, not just "today".
+        forecast_history.write_snapshot(self.conn, 'solcast_actuals', '2026-01-03', {'07:00': 0.5}, now=3000)
+        self.assertTrue(forecast_history.has_fetched_since(self.conn, 'solcast_actuals', 3000))
+
+    def test_has_fetched_since_is_source_specific(self):
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=2000)
+        self.assertFalse(forecast_history.has_fetched_since(self.conn, 'solcast', 1000))
+
 
 if __name__ == '__main__':
     unittest.main()

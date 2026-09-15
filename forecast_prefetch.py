@@ -34,11 +34,24 @@ within the same slot - retrying would spend quota meant for the next slot,
 and the read path (forecast_history.get_latest_merged) already tolerates a
 missing/stale slot gracefully, same "safe to fail" framing as
 rce_prefetch.py.
+
+Startup catch-up (run_catch_up): unlike rce_prefetch.py's read path (which
+falls back to a live fetch on a cache miss), forecast_history.get_latest_merged
+has no such fallback - a cold start (deploy, crash, dev restart) would
+otherwise leave /forecast empty until the next scheduled wake time above.
+ForecastPrefetchThread.run calls run_catch_up once before entering the
+loop: per source, it fetches immediately only if nothing has been written
+since the most recent wake time that should already have fired, so a
+quick restart costs nothing extra and only a genuine cold start spends
+quota. Solcast actuals catch-up never writes today - see
+fetch_and_store_solcast_actuals's max_date - to avoid ever permanently
+stranding a day with only a partial snapshot.
 """
 import logging
 import os
 import threading
 from datetime import datetime, time as dtime, timedelta
+from typing import Optional
 
 import forecast
 import forecast_history
@@ -57,6 +70,21 @@ def next_wake_time(now: datetime, wake_times=FORECAST_WAKE_TIMES) -> datetime:
     return now + timedelta(seconds=min(seconds_to_each))
 
 
+def last_wake_time(now: datetime, wake_times=FORECAST_WAKE_TIMES) -> datetime:
+    """The most recent occurrence of any of `wake_times` at-or-before `now`
+    - today's if one has already happened (or is happening right now),
+    else the last one from yesterday. Mirrors next_wake_time's "soonest
+    strictly after" but looking backward - used by the startup catch-up to
+    find the threshold a source's last snapshot should be newer than."""
+    candidates = []
+    for wake_time in wake_times:
+        candidate = datetime.combine(now.date(), wake_time)
+        if candidate > now:
+            candidate -= timedelta(days=1)
+        candidates.append(candidate)
+    return max(candidates)
+
+
 def fetch_and_store_meteosource(conn, date_yyyymmdd: str) -> None:
     payload = forecast.fetch_pv_production_forecast_combined_hourly_kwh(date_yyyymmdd)
     forecast_history.write_snapshot(conn, 'meteosource', date_yyyymmdd, payload)
@@ -70,12 +98,62 @@ def fetch_and_store_solcast(conn) -> None:
         forecast_history.write_snapshot(conn, 'solcast', date_str, payload)
 
 
-def fetch_and_store_solcast_actuals(conn) -> None:
+def fetch_and_store_solcast_actuals(conn, max_date: Optional[str] = None) -> None:
+    """`max_date` (YYYY-MM-DD), if given, skips writing any date >=
+    max_date - used by run_catch_up (with max_date=today) so a restart
+    mid-day never writes a partial "today" snapshot: if that were the only
+    actuals fetch of the day and the service went down again before the
+    normal 23:00 slot, the day would be stuck permanently incomplete once
+    it's displayed as "yesterday" (get_latest_merged only has that partial
+    snapshot to merge from). The regular scheduled call (inside
+    ForecastPrefetchThread.run's loop) always omits max_date - by 23:00
+    "today" is complete-enough (see module docstring), so today's actuals
+    stay the normal slot's job, never catch-up's."""
     east = solcast.fetch_solcast_estimated_actuals_30min(os.environ['SOLCAST_SITE_EAST_ID'])
     west = solcast.fetch_solcast_estimated_actuals_30min(os.environ['SOLCAST_SITE_WEST_ID'])
     combined_by_date = solcast.sum_sites_flat(east, west)
     for date_str, payload in combined_by_date.items():
+        if max_date is not None and date_str >= max_date:
+            continue
         forecast_history.write_snapshot(conn, 'solcast_actuals', date_str, payload)
+
+
+def run_catch_up(conn, now: datetime) -> None:
+    """Runs once at thread startup, before the normal wake-time loop below:
+    fetches whatever's stale so a restart (deploy, crash, dev testing)
+    doesn't leave /forecast empty until the next scheduled wake time.
+    Per-source, "stale" means no snapshot has been written since the most
+    recent wake time that should already have fired (last_wake_time) - a
+    quick restart minutes after a real fetch finds everything fresh and
+    fetches nothing extra; a genuine cold start (long downtime, fresh
+    install) fetches whatever's missing once. Solcast actuals catch-up
+    always passes max_date=today (see fetch_and_store_solcast_actuals) -
+    today's actuals stay the normal 23:00 slot's job. Failures are logged
+    and don't block the other catch-up fetches, same "safe to fail"
+    framing as the scheduled fetches in the loop below."""
+    today = now.strftime('%Y-%m-%d')
+
+    forecast_threshold = last_wake_time(now, FORECAST_WAKE_TIMES).timestamp()
+    if not forecast_history.has_fetched_since(conn, 'meteosource', forecast_threshold):
+        try:
+            fetch_and_store_meteosource(conn, today)
+            logger.info("Catch-up: fetched Meteosource forecast")
+        except Exception as e:
+            logger.warning(f"Catch-up Meteosource fetch failed: {e}")
+    if not forecast_history.has_fetched_since(conn, 'solcast', forecast_threshold):
+        try:
+            fetch_and_store_solcast(conn)
+            logger.info("Catch-up: fetched Solcast forecast")
+        except Exception as e:
+            logger.warning(f"Catch-up Solcast forecast fetch failed: {e}")
+
+    actuals_threshold = last_wake_time(now, (ACTUALS_WAKE_TIME,)).timestamp()
+    if not forecast_history.has_fetched_since(conn, 'solcast_actuals', actuals_threshold):
+        try:
+            fetch_and_store_solcast_actuals(conn, max_date=today)
+            logger.info("Catch-up: fetched Solcast estimated actuals (through yesterday)")
+        except Exception as e:
+            logger.warning(f"Catch-up Solcast estimated-actuals fetch failed: {e}")
 
 
 class ForecastPrefetchThread(threading.Thread):
@@ -87,6 +165,7 @@ class ForecastPrefetchThread(threading.Thread):
     def run(self):
         conn = forecast_history.init_db(self._db_path)
         try:
+            run_catch_up(conn, datetime.now())
             while not self._should_stop.is_set():
                 now = datetime.now()
                 next_forecast = next_wake_time(now, FORECAST_WAKE_TIMES)
