@@ -676,13 +676,24 @@ def get_forecast_hourly_json():
     fetched_at = request.args.get('fetched_at', type=int)
     logger.debug(f"Fetching hourly forecast JSON for {date_yyyymmdd} (fetched_at={fetched_at})")
 
+    now = datetime.now()
+    is_past_date = date_yyyymmdd < now.strftime('%Y-%m-%d')
+
     with _forecast_history_connection() as conn:
         meteosource = _read_forecast_payload(conn, 'meteosource', date_yyyymmdd, fetched_at)
         solcast_periods = _read_forecast_payload(conn, 'solcast', date_yyyymmdd, fetched_at)
+        # Solcast's estimated_actuals is only ever meaningful for a fully
+        # elapsed past day (see
+        # docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md
+        # §4) - skip the read entirely for today/future dates rather than
+        # showing an estimate of an estimate next to the real Actual line.
+        solcast_actuals_periods = (
+            _read_forecast_payload(conn, 'solcast_actuals', date_yyyymmdd, fetched_at)
+            if is_past_date else {}
+        )
         fetch_times = forecast_history.get_fetch_times(conn, date_yyyymmdd)
 
     actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd)
-    now = datetime.now()
     is_today = date_yyyymmdd == now.strftime('%Y-%m-%d')
     current_hour = now.strftime('%H:00') if is_today else None
     partial_kwh = _get_actual_pv_kwh_so_far_this_hour(now) if is_today else None
@@ -694,6 +705,10 @@ def get_forecast_hourly_json():
         'solcast': {
             'available': bool(solcast_periods),
             'periods': [{'time': t, **v} for t, v in sorted(solcast_periods.items())],
+        },
+        'solcast_actuals': {
+            'available': bool(solcast_actuals_periods),
+            'periods': [{'time': t, 'kwh': kwh} for t, kwh in sorted(solcast_actuals_periods.items())],
         },
         'actual': {
             'hours': [{'time': t, 'kwh': kwh} for t, kwh in sorted(actual_by_hour.items())],

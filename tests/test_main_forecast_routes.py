@@ -112,7 +112,9 @@ class ForecastHourlyJsonRouteTest(unittest.TestCase):
         def fake_merged(conn, source, date):
             if source == 'meteosource':
                 return {'07:00': 1.5}
-            return {'07:00': {'c10': 1.0, 'c50': 2.0, 'c90': 3.0}}
+            elif source == 'solcast':
+                return {'07:00': {'c10': 1.0, 'c50': 2.0, 'c90': 3.0}}
+            return {}
         mock_merged.side_effect = fake_merged
 
         resp = self.client.get('/forecast/hourly.json?date=2026-01-01')
@@ -149,7 +151,11 @@ class ForecastHourlyJsonRouteTest(unittest.TestCase):
         # {"07:00": 1.5} float value if both sources returned the same
         # Meteosource-shaped payload.
         def fake_snapshot(conn, source, date, fetched_at):
-            return {'07:00': 1.5} if source == 'meteosource' else {'07:00': {'c10': 1.0, 'c50': 2.0, 'c90': 3.0}}
+            if source == 'meteosource':
+                return {'07:00': 1.5}
+            elif source == 'solcast':
+                return {'07:00': {'c10': 1.0, 'c50': 2.0, 'c90': 3.0}}
+            return {}
         mock_snapshot.side_effect = fake_snapshot
 
         resp = self.client.get('/forecast/hourly.json?date=2026-01-01&fetched_at=1000')
@@ -157,6 +163,56 @@ class ForecastHourlyJsonRouteTest(unittest.TestCase):
         self.assertEqual(data['meteosource']['hours'], [{'time': '07:00', 'kwh': 1.5}])
         self.assertEqual(data['solcast']['periods'], [{'time': '07:00', 'c10': 1.0, 'c50': 2.0, 'c90': 3.0}])
         mock_snapshot.assert_any_call(unittest.mock.ANY, 'meteosource', '2026-01-01', 1000)
+
+    @patch('main._get_actual_hourly_pv_kwh', return_value={})
+    @patch('main._get_actual_pv_kwh_so_far_this_hour', return_value=None)
+    @patch('main.forecast_history.get_fetch_times', return_value=[])
+    @patch('main.forecast_history.get_latest_merged')
+    def test_returns_solcast_actuals_for_a_past_date(self, mock_merged, mock_fetch_times, mock_partial, mock_actual):
+        def fake_merged(conn, source, date):
+            # meteosource must return non-empty here too, otherwise
+            # _read_forecast_payload's live-fallback fires a real network
+            # call to meteosource.com for this (out-of-range) past date.
+            if source == 'meteosource':
+                return {'07:00': 1.5}
+            elif source == 'solcast_actuals':
+                return {'07:00': 0.75}
+            return {}
+        mock_merged.side_effect = fake_merged
+
+        resp = self.client.get('/forecast/hourly.json?date=2020-01-01')  # safely in the past
+
+        data = resp.get_json()
+        self.assertTrue(data['solcast_actuals']['available'])
+        self.assertEqual(data['solcast_actuals']['periods'], [{'time': '07:00', 'kwh': 0.75}])
+
+    @patch('main._get_actual_hourly_pv_kwh', return_value={})
+    @patch('main._get_actual_pv_kwh_so_far_this_hour', return_value=None)
+    @patch('main.forecast_history.get_fetch_times', return_value=[])
+    @patch('main.forecast_history.get_latest_merged')
+    def test_omits_solcast_actuals_for_todays_date(self, mock_merged, mock_fetch_times, mock_partial, mock_actual):
+        # Even if a snapshot exists (e.g. a stray/manual fetch), today's
+        # date must not surface it - see this plan's Global Constraints and
+        # spec §4's past-dates-only gating.
+        def fake_merged(conn, source, date):
+            # meteosource must return non-empty here too, otherwise
+            # _read_forecast_payload's live-fallback fires a real network
+            # call to meteosource.com.
+            if source == 'meteosource':
+                return {'07:00': 1.5}
+            elif source == 'solcast_actuals':
+                return {'07:00': 0.75}
+            return {}
+        mock_merged.side_effect = fake_merged
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        resp = self.client.get(f'/forecast/hourly.json?date={today}')
+
+        data = resp.get_json()
+        self.assertFalse(data['solcast_actuals']['available'])
+        self.assertEqual(data['solcast_actuals']['periods'], [])
+        for call in mock_merged.call_args_list:
+            self.assertNotEqual(call.args[1], 'solcast_actuals')
 
 
 if __name__ == '__main__':
