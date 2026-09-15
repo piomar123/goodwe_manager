@@ -41,7 +41,8 @@ class FetchSolcastForecast30MinTest(unittest.TestCase):
         solcast.fetch_solcast_forecast_30min('site-123')
         args, kwargs = mock_get.call_args
         self.assertIn('site-123', args[0])
-        self.assertEqual(kwargs['params']['api_key'], 'test-key')
+        self.assertEqual(kwargs['headers']['Authorization'], 'Bearer test-key')
+        self.assertNotIn('api_key', kwargs['params'])
         self.assertEqual(kwargs['params']['period'], 'PT30M')
 
     @patch.dict(os.environ, {}, clear=True)
@@ -104,7 +105,8 @@ class FetchSolcastEstimatedActuals30MinTest(unittest.TestCase):
         args, kwargs = mock_get.call_args
         self.assertIn('site-123', args[0])
         self.assertIn('estimated_actuals', args[0])
-        self.assertEqual(kwargs['params']['api_key'], 'test-key')
+        self.assertEqual(kwargs['headers']['Authorization'], 'Bearer test-key')
+        self.assertNotIn('api_key', kwargs['params'])
         self.assertEqual(kwargs['params']['period'], 'PT30M')
         self.assertEqual(kwargs['params']['hours'], 48)
 

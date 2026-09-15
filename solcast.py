@@ -50,7 +50,8 @@ def fetch_solcast_forecast_30min(resource_id: str) -> Dict[str, Dict[str, Dict[s
     assert api_key, "SOLCAST_API_KEY environment variable not set"
     response = requests.get(
         f"{SOLCAST_API_BASE}/rooftop_sites/{resource_id}/forecasts",
-        params={'format': 'json', 'period': 'PT30M', 'api_key': api_key},
+        params={'format': 'json', 'period': 'PT30M'},
+        headers={'Authorization': f'Bearer {api_key}'},
     )
     response.raise_for_status()
     data = response.json()
@@ -92,7 +93,8 @@ def fetch_solcast_estimated_actuals_30min(resource_id: str, hours: int = 168) ->
     assert api_key, "SOLCAST_API_KEY environment variable not set"
     response = requests.get(
         f"{SOLCAST_API_BASE}/rooftop_sites/{resource_id}/estimated_actuals",
-        params={'format': 'json', 'period': 'PT30M', 'hours': hours, 'api_key': api_key},
+        params={'format': 'json', 'period': 'PT30M', 'hours': hours},
+        headers={'Authorization': f'Bearer {api_key}'},
     )
     response.raise_for_status()
     data = response.json()
