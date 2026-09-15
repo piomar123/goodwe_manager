@@ -26,7 +26,24 @@ function aggregateSolcastHourly(periods) {
   return Object.keys(byHour).sort().map(h => byHour[h]);
 }
 
-const ForecastCalc = { aggregateSolcastHourly };
+// Same hour-bucketing convention as aggregateSolcastHourly, but for Solcast
+// estimated_actuals' flat {time, kwh} period shape (a historical estimate
+// is a single value, not a {c10,c50,c90} range) - kept as a separate
+// function rather than generalizing one aggregator across both shapes, for
+// the same reason solcast.py's sum_sites/sum_sites_flat stay separate. See
+// docs/superpowers/specs/2026-09-15-solcast-historical-estimate-design.md §5.
+function aggregateSolcastActualsHourly(periods) {
+  const byHour = {};
+  for (const p of periods) {
+    const hour = p.time.split(':')[0] + ':00';
+    const bucket = byHour[hour] || { time: hour, kwh: 0 };
+    bucket.kwh = Math.round((bucket.kwh + p.kwh) * 100) / 100;
+    byHour[hour] = bucket;
+  }
+  return Object.keys(byHour).sort().map(h => byHour[h]);
+}
+
+const ForecastCalc = { aggregateSolcastHourly, aggregateSolcastActualsHourly };
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = ForecastCalc;
 } else {
