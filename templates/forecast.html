@@ -18,20 +18,24 @@
           <input id="date-selector" type="date" class="form-control" value="{{ date }}" />
         </div>
       </div>
+      <div class="col-4">
+        <div class="input-group input-group-sm">
+          <select id="fetch-time-selector" class="form-select"></select>
+        </div>
+      </div>
     </div>
     <div class="row">
       <div class="col">
-        <p>
-          90°: {{ forecast.angle90_in_kWh }} kWh<br>
-          270°: {{ forecast.angle270_in_kWh }} kWh<br>
-          Total: {{ forecast.total_in_kWh }} kWh
-        </p>
+        <p id="forecast-summary">{{ summary }}</p>
       </div>
     </div>
     <div class="row">
       <div class="col">
         <div id="forecast-chart-error" class="alert alert-warning d-none" role="alert">
           Couldn't load the hourly forecast. Try reloading the page.
+        </div>
+        <div id="solcast-unavailable-note" class="alert alert-secondary d-none" role="alert">
+          Solcast forecast unavailable for this date.
         </div>
         <div style="background:#111;border-radius:6px;padding:12px">
           <canvas id="forecast-chart"></canvas>
@@ -61,6 +65,11 @@
   <style>
     #forecast-chart { height: 400px; }
     @media (max-width: 576px) { #forecast-chart { height: 260px; } }
+    /* main.py's _build_forecast_summary joins Meteosource/Solcast with a
+       literal \n - this renders that as a real line break without opting
+       the template out of Jinja's autoescaping (no `| safe` + `<br>`
+       needed for a plain two-line label). */
+    #forecast-summary { white-space: pre-line; }
     /* Sticky header that sticks to the *page's* scroll (no more fixed-height
        inner scroll box) - needs its own opaque background (matching
        Bootstrap's table-dark bg) since a sticky element is otherwise
@@ -77,12 +86,17 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <script src="/static/chart-theme.js"></script>
   <script src="/static/table.js"></script>
+  <script src="/static/js/forecast-calc.js"></script>
   <script>
     (async function () {
       const chartDate = '{{ date }}';
+      const initialFetchedAt = {{ fetched_at | tojson }};
       let data;
       try {
-        const resp = await fetch('/forecast/hourly.json?date=' + chartDate);
+        const url = new URL('/forecast/hourly.json', window.location.origin);
+        url.searchParams.set('date', chartDate);
+        if (initialFetchedAt) url.searchParams.set('fetched_at', initialFetchedAt);
+        const resp = await fetch(url);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         data = await resp.json();
       } catch (err) {
@@ -91,11 +105,28 @@
         return;
       }
 
-      const orientations = data.orientations; // e.g. [90, 270], drives the forecast bar series
-      const hourCount = data.hours.length; // one entry per hour of the day, so also this chart's category count
-      const actualValues = data.hours.map(h => h.actual_total_kwh); // null where no measured data yet - the real values, used for the table/tooltip
-      const currentHourIndex = data.current_hour ? data.hours.findIndex(h => h.time === data.current_hour) : -1;
-      const partialKwh = data.current_hour_actual_partial_kwh; // how much the in-progress hour has produced so far (not a full hour's worth)
+      // Fetch-time dropdown: "Latest" (no fetched_at param) plus every
+      // distinct past fetch for this date, newest first.
+      const selector = document.getElementById('fetch-time-selector');
+      const fmtFetchedAt = epoch => new Date(epoch * 1000).toLocaleString();
+      selector.innerHTML = ['<option value="">Latest</option>']
+        .concat(data.fetch_times.map(t => `<option value="${t}"${t === data.selected_fetched_at ? ' selected' : ''}>${fmtFetchedAt(t)}</option>`))
+        .join('');
+      selector.addEventListener('change', function () {
+        const url = new URL(window.location.href);
+        if (this.value) url.searchParams.set('fetched_at', this.value); else url.searchParams.delete('fetched_at');
+        window.location.href = url.toString();
+      });
+
+      document.getElementById('solcast-unavailable-note').classList.toggle('d-none', data.solcast.available);
+
+      const meteosourceByHour = Object.fromEntries(data.meteosource.hours.map(h => [h.time, h.kwh]));
+      const hourLabels = data.meteosource.hours.map(h => h.time); // Meteosource is always hourly - the chart's 24-category backbone
+      const hourCount = hourLabels.length; // one entry per hour of the day, so also this chart's category count
+      const actualByHour = Object.fromEntries(data.actual.hours.map(h => [h.time, h.kwh]));
+      const actualValues = hourLabels.map(t => actualByHour[t] ?? null); // null where no measured data yet - the real values, used for the table/tooltip
+      const currentHourIndex = data.actual.current_hour ? hourLabels.indexOf(data.actual.current_hour) : -1;
+      const partialKwh = data.actual.current_hour_actual_partial_kwh; // how much the in-progress hour has produced so far (not a full hour's worth)
       const actualLineColor = '#22cc66'; // pure green - reads clearly as "measured" against the near-white/amber forecast bars
       const trailingHourColor = '#ffffff'; // white for the current, still-partial hour - distinct from the teal/blue/amber used elsewhere in this chart
 
@@ -122,16 +153,26 @@
         }
       }
 
-      const columns = ['Hour', 'Forecast', 'Actual', 'Forecast cumul.', 'Actual cumul.'];
-      let cumForecastKwh = 0;
+      const solcastHourly = ForecastCalc.aggregateSolcastHourly(data.solcast.periods);
+      const solcastByHour = Object.fromEntries(solcastHourly.map(h => [h.time, h]));
+      const solcastActualsHourly = ForecastCalc.aggregateSolcastActualsHourly(data.solcast_actuals.periods);
+      const solcastActualsByHour = Object.fromEntries(solcastActualsHourly.map(h => [h.time, h]));
+
+      const columns = ['Hour', 'Meteosource', 'Solcast'];
+      if (data.solcast_actuals.available) columns.push('Solcast Estimated Actual');
+      columns.push('Actual', 'Actual cumul.');
       let cumActualKwh = 0;
-      const rows = data.hours.map((h, idx) => {
-        const row = { Hour: h.time, Forecast: h.total_kwh.toFixed(2) };
-        cumForecastKwh += h.total_kwh;
-        row['Forecast cumul.'] = cumForecastKwh.toFixed(2);
-        if (h.actual_total_kwh != null) {
-          cumActualKwh += h.actual_total_kwh;
-          row['Actual'] = h.actual_total_kwh.toFixed(2);
+      const rows = hourLabels.map((t, idx) => {
+        const row = { Hour: t, Meteosource: (meteosourceByHour[t] || 0).toFixed(2) };
+        const s = solcastByHour[t];
+        row['Solcast'] = s ? `${s.c50.toFixed(2)} (${s.c10.toFixed(2)}–${s.c90.toFixed(2)})` : '—';
+        if (data.solcast_actuals.available) {
+          const sa = solcastActualsByHour[t];
+          row['Solcast Estimated Actual'] = sa ? sa.kwh.toFixed(2) : '—';
+        }
+        if (actualByHour[t] != null) {
+          cumActualKwh += actualByHour[t];
+          row['Actual'] = actualByHour[t].toFixed(2);
           row['Actual cumul.'] = cumActualKwh.toFixed(2);
         } else if (idx === currentHourIndex && partialKwh != null) {
           row['Actual'] = `${partialKwh.toFixed(2)} (so far)`;
@@ -161,15 +202,70 @@
       // faded/dashed - a plain color swap reads much more clearly than a
       // faint dashed line did.
 
-      function forecastBarDatasets() {
-        return orientations.map((o, i) => ({
-          label: o + '°',
-          data: data.hours.map((h, idx) => ({ x: idx + 0.5, y: h.by_orientation[o] })),
-          backgroundColor: ChartTheme.seriesColor(i),
-          stack: 'forecast',
+      const c50Color = '#e0a458';
+      const solcastActualsColor = ChartTheme.seriesColor(3); // teal - distinct from Meteosource's blue-purple, Solcast's amber, and Actual's green
+
+      function solcastActualsDatasets() {
+        if (!data.solcast_actuals.available) return [];
+        // Hourly-aggregated, same x-positions (idx + 0.5) as Meteosource/
+        // Solcast forecast - see
+        // https://github.com/piomar123/goodwe_manager/pull/26 for the
+        // design rationale (the design spec doc itself was removed from
+        // the tree, but is still visible in that PR's history). Dashed
+        // border to visually read as "estimate", not a
+        // measurement - deliberately its own color/label (not reusing the
+        // real "Actual" line's green) so the two are never confused. A
+        // missing hour is pinned to 0, same convention solcastDatasets()
+        // uses for the same reason (a line dataset needs a numeric y at
+        // every x).
+        const points = hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastActualsByHour[t] || {}).kwh ?? 0 }));
+        return [
+          {
+            type: 'line',
+            label: 'Solcast Estimated Actual',
+            data: points,
+            borderColor: solcastActualsColor,
+            borderDash: [6, 4],
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            order: 1, // above Solcast forecast (order 2/3), below real Actual (order -1)
+          },
+        ];
+      }
+
+      function meteosourceBarDataset() {
+        return {
+          type: 'bar',
+          label: 'Meteosource',
+          data: hourLabels.map((t, idx) => ({ x: idx + 0.5, y: meteosourceByHour[t] || 0 })),
+          backgroundColor: ChartTheme.seriesColor(0),
           barPercentage: 1.0,
           categoryPercentage: 1.0,
-        }));
+          order: 10, // bottom layer - see https://github.com/piomar123/goodwe_manager/pull/26
+        };
+      }
+
+      function solcastDatasets() {
+        if (!data.solcast.available) return [];
+        // Hourly-aggregated, same resolution and same x-positions
+        // (idx + 0.5) as the Meteosource bar - see
+        // https://github.com/piomar123/goodwe_manager/pull/26 for the
+        // design rationale (the design spec doc itself was removed from
+        // the tree, but is still visible in that PR's history).
+        // solcastByHour is already built above (table
+        // section) from the same ForecastCalc.aggregateSolcastHourly call;
+        // reused here instead of a second aggregation pass. A missing hour
+        // (e.g. the very edge of a merged snapshot window) is deliberately
+        // pinned to 0 here - unlike the table, which shows '—' for the same
+        // case - because a filled band needs a numeric y at every x
+        // position; it can't skip a point the way a table cell can.
+        const points = key => hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastByHour[t] || {})[key] ?? 0 }));
+        return [
+          { type: 'line', label: 'Solcast c10', data: points('c10'), borderWidth: 0, pointRadius: 0, fill: false, order: 3 },
+          { type: 'line', label: 'Solcast c10–c90 range', data: points('c90'), borderWidth: 0, pointRadius: 0, fill: '-1', backgroundColor: ChartTheme.withAlpha(c50Color, 0.18), order: 3 },
+          { type: 'line', label: 'Solcast c50', data: points('c50'), borderColor: c50Color, backgroundColor: c50Color, borderWidth: 2, pointRadius: 0, fill: false, order: 2 },
+        ];
       }
 
       function actualLineDataset() {
@@ -190,7 +286,7 @@
           spanGaps: false, // don't bridge the gap where there's no measured data yet
           stepped: 'before',
           pointRadius: 0,
-          order: -1, // draw on top of the stacked bars
+          order: -1, // draw on top of everything else
           borderWidth: 1.5,
           fill: 'origin',
           backgroundColor: ChartTheme.withAlpha(actualLineColor, 0.4),
@@ -268,18 +364,22 @@
       function buildChart() {
         if (chart) chart.destroy();
 
-        const datasets = [...forecastBarDatasets(), actualLineDataset()];
+        const datasets = [meteosourceBarDataset(), ...solcastDatasets(), ...solcastActualsDatasets(), actualLineDataset()];
 
         // A real numeric axis so forecast bars (centered at hour+0.5) and
         // the line (points at the interval's left edge, hour) can genuinely
         // share the same [hour, hour+1) span - see the dataset-builder
-        // comments above for why.
+        // comments above for why. NOT stacked: Meteosource is now a single
+        // summed E+W bar series (not two orientation bars stacked on each
+        // other like this chart used to have), so there's nothing left to
+        // stack - leaving `stacked: true` here made Chart.js accumulate the
+        // Solcast/Actual line datasets on top of the bar's value instead of
+        // drawing them at their own real value.
         const xScale = {
           type: 'linear',
-          stacked: true,
           min: 0,
           max: hourCount,
-          afterBuildTicks: axis => { axis.ticks = data.hours.map((h, idx) => ({ value: idx })); },
+          afterBuildTicks: axis => { axis.ticks = hourLabels.map((t, idx) => ({ value: idx })); },
           ticks: {
             color: ChartTheme.axisTickColor,
             maxRotation: 0,
@@ -288,7 +388,7 @@
             callback(value) {
               const step = this.chart.width < 500 ? 4 : 2;
               const idx = Math.round(value);
-              return idx % step === 0 && data.hours[idx] ? data.hours[idx].time : '';
+              return idx % step === 0 && hourLabels[idx] ? hourLabels[idx] : '';
             },
           },
           grid: { display: false },
@@ -305,7 +405,7 @@
             animation: false,
             interaction: { mode: 'index', intersect: false },
             plugins: {
-              legend: ChartTheme.legend,
+              legend: { ...ChartTheme.legend, labels: { ...ChartTheme.legend.labels, filter: item => item.text !== 'Solcast c10' && item.text !== 'Solcast c10–c90 range' } },
               tooltip: {
                 ...ChartTheme.tooltip,
                 // At currentHourIndex, chartActualValues holds either the
@@ -313,7 +413,11 @@
                 // clearly marked as partial) or, lacking that, a clone of
                 // the last real hour used only to close the visual gap
                 // (partialKwh == null - hide it, it's not a real reading).
-                filter: item => !(item.dataset.label === 'Actual' && item.dataIndex === currentHourIndex && partialKwh == null),
+                // The Solcast c10/c10-c90-range datasets are internal
+                // helpers for drawing the shaded band - only the visible
+                // "Solcast c50" line should show its own tooltip row.
+                filter: item => !(item.dataset.label === 'Actual' && item.dataIndex === currentHourIndex && partialKwh == null)
+                  && item.dataset.label !== 'Solcast c10' && item.dataset.label !== 'Solcast c10–c90 range',
                 callbacks: {
                   // Forecast bars sit at x=hour+0.5 and the Actual line at
                   // x=hour - two different x values for "the same hour".
@@ -324,7 +428,7 @@
                   // position, not the x value, and is consistent across
                   // every dataset for a given hour - use that instead to
                   // always show the real hour.
-                  title: items => items.length ? data.hours[items[0].dataIndex].time : '',
+                  title: items => items.length ? hourLabels[items[0].dataIndex] : '',
                   // item.parsed.y is always a plain number regardless of
                   // the underlying data point being a bare number or a
                   // {x, y} object - item.raw would differ between the two
@@ -343,7 +447,6 @@
             scales: {
               x: xScale,
               y: {
-                stacked: true,
                 beginAtZero: true,
                 ticks: {
                   color: ChartTheme.axisTickColor,

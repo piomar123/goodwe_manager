@@ -10,11 +10,9 @@ import sqlite3
 import sys
 import threading
 import time
-from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Any, Mapping
+from typing import Optional, Any, Mapping, Tuple
 
 import aiosqlite
 import dotenv
@@ -26,10 +24,12 @@ from goodwe.sensor import EcoModeV2
 
 import eco_encoder
 import forecast
+import forecast_history
 import history
 import storage
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
+from forecast_prefetch import ForecastPrefetchThread
 from rce import parse_date, plot_rce, setup_plot_style, get_rce_15min
 from rce_prefetch import RcePrefetchThread
 from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
@@ -44,9 +44,6 @@ APP_PORT = int(os.environ.get('APP_PORT', 5000))
 # there).
 BACKUP_ACTIVE_THRESHOLD_W = float(os.environ.get('BACKUP_ACTIVE_THRESHOLD_W', 35))
 
-# FIXME poor-man's config - convert to .env and de-hard-code
-PV_ORIENTATIONS = (90, 270)  # this is used for the forecast only, if the count of orientations is changed, modify also ForecastData tuple and forecast.html template
-
 # https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format
 # https://gist.github.com/werediver/4358735?permalink_comment_id=3421708
 
@@ -56,8 +53,6 @@ dry_run = False
 
 EVERY_DAY = 0b1111111
 EVERY_DAY_STR = 'all'
-
-ForecastData = namedtuple('ForecastData', ('angle90_in_kWh', 'angle270_in_kWh', 'total_in_kWh'))
 
 
 @contextlib.contextmanager
@@ -71,6 +66,18 @@ def _data_db_connection():
     rollback) but doesn't close anything.
     """
     conn = sqlite3.connect(storage.DATA_DB_PATH)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def _forecast_history_connection():
+    """Short-lived, synchronous connection to forecast_history.db, same
+    connect/use/close shape as _data_db_connection - see that function's
+    docstring."""
+    conn = forecast_history.init_db()
     try:
         yield conn
     finally:
@@ -304,6 +311,7 @@ class AsyncioThread(threading.Thread):
 app = flask.Flask(__name__, static_url_path='/static')
 asyncio_thread = AsyncioThread(inverter_address=INVERTER_IP, daemon=False)
 rce_prefetch_thread = RcePrefetchThread()
+forecast_prefetch_thread = ForecastPrefetchThread()
 
 
 @app.route('/')
@@ -516,57 +524,72 @@ def get_prices_image():
     return flask.Response(output_io.getvalue(), mimetype='image/png')
 
 
-# Short-lived cache so a /forecast page view and the hourly-chart's AJAX call
-# (which happens moments later, for the same date) don't each re-scrape
-# meteosource.com from scratch - one scrape per orientation per date is enough.
-# Keyed by date string; holds (fetched_at_monotonic, hours) tuples.
-_FORECAST_CACHE_TTL_SECONDS = 300
-_forecast_cache = {}
-_forecast_cache_lock = threading.Lock()
+def _read_forecast_payload(conn, source, date_yyyymmdd, fetched_at):
+    """Reads a forecast payload for `source`/`date_yyyymmdd`: the merged
+    "latest" view (forecast_history.get_latest_merged) if `fetched_at` is
+    None, else that exact snapshot (gaps included). Falls back to a live
+    Meteosource fetch - the only source that can answer an arbitrary date
+    on demand, see forecast_prefetch.py's docstring and the design spec
+    section 7 - when there's nothing in history yet for that date, and
+    persists the result so future reads for that date hit history too.
+    """
+    if fetched_at is not None:
+        return forecast_history.get_snapshot(conn, source, date_yyyymmdd, fetched_at) or {}
+    payload = forecast_history.get_latest_merged(conn, source, date_yyyymmdd)
+    if not payload and source == 'meteosource':
+        payload = forecast.fetch_pv_production_forecast_combined_hourly_kwh(date_yyyymmdd)
+        forecast_history.write_snapshot(conn, source, date_yyyymmdd, payload)
+    return payload
 
 
-def _get_hourly_forecast_cached(date_yyyymmdd):
-    now = time.monotonic()
-    with _forecast_cache_lock:
-        cached = _forecast_cache.get(date_yyyymmdd)
-        if cached and now - cached[0] < _FORECAST_CACHE_TTL_SECONDS:
-            return cached[1]
+def _solcast_daily_totals(periods_dict):
+    """periods_dict: {"HH:MM": {"c10":.., "c50":.., "c90":..}}. Returns
+    (c10_total, c50_total, c90_total) day sums, rounded to 1 decimal to
+    match the existing summary line's precision."""
+    c10 = sum(v['c10'] for v in periods_dict.values())
+    c50 = sum(v['c50'] for v in periods_dict.values())
+    c90 = sum(v['c90'] for v in periods_dict.values())
+    return round(c10, 1), round(c50, 1), round(c90, 1)
 
-    orientations = PV_ORIENTATIONS
-    with ThreadPoolExecutor(max_workers=len(orientations)) as executor:
-        hourly_futures = [executor.submit(forecast.fetch_pv_production_forecast_hourly_kwh, date_yyyymmdd, orientation) for orientation in orientations]
-        hourly_by_orientation = [future.result() for future in hourly_futures]
 
-    # Combine the per-orientation series into one row per timestamp, assuming
-    # (as fetch_pv_production_forecast_hourly_kwh does today) that every
-    # orientation returns entries for the same set of hourly timestamps.
-    by_timestamp = {}
-    for orientation, series in zip(orientations, hourly_by_orientation):
-        for timestamp_ms, kwh in series:
-            by_timestamp.setdefault(timestamp_ms, {})[orientation] = kwh
+def _accuracy_delta_pct(forecast_total, actual_total):
+    """Δ = round((forecast_total - actual_total) / actual_total * 100),
+    signed - positive means the forecast overestimated, negative means it
+    underestimated. None if actual_total is falsy (0 or None) - a real
+    zero-production day (e.g. total snow cover) can't be divided into, and
+    get_forecast() already only passes a real actual_total when one is
+    computable (see its own gating logic)."""
+    if not actual_total:
+        return None
+    return round((forecast_total - actual_total) / actual_total * 100)
 
-    hours = []
-    for timestamp_ms in sorted(by_timestamp):
-        per_orientation = by_timestamp[timestamp_ms]
-        missing = [o for o in orientations if o not in per_orientation]
-        if missing:
-            logger.warning(f"Forecast for {date_yyyymmdd} at {timestamp_ms}: missing orientations {missing}, treating as 0 kWh")
-        total = sum(per_orientation.values())
-        hours.append({
-            # utcfromtimestamp, not fromtimestamp - forecast.py's epoch
-            # values already encode the local hour directly despite looking
-            # like true UTC epoch; converting via the system's real UTC
-            # offset here made every forecast turn up ~2h later than real
-            # production. See forecast.py's
-            # _fetch_pv_production_forecast_local_day_raw docstring.
-            'time': datetime.utcfromtimestamp(timestamp_ms / 1000).strftime('%H:%M'),
-            'by_orientation': {str(o): round(per_orientation.get(o, 0), 2) for o in orientations},
-            'total_kwh': round(total, 2),
-        })
 
-    with _forecast_cache_lock:
-        _forecast_cache[date_yyyymmdd] = (now, hours)
-    return hours
+def _build_forecast_summary(meteosource_total, solcast_totals, actual_total):
+    r"""meteosource_total: day-total Meteosource kWh. solcast_totals:
+    (c10_total, c50_total, c90_total) tuple, or None if Solcast has no data
+    for this date. actual_total: day-total real Actual kWh if the accuracy
+    delta is computable for this date (a fully elapsed past day with all 24
+    hours recorded - see get_forecast's gating), else None to omit deltas
+    entirely. Returns the summary string - one line if Solcast has no data,
+    two `\n`-joined lines otherwise; forecast.html renders it with CSS
+    `white-space: pre-line` so the `\n` becomes a real line break without
+    needing `| safe` + `<br>`.
+    """
+    meteosource_line = f"Meteosource: {meteosource_total} kWh"
+    meteosource_delta = _accuracy_delta_pct(meteosource_total, actual_total)
+    if meteosource_delta is not None:
+        meteosource_line += f" (Δ {meteosource_delta:+d}% vs actual)"
+    lines = [meteosource_line]
+
+    if solcast_totals is not None:
+        c10_total, c50_total, c90_total = solcast_totals
+        solcast_line = f"Solcast: {c50_total} ({c10_total}-{c90_total}) kWh"
+        solcast_delta = _accuracy_delta_pct(c50_total, actual_total)
+        if solcast_delta is not None:
+            solcast_line += f" (Δ {solcast_delta:+d}% vs actual)"
+        lines.append(solcast_line)
+
+    return "\n".join(lines)
 
 
 @app.get('/forecast')
@@ -574,13 +597,34 @@ def get_forecast():
     date_param = request.args.get('date', default='t')
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
-    logger.debug(f"Fetching forecast for {date_yyyymmdd}")
-    hours = _get_hourly_forecast_cached(date_yyyymmdd)
-    forecasts = [sum(hour['by_orientation'][str(o)] for hour in hours) for o in PV_ORIENTATIONS]
-    logger.debug(f"Forecasts: {forecasts} kWh")
-    total_kwh = sum(forecasts)
-    forecast_data = ForecastData(angle90_in_kWh=f"{forecasts[0]:.1f}", angle270_in_kWh=f"{forecasts[1]:.1f}", total_in_kWh=f"{total_kwh:.1f}")
-    return flask.render_template('forecast.html', date=date_yyyymmdd, forecast=forecast_data)
+    fetched_at = request.args.get('fetched_at', type=int)
+    logger.debug(f"Fetching forecast for {date_yyyymmdd} (fetched_at={fetched_at})")
+
+    with _forecast_history_connection() as conn:
+        meteosource = _read_forecast_payload(conn, 'meteosource', date_yyyymmdd, fetched_at)
+        solcast_periods = _read_forecast_payload(conn, 'solcast', date_yyyymmdd, fetched_at)
+
+    meteosource_total = round(sum(meteosource.values()), 1)
+    solcast_totals = _solcast_daily_totals(solcast_periods) if solcast_periods else None
+
+    # Accuracy delta only for a fully elapsed past date with complete
+    # telemetry - see this plan's Global Constraints and spec §3's
+    # amendment for why (a partial/incomplete actual total would make the
+    # delta misleading, not informative). Also only for the merged "Latest"
+    # view (fetched_at is None): a specific historical snapshot may only
+    # cover part of the day (Solcast/Meteosource fetches are forward-looking),
+    # so its forecast total is itself partial and comparing it to the full-day
+    # actual total would be just as misleading.
+    is_past_date = date_yyyymmdd < datetime.now().strftime('%Y-%m-%d')
+    actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd) if is_past_date else {}
+    actual_total = (
+        round(sum(actual_by_hour.values()), 1)
+        if fetched_at is None and is_past_date and len(actual_by_hour) == 24
+        else None
+    )
+
+    summary = _build_forecast_summary(meteosource_total, solcast_totals, actual_total)
+    return flask.render_template('forecast.html', date=date_yyyymmdd, fetched_at=fetched_at, summary=summary)
 
 
 def _get_actual_hourly_pv_kwh(date_yyyymmdd):
@@ -629,20 +673,52 @@ def get_forecast_hourly_json():
     date_param = request.args.get('date', default='t')
     date = parse_date(date_param)
     date_yyyymmdd = date.strftime('%Y-%m-%d')
-    logger.debug(f"Fetching hourly forecast for {date_yyyymmdd}")
-    hours = _get_hourly_forecast_cached(date_yyyymmdd)
-    actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd)
+    fetched_at = request.args.get('fetched_at', type=int)
+    logger.debug(f"Fetching hourly forecast JSON for {date_yyyymmdd} (fetched_at={fetched_at})")
+
     now = datetime.now()
-    for hour in hours:
-        actual = actual_by_hour.get(hour['time'])
-        hour['actual_total_kwh'] = round(actual, 2) if actual is not None else None
+    is_past_date = date_yyyymmdd < now.strftime('%Y-%m-%d')
+
+    with _forecast_history_connection() as conn:
+        meteosource = _read_forecast_payload(conn, 'meteosource', date_yyyymmdd, fetched_at)
+        solcast_periods = _read_forecast_payload(conn, 'solcast', date_yyyymmdd, fetched_at)
+        # Solcast's estimated_actuals is only ever meaningful for a fully
+        # elapsed past day (see
+        # https://github.com/piomar123/goodwe_manager/pull/26 for the
+        # design rationale - the design spec doc itself was removed from
+        # the tree, but is still visible in that PR's history) - skip the
+        # read entirely for today/future dates rather than showing an
+        # estimate of an estimate next to the real Actual line.
+        solcast_actuals_periods = (
+            _read_forecast_payload(conn, 'solcast_actuals', date_yyyymmdd, fetched_at)
+            if is_past_date else {}
+        )
+        fetch_times = forecast_history.get_fetch_times(conn, date_yyyymmdd)
+
+    actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd)
     is_today = date_yyyymmdd == now.strftime('%Y-%m-%d')
+    current_hour = now.strftime('%H:00') if is_today else None
+    partial_kwh = _get_actual_pv_kwh_so_far_this_hour(now) if is_today else None
+
     return flask.jsonify({
-        'date': date_yyyymmdd,
-        'orientations': PV_ORIENTATIONS,
-        'hours': hours,
-        'current_hour': now.strftime('%H:00') if is_today else None,
-        'current_hour_actual_partial_kwh': _get_actual_pv_kwh_so_far_this_hour(now) if is_today else None,
+        'meteosource': {
+            'hours': [{'time': t, 'kwh': kwh} for t, kwh in sorted(meteosource.items())],
+        },
+        'solcast': {
+            'available': bool(solcast_periods),
+            'periods': [{'time': t, **v} for t, v in sorted(solcast_periods.items())],
+        },
+        'solcast_actuals': {
+            'available': bool(solcast_actuals_periods),
+            'periods': [{'time': t, 'kwh': kwh} for t, kwh in sorted(solcast_actuals_periods.items())],
+        },
+        'actual': {
+            'hours': [{'time': t, 'kwh': kwh} for t, kwh in sorted(actual_by_hour.items())],
+            'current_hour': current_hour,
+            'current_hour_actual_partial_kwh': partial_kwh,
+        },
+        'fetch_times': fetch_times,
+        'selected_fetched_at': fetched_at,
     })
 
 
@@ -753,6 +829,7 @@ def main():
 
     asyncio_thread.start()
     rce_prefetch_thread.start()
+    forecast_prefetch_thread.start()
     # atexit.register(stop_threads)
     try:
         # threaded=True is Flask's own default (Flask.run() sets it via
@@ -767,6 +844,7 @@ def main():
         logger.info("Finishing the application...")
         asyncio_thread.finish()
         rce_prefetch_thread.finish()
+        forecast_prefetch_thread.finish()
         logger.info("Finished all threads")
 
 
