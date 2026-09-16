@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, time as dtime
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import forecast_history
 import forecast_prefetch
@@ -75,6 +75,12 @@ class FetchAndStoreTest(unittest.TestCase):
         self.assertEqual(len(times), 1)
         self.assertEqual(forecast_history.get_snapshot(self.conn, 'meteosource', '2026-01-01', times[0]), {'07:00': 1.5})
 
+    @patch('forecast_prefetch.forecast.fetch_pv_production_forecast_combined_hourly_kwh')
+    def test_fetch_and_store_meteosource_uses_the_given_now_as_fetched_at(self, mock_fetch):
+        mock_fetch.return_value = {'07:00': 1.5}
+        forecast_prefetch.fetch_and_store_meteosource(self.conn, '2026-01-01', now=12345)
+        self.assertEqual(forecast_history.get_snapshot(self.conn, 'meteosource', '2026-01-01', 12345), {'07:00': 1.5})
+
     @patch.dict(os.environ, {'SOLCAST_SITE_EAST_ID': 'east-1', 'SOLCAST_SITE_WEST_ID': 'west-1'})
     @patch('forecast_prefetch.solcast.fetch_solcast_forecast_30min')
     def test_fetch_and_store_solcast_sums_sites_and_writes_a_snapshot_per_date(self, mock_fetch):
@@ -92,6 +98,14 @@ class FetchAndStoreTest(unittest.TestCase):
             forecast_history.get_snapshot(self.conn, 'solcast', '2026-01-01', times[0]),
             {'07:00': {'c10': 1.5, 'c50': 3.0, 'c90': 4.5}},
         )
+
+    @patch.dict(os.environ, {'SOLCAST_SITE_EAST_ID': 'east-1', 'SOLCAST_SITE_WEST_ID': 'west-1'})
+    @patch('forecast_prefetch.solcast.fetch_solcast_forecast_30min')
+    def test_fetch_and_store_solcast_uses_the_given_now_for_every_date(self, mock_fetch):
+        mock_fetch.return_value = {'2026-01-01': {'07:00': {'c10': 0.1, 'c50': 0.2, 'c90': 0.3}}, '2026-01-02': {'07:00': {'c10': 0.1, 'c50': 0.2, 'c90': 0.3}}}
+        forecast_prefetch.fetch_and_store_solcast(self.conn, now=12345)
+        self.assertEqual(forecast_history.get_fetch_times(self.conn, '2026-01-01'), [12345])
+        self.assertEqual(forecast_history.get_fetch_times(self.conn, '2026-01-02'), [12345])
 
     @patch.dict(os.environ, {'SOLCAST_SITE_EAST_ID': 'east-1', 'SOLCAST_SITE_WEST_ID': 'west-1'})
     @patch('forecast_prefetch.solcast.fetch_solcast_estimated_actuals_30min')
@@ -123,6 +137,14 @@ class FetchAndStoreTest(unittest.TestCase):
         self.assertEqual(forecast_history.get_latest_merged(self.conn, 'solcast_actuals', '2026-01-01'), {'07:00': 1.0})
         self.assertEqual(forecast_history.get_latest_merged(self.conn, 'solcast_actuals', '2026-01-02'), {})
 
+    @patch.dict(os.environ, {'SOLCAST_SITE_EAST_ID': 'east-1', 'SOLCAST_SITE_WEST_ID': 'west-1'})
+    @patch('forecast_prefetch.solcast.fetch_solcast_estimated_actuals_30min')
+    def test_fetch_and_store_solcast_actuals_uses_the_given_now_for_every_date(self, mock_fetch):
+        mock_fetch.return_value = {'2026-01-01': {'07:00': 0.5}, '2026-01-02': {'07:00': 0.5}}
+        forecast_prefetch.fetch_and_store_solcast_actuals(self.conn, now=12345)
+        self.assertEqual(forecast_history.get_fetch_times(self.conn, '2026-01-01'), [12345])
+        self.assertEqual(forecast_history.get_fetch_times(self.conn, '2026-01-02'), [12345])
+
 
 class RunCatchUpTest(unittest.TestCase):
     def setUp(self):
@@ -144,9 +166,23 @@ class RunCatchUpTest(unittest.TestCase):
     @patch('forecast_prefetch.fetch_and_store_meteosource')
     def test_fetches_everything_when_nothing_is_fresh(self, mock_meteosource, mock_solcast, mock_actuals):
         forecast_prefetch.run_catch_up(self.conn, self.now)
-        mock_meteosource.assert_called_once_with(self.conn, '2026-01-02')
-        mock_solcast.assert_called_once_with(self.conn)
-        mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02')
+        mock_meteosource.assert_called_once_with(self.conn, '2026-01-02', now=ANY)
+        mock_solcast.assert_called_once_with(self.conn, now=ANY)
+        mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02', now=ANY)
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_meteosource_and_solcast_share_the_same_fetched_at_when_both_stale(self, mock_meteosource, mock_solcast, mock_actuals):
+        # Two separate API round-trips (Meteosource, then Solcast east+west)
+        # drifting a few seconds apart used to give them different
+        # fetched_at values, splitting one wake-up into two dropdown
+        # entries where each source is only present in one - see
+        # run_catch_up's/the module docstring's note on this.
+        forecast_prefetch.run_catch_up(self.conn, self.now)
+        meteosource_now = mock_meteosource.call_args.kwargs['now']
+        solcast_now = mock_solcast.call_args.kwargs['now']
+        self.assertEqual(meteosource_now, solcast_now)
 
     @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
     @patch('forecast_prefetch.fetch_and_store_solcast')
@@ -162,7 +198,36 @@ class RunCatchUpTest(unittest.TestCase):
 
         mock_meteosource.assert_not_called()
         mock_solcast.assert_not_called()
-        mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02')
+        mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02', now=ANY)
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_meteosource_fetches_alongside_solcast_even_when_individually_fresh(self, mock_meteosource, mock_solcast, mock_actuals):
+        # Meteosource has no quota to conserve, unlike Solcast - it should
+        # piggyback on Solcast's fetch cycle even when its own staleness
+        # check alone would have skipped it, so the two stay aligned on one
+        # shared fetched_at.
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-02', {'07:00': 1.0}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
+
+        forecast_prefetch.run_catch_up(self.conn, self.now)
+
+        meteosource_now = mock_meteosource.call_args.kwargs['now']
+        solcast_now = mock_solcast.call_args.kwargs['now']
+        self.assertEqual(meteosource_now, solcast_now)
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_solcast_does_not_fetch_just_because_meteosource_is_stale(self, mock_meteosource, mock_solcast, mock_actuals):
+        # The reverse doesn't hold - Solcast's own staleness gate is
+        # untouched, since it's the one with quota to conserve.
+        forecast_history.write_snapshot(self.conn, 'solcast', '2026-01-02', {'07:00': {'c10': 1, 'c50': 2, 'c90': 3}}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
+
+        forecast_prefetch.run_catch_up(self.conn, self.now)
+
+        mock_meteosource.assert_called_once()  # stale on its own
+        mock_solcast.assert_not_called()
 
     @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
     @patch('forecast_prefetch.fetch_and_store_solcast')

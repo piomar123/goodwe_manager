@@ -37,6 +37,9 @@
         <div id="solcast-unavailable-note" class="alert alert-secondary d-none" role="alert">
           Solcast forecast unavailable for this date.
         </div>
+        <div id="meteosource-unavailable-note" class="alert alert-secondary d-none" role="alert">
+          Meteosource forecast unavailable for this fetch time.
+        </div>
         <div style="background:#111;border-radius:6px;padding:12px">
           <canvas id="forecast-chart"></canvas>
         </div>
@@ -119,9 +122,30 @@
       });
 
       document.getElementById('solcast-unavailable-note').classList.toggle('d-none', data.solcast.available);
+      // Meteosource is almost always present for the merged "Latest" view
+      // (main.py's _read_forecast_payload live-fetches it on a miss there)
+      // - this note is really only for a specific historical fetched_at
+      // that happens to have no Meteosource snapshot (e.g. Solcast and
+      // Meteosource landing at slightly different fetched_at values - see
+      // forecast_prefetch.py). Without this, a missing Meteosource
+      // snapshot at a selected fetch time silently renders as a flat 0.00
+      // row/zero-height bars (meteosourceByHour[t] || 0 below), which reads
+      // exactly like "Meteosource forecasted zero production all day"
+      // instead of "no data for this fetch time".
+      document.getElementById('meteosource-unavailable-note').classList.toggle('d-none', data.meteosource.available);
 
       const meteosourceByHour = Object.fromEntries(data.meteosource.hours.map(h => [h.time, h.kwh]));
-      const hourLabels = data.meteosource.hours.map(h => h.time); // Meteosource is always hourly - the chart's 24-category backbone
+      // The chart/table's 24-category backbone - the fixed 'HH:00' sequence
+      // for a full day, not derived from any one source's actual hours.
+      // Previously this was data.meteosource.hours.map(h => h.time): fine
+      // whenever Meteosource has a snapshot, but a specific historical
+      // fetched_at can have Meteosource empty (no exact-match snapshot at
+      // that timestamp) while Solcast/actuals do have data there - with a
+      // Meteosource-derived backbone that blanked the entire chart AND
+      // table, hiding data that was actually present. Every per-source
+      // lookup below already tolerates a missing hour (`xByHour[t] || 0`
+      // etc.), so a fixed backbone needs no other changes.
+      const hourLabels = Array.from({ length: 24 }, (_, h) => `${String(h).padStart(2, '0')}:00`);
       const hourCount = hourLabels.length; // one entry per hour of the day, so also this chart's category count
       const actualByHour = Object.fromEntries(data.actual.hours.map(h => [h.time, h.kwh]));
       const actualValues = hourLabels.map(t => actualByHour[t] ?? null); // null where no measured data yet - the real values, used for the table/tooltip

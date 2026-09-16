@@ -702,6 +702,7 @@ def get_forecast_hourly_json():
 
     return flask.jsonify({
         'meteosource': {
+            'available': bool(meteosource),
             'hours': [{'time': t, 'kwh': kwh} for t, kwh in sorted(meteosource.items())],
         },
         'solcast': {
