@@ -121,6 +121,7 @@ class ForecastHourlyJsonRouteTest(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
+        self.assertTrue(data['meteosource']['available'])
         self.assertEqual(data['meteosource']['hours'], [{'time': '07:00', 'kwh': 1.5}])
         self.assertTrue(data['solcast']['available'])
         self.assertEqual(data['solcast']['periods'], [{'time': '07:00', 'c10': 1.0, 'c50': 2.0, 'c90': 3.0}])
@@ -163,6 +164,29 @@ class ForecastHourlyJsonRouteTest(unittest.TestCase):
         self.assertEqual(data['meteosource']['hours'], [{'time': '07:00', 'kwh': 1.5}])
         self.assertEqual(data['solcast']['periods'], [{'time': '07:00', 'c10': 1.0, 'c50': 2.0, 'c90': 3.0}])
         mock_snapshot.assert_any_call(unittest.mock.ANY, 'meteosource', '2026-01-01', 1000)
+
+    @patch('main._get_actual_hourly_pv_kwh', return_value={})
+    @patch('main._get_actual_pv_kwh_so_far_this_hour', return_value=None)
+    @patch('main.forecast_history.get_fetch_times', return_value=[1000])
+    @patch('main.forecast_history.get_snapshot')
+    def test_meteosource_unavailable_for_a_fetched_at_with_no_matching_snapshot(self, mock_snapshot, mock_fetch_times, mock_partial, mock_actual):
+        # A selected fetched_at is an exact-match lookup, not merged (see
+        # test_specific_fetched_at_uses_get_snapshot_not_merged) - Solcast
+        # can have a snapshot at a timestamp Meteosource never wrote one at
+        # (two independent API round-trips within one wake-up, or a
+        # solcast-only catch-up fetch). No live-fallback here either, since
+        # that only fires for the merged "Latest" view (fetched_at is None).
+        def fake_snapshot(conn, source, date, fetched_at):
+            if source == 'solcast':
+                return {'07:00': {'c10': 1.0, 'c50': 2.0, 'c90': 3.0}}
+            return {}
+        mock_snapshot.side_effect = fake_snapshot
+
+        resp = self.client.get('/forecast/hourly.json?date=2026-01-01&fetched_at=1000')
+        data = resp.get_json()
+        self.assertFalse(data['meteosource']['available'])
+        self.assertEqual(data['meteosource']['hours'], [])
+        self.assertTrue(data['solcast']['available'])
 
     @patch('main._get_actual_hourly_pv_kwh', return_value={})
     @patch('main._get_actual_pv_kwh_so_far_this_hour', return_value=None)
