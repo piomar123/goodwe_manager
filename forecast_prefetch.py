@@ -215,10 +215,14 @@ class ForecastPrefetchThread(threading.Thread):
                 wait_seconds = (next_wake - now).total_seconds()
                 if self._should_stop.wait(wait_seconds):
                     return
+                # One shared moment for whichever branch(es) fire below - a
+                # single instant, not re-read per branch, so a coincidental
+                # tie (next_wake == both) still gives forecast and actuals
+                # the same fetched_at rather than two calls to datetime.now().
                 wake_time = datetime.now()
-                today = wake_time.strftime('%Y-%m-%d')
-                fetch_epoch = int(wake_time.timestamp())
                 if next_wake == next_forecast:
+                    today = wake_time.strftime('%Y-%m-%d')
+                    fetch_epoch = int(wake_time.timestamp())
                     try:
                         fetch_and_store_meteosource(conn, today, now=fetch_epoch)
                         logger.info(f"Prefetched Meteosource forecast for {today}")
@@ -231,7 +235,7 @@ class ForecastPrefetchThread(threading.Thread):
                         logger.warning(f"Solcast prefetch failed: {e}")
                 if next_wake == next_actuals:
                     try:
-                        fetch_and_store_solcast_actuals(conn, now=fetch_epoch)
+                        fetch_and_store_solcast_actuals(conn, now=int(wake_time.timestamp()))
                         logger.info("Prefetched Solcast estimated actuals")
                     except Exception as e:
                         logger.warning(f"Solcast estimated-actuals prefetch failed: {e}")
