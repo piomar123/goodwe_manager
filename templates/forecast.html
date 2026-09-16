@@ -121,7 +121,17 @@
       document.getElementById('solcast-unavailable-note').classList.toggle('d-none', data.solcast.available);
 
       const meteosourceByHour = Object.fromEntries(data.meteosource.hours.map(h => [h.time, h.kwh]));
-      const hourLabels = data.meteosource.hours.map(h => h.time); // Meteosource is always hourly - the chart's 24-category backbone
+      // The chart/table's 24-category backbone - the fixed 'HH:00' sequence
+      // for a full day, not derived from any one source's actual hours.
+      // Previously this was data.meteosource.hours.map(h => h.time): fine
+      // whenever Meteosource has a snapshot, but a specific historical
+      // fetched_at can have Meteosource empty (no exact-match snapshot at
+      // that timestamp) while Solcast/actuals do have data there - with a
+      // Meteosource-derived backbone that blanked the entire chart AND
+      // table, hiding data that was actually present. Every per-source
+      // lookup below already tolerates a missing hour (`xByHour[t] || 0`
+      // etc.), so a fixed backbone needs no other changes.
+      const hourLabels = Array.from({ length: 24 }, (_, h) => `${String(h).padStart(2, '0')}:00`);
       const hourCount = hourLabels.length; // one entry per hour of the day, so also this chart's category count
       const actualByHour = Object.fromEntries(data.actual.hours.map(h => [h.time, h.kwh]));
       const actualValues = hourLabels.map(t => actualByHour[t] ?? null); // null where no measured data yet - the real values, used for the table/tooltip
