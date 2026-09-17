@@ -239,10 +239,10 @@
         // border to visually read as "estimate", not a
         // measurement - deliberately its own color/label (not reusing the
         // real "Actual" line's green) so the two are never confused. A
-        // missing hour is pinned to 0, same convention solcastDatasets()
-        // uses for the same reason (a line dataset needs a numeric y at
-        // every x).
-        const points = hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastActualsByHour[t] || {}).kwh ?? 0 }));
+        // missing hour is left null (not 0): Chart.js treats null as a gap
+        // (spanGaps defaults false), so it reads as "no data" rather than
+        // "estimated zero production".
+        const points = hourLabels.map((t, idx) => ({ x: idx + 0.5, y: solcastActualsByHour[t] ? solcastActualsByHour[t].kwh : null }));
         return [
           {
             type: 'line',
@@ -262,7 +262,10 @@
         return {
           type: 'bar',
           label: 'Meteosource',
-          data: hourLabels.map((t, idx) => ({ x: idx + 0.5, y: meteosourceByHour[t] || 0 })),
+          // A missing hour is left null (not 0) - see
+          // solcastRangeBarDataset() below for why (real zero-production
+          // hours must stay distinct from "no forecast for this hour yet").
+          data: hourLabels.map((t, idx) => ({ x: idx + 0.5, y: meteosourceByHour[t] ?? null })),
           backgroundColor: ChartTheme.seriesColor(0),
           barPercentage: 1.0,
           categoryPercentage: 1.0,
@@ -270,25 +273,38 @@
         };
       }
 
-      function solcastDatasets() {
+      function solcastRangeBarDataset() {
         if (!data.solcast.available) return [];
         // Hourly-aggregated, same resolution and same x-positions
         // (idx + 0.5) as the Meteosource bar - see
         // https://github.com/piomar123/goodwe_manager/pull/26 for the
         // design rationale (the design spec doc itself was removed from
         // the tree, but is still visible in that PR's history).
-        // solcastByHour is already built above (table
-        // section) from the same ForecastCalc.aggregateSolcastHourly call;
-        // reused here instead of a second aggregation pass. A missing hour
-        // (e.g. the very edge of a merged snapshot window) is deliberately
-        // pinned to 0 here - unlike the table, which shows '—' for the same
-        // case - because a filled band needs a numeric y at every x
-        // position; it can't skip a point the way a table cell can.
-        const points = key => hourLabels.map((t, idx) => ({ x: idx + 0.5, y: (solcastByHour[t] || {})[key] ?? 0 }));
+        // solcastByHour is already built above (table section) from the
+        // same ForecastCalc.aggregateSolcastHourly call; reused here
+        // instead of a second aggregation pass. A single floating bar per
+        // hour spanning [c10, c90] (Chart.js's array-value floating-bar
+        // form), translucent so Meteosource's bar underneath stays visible
+        // - the c50 median is drawn separately as a tick by
+        // solcastC50TickPlugin below, since a bar dataset has no line of
+        // its own to color differently. A missing hour (e.g. an hour before
+        // the snapshot's fetch time - Solcast forecasts are forward-looking
+        // only - or the edge of a merged snapshot window) is left null,
+        // same as the table's '—': a null-valued bar simply isn't drawn.
+        const points = hourLabels.map((t, idx) => {
+          const s = solcastByHour[t];
+          return { x: idx + 0.5, y: s ? [s.c10, s.c90] : null };
+        });
         return [
-          { type: 'line', label: 'Solcast c10', data: points('c10'), borderWidth: 0, pointRadius: 0, fill: false, order: 3 },
-          { type: 'line', label: 'Solcast c10–c90 range', data: points('c90'), borderWidth: 0, pointRadius: 0, fill: '-1', backgroundColor: ChartTheme.withAlpha(c50Color, 0.18), order: 3 },
-          { type: 'line', label: 'Solcast c50', data: points('c50'), borderColor: c50Color, backgroundColor: c50Color, borderWidth: 2, pointRadius: 0, fill: false, order: 2 },
+          {
+            type: 'bar',
+            label: 'Solcast (c10–c90)',
+            data: points,
+            backgroundColor: ChartTheme.withAlpha(c50Color, 0.45),
+            barPercentage: 1.0,
+            categoryPercentage: 1.0,
+            order: 5, // above Meteosource's bar (order 10), below the Solcast Estimated Actual/Actual lines
+          },
         ];
       }
 
@@ -318,6 +334,34 @@
       }
 
       let chart = null;
+
+      // Draws the Solcast c50 median as a short horizontal tick spanning
+      // each hour's bar, since solcastRangeBarDataset()'s floating bar has
+      // no line of its own to color differently for the median - same
+      // custom-draw approach as the other plugins here (nowLinePlugin,
+      // currentHourStepExtensionPlugin).
+      const solcastC50TickPlugin = {
+        id: 'solcastC50Tick',
+        afterDatasetsDraw(c) {
+          if (!data.solcast.available) return;
+          const { ctx, scales: { x, y } } = c;
+          ctx.save();
+          ctx.strokeStyle = c50Color;
+          ctx.lineWidth = 2;
+          hourLabels.forEach((t, idx) => {
+            const s = solcastByHour[t];
+            if (!s) return;
+            const x0 = x.getPixelForValue(idx);
+            const x1 = x.getPixelForValue(idx + 1);
+            const yPx = y.getPixelForValue(s.c50);
+            ctx.beginPath();
+            ctx.moveTo(x0, yPx);
+            ctx.lineTo(x1, yPx);
+            ctx.stroke();
+          });
+          ctx.restore();
+        }
+      };
 
       // The vertical "now" marker - only drawn when viewing today. Styled
       // and positioned to match the RCE prices chart's now-line: red, solid,
@@ -388,7 +432,7 @@
       function buildChart() {
         if (chart) chart.destroy();
 
-        const datasets = [meteosourceBarDataset(), ...solcastDatasets(), ...solcastActualsDatasets(), actualLineDataset()];
+        const datasets = [meteosourceBarDataset(), ...solcastRangeBarDataset(), ...solcastActualsDatasets(), actualLineDataset()];
 
         // A real numeric axis so forecast bars (centered at hour+0.5) and
         // the line (points at the interval's left edge, hour) can genuinely
@@ -421,7 +465,7 @@
 
         chart = new Chart(document.getElementById('forecast-chart'), {
           type: 'bar',
-          plugins: [currentHourStepExtensionPlugin, nowLinePlugin],
+          plugins: [currentHourStepExtensionPlugin, nowLinePlugin, solcastC50TickPlugin],
           data: { datasets },
           options: {
             responsive: true,
@@ -429,7 +473,7 @@
             animation: false,
             interaction: { mode: 'index', intersect: false },
             plugins: {
-              legend: { ...ChartTheme.legend, labels: { ...ChartTheme.legend.labels, filter: item => item.text !== 'Solcast c10' && item.text !== 'Solcast c10–c90 range' } },
+              legend: ChartTheme.legend,
               tooltip: {
                 ...ChartTheme.tooltip,
                 // At currentHourIndex, chartActualValues holds either the
@@ -437,11 +481,7 @@
                 // clearly marked as partial) or, lacking that, a clone of
                 // the last real hour used only to close the visual gap
                 // (partialKwh == null - hide it, it's not a real reading).
-                // The Solcast c10/c10-c90-range datasets are internal
-                // helpers for drawing the shaded band - only the visible
-                // "Solcast c50" line should show its own tooltip row.
-                filter: item => !(item.dataset.label === 'Actual' && item.dataIndex === currentHourIndex && partialKwh == null)
-                  && item.dataset.label !== 'Solcast c10' && item.dataset.label !== 'Solcast c10–c90 range',
+                filter: item => !(item.dataset.label === 'Actual' && item.dataIndex === currentHourIndex && partialKwh == null),
                 callbacks: {
                   // Forecast bars sit at x=hour+0.5 and the Actual line at
                   // x=hour - two different x values for "the same hour".
@@ -453,11 +493,20 @@
                   // every dataset for a given hour - use that instead to
                   // always show the real hour.
                   title: items => items.length ? hourLabels[items[0].dataIndex] : '',
-                  // item.parsed.y is always a plain number regardless of
-                  // the underlying data point being a bare number or a
-                  // {x, y} object - item.raw would differ between the two
-                  // and need separate handling.
                   label: item => {
+                    // The floating-bar Solcast dataset's parsed/raw value is
+                    // just the [c10, c90] pair - go back to solcastByHour to
+                    // also surface c50, same "c50 (c10–c90)" format the
+                    // table uses.
+                    if (item.dataset.label === 'Solcast (c10–c90)') {
+                      const s = solcastByHour[hourLabels[item.dataIndex]];
+                      return s ? ` Solcast: ${s.c50.toFixed(2)} (${s.c10.toFixed(2)}–${s.c90.toFixed(2)}) kWh` : ' Solcast: — kWh';
+                    }
+                    // item.parsed.y is always a plain number for every other
+                    // dataset here, regardless of the underlying data point
+                    // being a bare number or a {x, y} object - item.raw
+                    // would differ between the two and need separate
+                    // handling.
                     const val = item.parsed.y;
                     if (item.dataset.label !== 'Actual' || val == null) {
                       return ` ${item.dataset.label}: ${val != null ? val.toFixed(2) : '—'} kWh`;
