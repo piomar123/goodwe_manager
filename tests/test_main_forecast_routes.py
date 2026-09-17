@@ -190,6 +190,44 @@ class ForecastHourlyJsonRouteTest(unittest.TestCase):
 
     @patch('main._get_actual_hourly_pv_kwh', return_value={})
     @patch('main._get_actual_pv_kwh_so_far_this_hour', return_value=None)
+    @patch('main.forecast_history.get_fetch_times', return_value=[1000])
+    @patch('main.forecast_history.get_snapshot')
+    @patch('main.forecast_history.get_merged_since')
+    def test_solcast_actuals_for_a_specific_fetched_at_uses_merged_since_that_days_start(
+            self, mock_merged_since, mock_snapshot, mock_fetch_times, mock_partial, mock_actual):
+        # Actuals are fetched once/day and don't change once measured -
+        # unlike meteosource/solcast, a selected fetched_at must not be an
+        # exact-match get_snapshot lookup for solcast_actuals (that would
+        # spuriously show "unavailable" for any fetched_at earlier in the
+        # day than that day's once-daily actuals fetch). Instead it should
+        # show whatever's freshest from that fetched_at's calendar day
+        # onward.
+        def fake_snapshot(conn, source, date, fetched_at):
+            if source == 'meteosource':
+                return {'07:00': 1.5}
+            elif source == 'solcast':
+                return {'07:00': {'c10': 1.0, 'c50': 2.0, 'c90': 3.0}}
+            return {}
+        mock_snapshot.side_effect = fake_snapshot
+        mock_merged_since.return_value = {'07:00': 0.75}
+
+        # fetched_at=1000 -> 1970-01-01 00:16:40 UTC; midnight that day is epoch 0.
+        resp = self.client.get('/forecast/hourly.json?date=2020-01-01&fetched_at=1000')
+
+        data = resp.get_json()
+        self.assertTrue(data['solcast_actuals']['available'])
+        self.assertEqual(data['solcast_actuals']['periods'], [{'time': '07:00', 'kwh': 0.75}])
+        mock_merged_since.assert_called_once()
+        args = mock_merged_since.call_args.args
+        self.assertEqual(args[1], 'solcast_actuals')
+        self.assertEqual(args[2], '2020-01-01')
+        self.assertLessEqual(args[3], 1000)
+        mock_snapshot.assert_any_call(unittest.mock.ANY, 'meteosource', '2020-01-01', 1000)
+        for call in mock_snapshot.call_args_list:
+            self.assertNotEqual(call.args[1], 'solcast_actuals')
+
+    @patch('main._get_actual_hourly_pv_kwh', return_value={})
+    @patch('main._get_actual_pv_kwh_so_far_this_hour', return_value=None)
     @patch('main.forecast_history.get_fetch_times', return_value=[])
     @patch('main.forecast_history.get_latest_merged')
     def test_returns_solcast_actuals_for_a_past_date(self, mock_merged, mock_fetch_times, mock_partial, mock_actual):
