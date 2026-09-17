@@ -99,6 +99,27 @@ def get_fetch_times(conn: sqlite3.Connection, date: str) -> List[int]:
     return [r[0] for r in rows]
 
 
+def get_merged_since(conn: sqlite3.Connection, source: str, date: str, since_epoch: int) -> Dict:
+    """Like get_latest_merged, but only merges snapshots with fetched_at >=
+    since_epoch. Backs the fetch-time dropdown's read of solcast_actuals:
+    actuals are fetched once/day and don't change once measured, so pinning
+    them to the exact selected fetched_at (like forecasts) only produces
+    spurious "unavailable" gaps for a viewing time earlier in the day than
+    that day's once-daily actuals fetch. Showing the freshest actuals
+    fetched on or after the selected fetch time's calendar day is what the
+    dropdown should mean for actuals, even though it isn't literally what
+    was known at that exact instant.
+    """
+    rows = conn.execute(
+        "SELECT payload FROM forecast_snapshots WHERE source = ? AND date = ? AND fetched_at >= ? ORDER BY fetched_at ASC",
+        (source, date, since_epoch),
+    ).fetchall()
+    merged: Dict = {}
+    for (payload_json,) in rows:
+        merged.update(json.loads(payload_json))
+    return merged
+
+
 def has_fetched_since(conn: sqlite3.Connection, source: str, since_epoch: int) -> bool:
     """True if `source` has any snapshot (any date) with fetched_at >=
     since_epoch. Checked across all dates rather than one - a single fetch
@@ -123,13 +144,8 @@ def get_latest_merged(conn: sqlite3.Connection, source: str, date: str) -> Dict:
     each call is forward-looking from its own call time, so no single
     snapshot alone covers a full day once part of it is in the past
     relative to that snapshot's fetch time. Returns {} if there are no
-    snapshots at all for (source, date).
+    snapshots at all for (source, date). fetched_at is NOT NULL and never
+    negative (see write_snapshot), so since_epoch=0 merges every snapshot -
+    this is just get_merged_since with no lower bound.
     """
-    rows = conn.execute(
-        "SELECT payload FROM forecast_snapshots WHERE source = ? AND date = ? ORDER BY fetched_at ASC",
-        (source, date),
-    ).fetchall()
-    merged: Dict = {}
-    for (payload_json,) in rows:
-        merged.update(json.loads(payload_json))
-    return merged
+    return get_merged_since(conn, source, date, 0)

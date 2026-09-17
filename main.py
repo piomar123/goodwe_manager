@@ -689,10 +689,22 @@ def get_forecast_hourly_json():
         # the tree, but is still visible in that PR's history) - skip the
         # read entirely for today/future dates rather than showing an
         # estimate of an estimate next to the real Actual line.
-        solcast_actuals_periods = (
-            _read_forecast_payload(conn, 'solcast_actuals', date_yyyymmdd, fetched_at)
-            if is_past_date else {}
-        )
+        #
+        # Unlike meteosource/solcast, a selected fetched_at is not an
+        # exact-match lookup here: actuals are fetched once/day and don't
+        # change once measured, so pinning them to the exact selected
+        # fetched_at would only produce a spurious "unavailable" gap for
+        # any viewing time earlier in the day than that day's once-daily
+        # actuals fetch. Instead, show whatever's freshest from that
+        # fetched_at's calendar day onward (forecast_history.get_merged_since).
+        if not is_past_date:
+            solcast_actuals_periods = {}
+        elif fetched_at is None:
+            solcast_actuals_periods = forecast_history.get_latest_merged(conn, 'solcast_actuals', date_yyyymmdd)
+        else:
+            since = datetime.fromtimestamp(fetched_at).replace(hour=0, minute=0, second=0, microsecond=0)
+            solcast_actuals_periods = forecast_history.get_merged_since(
+                conn, 'solcast_actuals', date_yyyymmdd, int(since.timestamp()))
         fetch_times = forecast_history.get_fetch_times(conn, date_yyyymmdd)
 
     actual_by_hour = _get_actual_hourly_pv_kwh(date_yyyymmdd)

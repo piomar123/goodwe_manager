@@ -78,6 +78,29 @@ class ForecastHistoryTest(unittest.TestCase):
     def test_get_latest_merged_with_no_snapshots_returns_empty_dict(self):
         self.assertEqual(forecast_history.get_latest_merged(self.conn, 'solcast', '2026-01-01'), {})
 
+    def test_get_merged_since_excludes_snapshots_before_the_threshold(self):
+        forecast_history.write_snapshot(self.conn, 'solcast_actuals', '2026-01-01', {'07:00': 1.0}, now=1000)
+        forecast_history.write_snapshot(self.conn, 'solcast_actuals', '2026-01-01', {'07:00': 2.0}, now=2000)
+        self.assertEqual(
+            forecast_history.get_merged_since(self.conn, 'solcast_actuals', '2026-01-01', 2000),
+            {'07:00': 2.0},
+        )
+
+    def test_get_merged_since_merges_periods_like_get_latest_merged(self):
+        forecast_history.write_snapshot(self.conn, 'solcast_actuals', '2026-01-01', {'07:00': 1.0, '08:00': 2.0}, now=1000)
+        forecast_history.write_snapshot(self.conn, 'solcast_actuals', '2026-01-01', {'08:00': 2.5}, now=2000)
+        self.assertEqual(
+            forecast_history.get_merged_since(self.conn, 'solcast_actuals', '2026-01-01', 1000),
+            {'07:00': 1.0, '08:00': 2.5},
+        )
+
+    def test_get_merged_since_with_nothing_at_or_after_threshold_returns_empty_dict(self):
+        forecast_history.write_snapshot(self.conn, 'solcast_actuals', '2026-01-01', {'07:00': 1.0}, now=1000)
+        self.assertEqual(
+            forecast_history.get_merged_since(self.conn, 'solcast_actuals', '2026-01-01', 2000),
+            {},
+        )
+
     def test_has_fetched_since_true_when_a_snapshot_is_at_or_after_the_threshold(self):
         forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=2000)
         self.assertTrue(forecast_history.has_fetched_since(self.conn, 'meteosource', 2000))
