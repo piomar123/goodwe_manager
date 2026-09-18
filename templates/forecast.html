@@ -132,10 +132,11 @@
       // that happens to have no Meteosource snapshot (e.g. Solcast and
       // Meteosource landing at slightly different fetched_at values - see
       // forecast_prefetch.py). Without this, a missing Meteosource
-      // snapshot at a selected fetch time silently renders as a flat 0.00
-      // row/zero-height bars (meteosourceByHour[t] || 0 below), which reads
-      // exactly like "Meteosource forecasted zero production all day"
-      // instead of "no data for this fetch time".
+      // snapshot at a selected fetch time would be indistinguishable from
+      // a genuinely fetched forecast of exactly zero production all day -
+      // the chart/table already render a missing hour as a gap/'—' rather
+      // than a misleading 0.00, but that alone doesn't explain *why* it's
+      // missing.
       document.getElementById('meteosource-unavailable-note').classList.toggle('d-none', data.meteosource.available);
 
       const meteosourceByHour = Object.fromEntries(data.meteosource.hours.map(h => [h.time, h.kwh]));
@@ -186,72 +187,16 @@
       const solcastActualsHourly = ForecastCalc.aggregateSolcastActualsHourly(data.solcast_actuals.periods);
       const solcastActualsByHour = Object.fromEntries(solcastActualsHourly.map(h => [h.time, h]));
 
-      // Builds one row per hour, for either mode of the Cumulative switch:
-      // hourly (that hour's own value) or cumulative (the running total
-      // through that hour). A missing hour (null in *ByHour) shows '—' and
-      // is skipped from the running total - same convention as the old
-      // Actual/Actual-cumul. columns had, now applied to every series so
-      // the switch behaves consistently across all of them. Solcast's
-      // c10/c50/c90 are each summed independently when cumulative, so the
-      // displayed range stays a real (min, median, max) of running totals,
-      // not just the c50 total with the last hour's spread tacked on.
-      function buildTableRows(cumulative) {
-        let cumMeteo = 0, cumC10 = 0, cumC50 = 0, cumC90 = 0, cumSolcastActuals = 0, cumActual = 0;
-        return hourLabels.map((t, idx) => {
-          const row = { Hour: t };
-
-          const m = meteosourceByHour[t];
-          if (m != null) {
-            cumMeteo += m;
-            row['Meteosource'] = (cumulative ? cumMeteo : m).toFixed(2);
-          } else {
-            row['Meteosource'] = '—';
-          }
-
-          const s = solcastByHour[t];
-          if (s) {
-            cumC10 += s.c10; cumC50 += s.c50; cumC90 += s.c90;
-            const c10 = cumulative ? cumC10 : s.c10;
-            const c50 = cumulative ? cumC50 : s.c50;
-            const c90 = cumulative ? cumC90 : s.c90;
-            row['Solcast'] = `${c50.toFixed(2)} (${c10.toFixed(2)}–${c90.toFixed(2)})`;
-          } else {
-            row['Solcast'] = '—';
-          }
-
-          if (data.solcast_actuals.available) {
-            const sa = solcastActualsByHour[t];
-            if (sa) {
-              cumSolcastActuals += sa.kwh;
-              row['Solcast Estimated Actual'] = (cumulative ? cumSolcastActuals : sa.kwh).toFixed(2);
-            } else {
-              row['Solcast Estimated Actual'] = '—';
-            }
-          }
-
-          if (actualByHour[t] != null) {
-            cumActual += actualByHour[t];
-            row['Actual'] = (cumulative ? cumActual : actualByHour[t]).toFixed(2);
-          } else if (idx === currentHourIndex && partialKwh != null) {
-            const val = cumulative ? cumActual + partialKwh : partialKwh;
-            row['Actual'] = `${val.toFixed(2)} (so far)`;
-          } else {
-            // Not a completed hour and not the live partial one either - no
-            // meaningful "actual production through this hour" figure yet
-            // (covers future hours, and any hour past-due but still missing
-            // data, e.g. no inverter connection).
-            row['Actual'] = '—';
-          }
-          return row;
-        });
-      }
-
       function buildTable() {
         const cumulative = document.getElementById('table-cumulative-toggle').checked;
         const columns = ['Hour', 'Meteosource', 'Solcast'];
         if (data.solcast_actuals.available) columns.push('Solcast Estimated Actual');
         columns.push('Actual');
-        renderTable('forecast-table-head', 'forecast-table-body', 'forecast-table-empty', columns, buildTableRows(cumulative));
+        const rows = ForecastCalc.buildForecastTableRows({
+          hourLabels, meteosourceByHour, solcastByHour, solcastActualsByHour, actualByHour,
+          currentHourIndex, partialKwh, solcastActualsAvailable: data.solcast_actuals.available, cumulative,
+        });
+        renderTable('forecast-table-head', 'forecast-table-body', 'forecast-table-empty', columns, rows);
       }
       buildTable();
       document.getElementById('table-cumulative-toggle').addEventListener('change', buildTable);
