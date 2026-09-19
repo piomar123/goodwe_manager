@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, time as dtime
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, call, patch
 
 import forecast_history
 import forecast_prefetch
@@ -166,7 +166,10 @@ class RunCatchUpTest(unittest.TestCase):
     @patch('forecast_prefetch.fetch_and_store_meteosource')
     def test_fetches_everything_when_nothing_is_fresh(self, mock_meteosource, mock_solcast, mock_actuals):
         forecast_prefetch.run_catch_up(self.conn, self.now)
-        mock_meteosource.assert_called_once_with(self.conn, '2026-01-02', now=ANY)
+        self.assertEqual(mock_meteosource.call_args_list, [
+            call(self.conn, '2026-01-02', now=ANY),
+            call(self.conn, '2026-01-03', now=ANY),
+        ])
         mock_solcast.assert_called_once_with(self.conn, now=ANY)
         mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02', now=ANY)
 
@@ -180,9 +183,9 @@ class RunCatchUpTest(unittest.TestCase):
         # entries where each source is only present in one - see
         # run_catch_up's/the module docstring's note on this.
         forecast_prefetch.run_catch_up(self.conn, self.now)
-        meteosource_now = mock_meteosource.call_args.kwargs['now']
         solcast_now = mock_solcast.call_args.kwargs['now']
-        self.assertEqual(meteosource_now, solcast_now)
+        meteosource_nows = [c.kwargs['now'] for c in mock_meteosource.call_args_list]
+        self.assertEqual(meteosource_nows, [solcast_now, solcast_now])
 
     @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
     @patch('forecast_prefetch.fetch_and_store_solcast')
@@ -212,9 +215,9 @@ class RunCatchUpTest(unittest.TestCase):
 
         forecast_prefetch.run_catch_up(self.conn, self.now)
 
-        meteosource_now = mock_meteosource.call_args.kwargs['now']
         solcast_now = mock_solcast.call_args.kwargs['now']
-        self.assertEqual(meteosource_now, solcast_now)
+        meteosource_nows = [c.kwargs['now'] for c in mock_meteosource.call_args_list]
+        self.assertEqual(meteosource_nows, [solcast_now, solcast_now])
 
     @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
     @patch('forecast_prefetch.fetch_and_store_solcast')
@@ -226,7 +229,8 @@ class RunCatchUpTest(unittest.TestCase):
 
         forecast_prefetch.run_catch_up(self.conn, self.now)
 
-        mock_meteosource.assert_called_once()  # stale on its own
+        # stale on its own - fetched for both today and tomorrow
+        self.assertEqual(mock_meteosource.call_count, 2)
         mock_solcast.assert_not_called()
 
     @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
@@ -235,6 +239,7 @@ class RunCatchUpTest(unittest.TestCase):
     def test_fetch_failure_is_logged_and_does_not_stop_the_other_catch_up_fetches(self, mock_meteosource, mock_solcast, mock_actuals):
         mock_meteosource.side_effect = RuntimeError("boom")
         forecast_prefetch.run_catch_up(self.conn, self.now)
+        self.assertEqual(mock_meteosource.call_count, 2)  # today and tomorrow both attempted despite failure
         mock_solcast.assert_called_once()
         mock_actuals.assert_called_once()
 
