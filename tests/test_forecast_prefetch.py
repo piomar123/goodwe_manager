@@ -192,14 +192,18 @@ class RunCatchUpTest(unittest.TestCase):
     @patch('forecast_prefetch.fetch_and_store_meteosource')
     def test_skips_sources_already_fresh_since_the_last_passed_wake_time(self, mock_meteosource, mock_solcast, mock_actuals):
         # A snapshot written after last_wake_time(now, FORECAST_WAKE_TIMES)
-        # (today's 06:00) means meteosource/solcast are fresh; only actuals
-        # (last passed slot: yesterday's 23:00) is still stale.
+        # (today's 06:00) means solcast is fresh and meteosource is fresh
+        # for *today* - but meteosource's staleness is checked per-date
+        # (see has_fetched_date_since), so tomorrow's still-missing
+        # snapshot must still be fetched even though solcast doesn't need
+        # to piggyback it. Only actuals (last passed slot: yesterday's
+        # 23:00) is otherwise stale.
         forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-02', {'07:00': 1.0}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
         forecast_history.write_snapshot(self.conn, 'solcast', '2026-01-02', {'07:00': {'c10': 1, 'c50': 2, 'c90': 3}}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
 
         forecast_prefetch.run_catch_up(self.conn, self.now)
 
-        mock_meteosource.assert_not_called()
+        mock_meteosource.assert_called_once_with(self.conn, '2026-01-03', now=ANY)
         mock_solcast.assert_not_called()
         mock_actuals.assert_called_once_with(self.conn, max_date='2026-01-02', now=ANY)
 
