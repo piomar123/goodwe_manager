@@ -77,16 +77,30 @@ That same investigation found real, physical BMS self-consumption: a
 calibration bias - it's real, always-flowing power (per PR #33's
 commit message and `diagram-calc.js`'s comment above `batteryState()`).
 
-One hypothesis (unconfirmed) for *why* PR #33 found `pbattery1` reading
-negative in ~19% of samples labeled Discharge by `battery_mode`: when
-the battery is full, the BMS caps max charge current at 0A (nothing
-more to charge), but the BMS itself still draws a small amount of power
-for its own operation - which could show up as a small negative
+One hypothesis for *why* PR #33 found `pbattery1` reading negative in
+~19% of samples labeled Discharge by `battery_mode`: when the battery
+is full, the BMS caps max charge current at 0A (nothing more to
+charge), but the BMS itself still draws a small amount of power for
+its own operation - which could show up as a small negative
 (charge-direction) reading even while the mode label still says
-Discharge. If true, this is a distinct, real steady-state phenomenon
-tied to full-SOC specifically, separate from (and additional to) the
+Discharge. This is a distinct, real steady-state phenomenon tied to
+full-SOC specifically, separate from (and additional to) the
 cross-register poll timing skew described below, which is a transient
 effect around any state transition regardless of SOC.
+
+**Partially confirmed** via `_estimate_battery_efficiency.py`'s own
+session data: at a 30W charge/discharge threshold, 92% of sessions
+classified as charging (negative `pbattery1`) clustered tightly at
+31-33W average power - not noise, a real, narrow, always-present band -
+with a clean gap and zero sessions in [40,60)W before genuine
+higher-power charge events resume. The equivalent discharge-direction
+sessions showed no such band at all (minimum 77W). This is consistent
+with a real, roughly-constant ~31-33W trickle that's specifically
+charge-directional, matching the full-SOC BMS hypothesis - though it
+doesn't confirm the full-SOC mechanism itself, only that the trickle is
+real, narrow, and asymmetric between directions.
+`DEFAULT_BATTERY_NOISE_W` is set to 60W (not a smaller "just above
+noise" value) specifically to sit in that gap.
 
 ## Noise / cross-sensor disagreement, verified against this hardware
 

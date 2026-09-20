@@ -65,9 +65,17 @@ import storage
 # PR #33's ~19%-of-Discharge-samples disagreement (concentrated within
 # +/-200W of zero) is cross-register poll timing skew, not power-value
 # noise (see GOODWE_SENSOR_NOTES.md) - a magnitude threshold doesn't fix
-# a timing problem, so this stays modest; the real transition guards are
-# DEFAULT_MIN_SESSION_SECONDS/DEFAULT_EDGE_TRIM_SAMPLES below.
-DEFAULT_BATTERY_NOISE_W = 30.0
+# a timing problem, so this alone would suggest a modest value; the real
+# transition guards are DEFAULT_MIN_SESSION_SECONDS/DEFAULT_EDGE_TRIM_SAMPLES
+# below. But real data showed a second, distinct effect: 92% of
+# battery_ac_charge sessions at a 30W threshold clustered tightly at
+# 31-33W average power (a real BMS self-consumption trickle - see the
+# full-SOC hypothesis below - not noise, but not real charging either),
+# with a clean gap and zero sessions in [40,60)W before genuine charge
+# events resume at 60W+. 60W sits in that gap, cleanly excluding the
+# trickle while keeping every real event (verified: discharge-direction
+# sessions are already all >=77W, so this doesn't affect that side).
+DEFAULT_BATTERY_NOISE_W = 60.0
 # Zero, not a small positive margin: any nonzero PV, even a few watts,
 # is real DC power reaching the shared PV/battery bus on a hybrid
 # inverter, and battery_ac_charge/battery_ac_discharge require PV
