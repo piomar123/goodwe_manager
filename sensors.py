@@ -121,6 +121,24 @@ SELECTED_SENSORS = [
     'rssi',
 ]
 
+# Today-only counters that are only useful transiently (e.g. published in
+# MQTT telemetry for Home Assistant to track "today so far") - not worth a
+# lifetime of rows in data.db, since they reset to 0 every midnight and
+# _estimate_battery_efficiency.py-style historical analysis already prefers
+# the lifetime counters. `e_total` is the exception: kept in the DB since
+# it's the lifetime PV counter, not a daily-reset one.
+_EPHEMERAL_ONLY_SENSORS = {
+    'e_day_exp',
+    'e_day_imp',
+    'e_load_day',
+    'e_bat_charge_day',
+    'e_bat_discharge_day',
+}
+
+# The subset of SELECTED_SENSORS actually persisted to data.db - see
+# _EPHEMERAL_ONLY_SENSORS above for what's excluded and why.
+DB_SENSORS = [name for name in SELECTED_SENSORS if name not in _EPHEMERAL_ONLY_SENSORS]
+
 # Columns whose values are text labels/codes, not continuous numeric
 # measurements. Everything else in SELECTED_SENSORS is stored as REAL.
 TEXT_SENSOR_COLUMNS = {
@@ -151,14 +169,22 @@ TEXT_CALCULATED_COLUMNS = {'_hour_start_timestamp', '_day_start_timestamp'}
 
 def sensor_columns() -> list:
     """Ordered (column_name, sql_type) pairs for the inverter_history table,
-    in the same order as SELECTED_SENSORS + CalculatedValuesEvaluator.headers().
+    in the same order as DB_SENSORS + CalculatedValuesEvaluator.headers().
     """
     columns = []
-    for name in SELECTED_SENSORS:
+    for name in DB_SENSORS:
         columns.append((name, 'TEXT' if name in TEXT_SENSOR_COLUMNS else 'REAL'))
     for name in CALCULATED_VALUE_HEADERS:
         columns.append((name, 'TEXT' if name in TEXT_CALCULATED_COLUMNS else 'REAL'))
     return columns
+
+
+def db_row(sensors_data_with_calculated: Mapping[str, Any]) -> dict:
+    """Narrows a full sensors_data_with_calculated dict (SELECTED_SENSORS +
+    calculated fields, as published in MQTT telemetry/SSE) down to just the
+    columns actually persisted in data.db (DB_SENSORS + calculated fields) -
+    see DB_SENSORS for what's excluded and why."""
+    return {name: sensors_data_with_calculated[name] for name in DB_SENSORS + CALCULATED_VALUE_HEADERS}
 
 
 class CalculatedValuesEvaluator:

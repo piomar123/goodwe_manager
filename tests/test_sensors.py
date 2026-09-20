@@ -1,6 +1,6 @@
 import unittest
 
-from sensors import CalculatedValuesEvaluator, SELECTED_SENSORS, sensor_columns
+from sensors import CalculatedValuesEvaluator, DB_SENSORS, SELECTED_SENSORS, sensor_columns, db_row
 
 
 class CalculatedValuesEvaluatorTest(unittest.TestCase):
@@ -177,13 +177,22 @@ class DailyCalculatedValuesTest(unittest.TestCase):
 
 
 class SensorColumnsTest(unittest.TestCase):
-    def test_covers_every_selected_sensor_plus_calculated_headers(self):
+    def test_covers_every_db_sensor_plus_calculated_headers(self):
         columns = sensor_columns()
         column_names = [name for name, _ in columns]
 
-        self.assertEqual(len(columns), len(SELECTED_SENSORS) + 8)
-        self.assertEqual(column_names[:len(SELECTED_SENSORS)], SELECTED_SENSORS)
+        self.assertEqual(len(columns), len(DB_SENSORS) + 8)
+        self.assertEqual(column_names[:len(DB_SENSORS)], DB_SENSORS)
         self.assertIn('_hourly_meter_export', column_names)
+
+    def test_excludes_daily_reset_counters_kept_ephemeral_for_mqtt_only(self):
+        column_names = {name for name, _ in sensor_columns()}
+
+        for ephemeral in ('e_day_exp', 'e_day_imp', 'e_load_day', 'e_bat_charge_day', 'e_bat_discharge_day'):
+            self.assertNotIn(ephemeral, column_names)
+        # e_total is the lifetime counter, not a daily-reset one - stays in the DB.
+        self.assertIn('e_total', column_names)
+        self.assertIn('e_total', DB_SENSORS)
 
     def test_label_columns_are_text_everything_else_is_real(self):
         columns = dict(sensor_columns())
@@ -192,6 +201,19 @@ class SensorColumnsTest(unittest.TestCase):
         self.assertEqual(columns['pv1_mode_label'], 'TEXT')
         self.assertEqual(columns['ppv'], 'REAL')
         self.assertEqual(columns['battery_soc'], 'REAL')
+
+
+class DbRowTest(unittest.TestCase):
+    def test_narrows_to_db_sensors_and_calculated_headers_only(self):
+        full = {name: f'v_{name}' for name in SELECTED_SENSORS}
+        full |= {name: f'c_{name}' for name in CalculatedValuesEvaluator.headers()}
+        full['e_day_exp'] = 'should be dropped'
+
+        narrowed = db_row(full)
+
+        self.assertNotIn('e_day_exp', narrowed)
+        self.assertIn('e_total', narrowed)
+        self.assertEqual(set(narrowed.keys()), set(DB_SENSORS) | set(CalculatedValuesEvaluator.headers()))
 
 
 if __name__ == '__main__':

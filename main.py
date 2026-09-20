@@ -37,7 +37,7 @@ from error_logging import install_uncaught_exception_logging
 from forecast_prefetch import ForecastPrefetchThread
 from rce import parse_date, plot_rce, setup_plot_style, get_rce_15min
 from rce_prefetch import RcePrefetchThread
-from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns
+from sensors import SELECTED_SENSORS, CalculatedValuesEvaluator, sensor_columns, db_row
 
 dotenv.load_dotenv()
 INVERTER_IP = os.environ.get('INVERTER_IP')
@@ -257,7 +257,7 @@ class AsyncioThread(threading.Thread):
                 server_received_at = time.time()
                 sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
-                await storage.insert_sample_async(self._db_conn, sensors_data_with_calculated)
+                await storage.insert_sample_async(self._db_conn, db_row(sensors_data_with_calculated))
                 # Freshness/lag fields for the UI only - deliberately not
                 # persisted (would need a schema/migration change), just
                 # attached to the SSE payload. `_read_duration_seconds` isolates
