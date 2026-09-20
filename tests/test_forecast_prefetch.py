@@ -238,6 +238,33 @@ class RunCatchUpTest(unittest.TestCase):
         mock_solcast.assert_called_once()
         mock_actuals.assert_called_once()
 
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_calls_on_solcast_updated_after_a_successful_solcast_fetch(self, mock_meteosource, mock_solcast, mock_actuals):
+        calls = []
+        forecast_prefetch.run_catch_up(self.conn, self.now, on_solcast_updated=lambda: calls.append(True))
+        self.assertEqual(calls, [True])
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_does_not_call_on_solcast_updated_when_solcast_fetch_fails(self, mock_meteosource, mock_solcast, mock_actuals):
+        mock_solcast.side_effect = RuntimeError("boom")
+        calls = []
+        forecast_prefetch.run_catch_up(self.conn, self.now, on_solcast_updated=lambda: calls.append(True))
+        self.assertEqual(calls, [])
+
+    @patch('forecast_prefetch.fetch_and_store_solcast_actuals')
+    @patch('forecast_prefetch.fetch_and_store_solcast')
+    @patch('forecast_prefetch.fetch_and_store_meteosource')
+    def test_does_not_call_on_solcast_updated_when_solcast_is_not_stale(self, mock_meteosource, mock_solcast, mock_actuals):
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-02', {'07:00': 1.0}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
+        forecast_history.write_snapshot(self.conn, 'solcast', '2026-01-02', {'07:00': {'c10': 1, 'c50': 2, 'c90': 3}}, now=int(datetime(2026, 1, 2, 6, 5).timestamp()))
+        calls = []
+        forecast_prefetch.run_catch_up(self.conn, self.now, on_solcast_updated=lambda: calls.append(True))
+        self.assertEqual(calls, [])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -66,6 +66,21 @@ class ComputeHourIncomeTest(unittest.TestCase):
         self.assertAlmostEqual(result['balance_kwh'], -4.0)
         self.assertAlmostEqual(result['meter_pln'], -4.0 * income.IMPORT_PRICE_KWH)
 
+    def test_custom_import_price_is_used_instead_of_the_flat_constant(self):
+        result = income.compute_hour_income(hourly_export=1.0, hourly_import=5.0, load_kwh=3.0,
+                                            rce_price_pln_per_mwh=400.0, import_price_kwh=0.35)
+
+        self.assertAlmostEqual(result['balance_kwh'], -4.0)
+        self.assertAlmostEqual(result['meter_pln'], -4.0 * 0.35)
+        self.assertAlmostEqual(result['no_buy_pln'], 3.0 * 0.35)
+
+    def test_default_import_price_is_still_the_flat_constant(self):
+        # unchanged behavior when the new parameter is omitted entirely
+        result = income.compute_hour_income(hourly_export=1.0, hourly_import=5.0, load_kwh=3.0,
+                                            rce_price_pln_per_mwh=400.0)
+
+        self.assertAlmostEqual(result['meter_pln'], -4.0 * income.IMPORT_PRICE_KWH)
+
 
 if __name__ == '__main__':
     unittest.main()

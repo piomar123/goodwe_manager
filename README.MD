@@ -19,6 +19,26 @@ you have old `data-*.csv` files from before the switch to SQLite, run
 `python _migrate_csv_to_sqlite.py` once to import them into `data.db`
 (safe to re-run; already-migrated files are skipped).
 
+## Tariff-aware import pricing (optional)
+
+`_calculate_income.py` and the MQTT bridge (see the Predbat bridge design
+doc) can price imported energy using a real time-of-use tariff schedule
+instead of a flat rate. Copy an example from `tariff_examples/` (e.g.
+`g12w_pge.yaml`) to `tariff_import.yaml` (already gitignored), fill in
+your actual rates, and set `TARIFF_IMPORT_CONFIG=tariff_import.yaml` in
+`.env`. Without this set, both keep using the flat `IMPORT_PRICE_KWH`
+constant, unchanged from today's behavior.
+
+## MQTT bridge for Home Assistant / Predbat (optional)
+
+Set `MQTT_HOST` (and `MQTT_USERNAME`/`MQTT_PASSWORD` if your broker
+requires auth) in `.env` to publish live telemetry, daily energy
+counters, RCE export prices, tariff-based import prices (if
+`TARIFF_IMPORT_CONFIG` is also set), and the combined PV forecast to your
+MQTT broker. Unset `MQTT_HOST` (the default) disables this entirely - no
+behavior change from before this feature existed. See PR #35 for the
+full topic list and Home Assistant/Predbat setup.
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 

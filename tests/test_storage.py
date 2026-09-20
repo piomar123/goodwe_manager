@@ -232,6 +232,15 @@ class CurrentHourBoundsTest(unittest.TestCase):
         )
 
 
+class CurrentDayBoundsTest(unittest.TestCase):
+    def test_returns_local_midnight_to_midnight(self):
+        now = datetime(2026, 8, 28, 14, 30, 0)
+        start_epoch, end_epoch = storage.current_day_bounds(now)
+
+        self.assertEqual(datetime.fromtimestamp(start_epoch), datetime(2026, 8, 28, 0, 0, 0))
+        self.assertEqual(end_epoch - start_epoch, 24 * 3600)
+
+
 class StorageAsyncTest(unittest.TestCase):
     def setUp(self):
         fd, self.db_path = tempfile.mkstemp(suffix='.db')

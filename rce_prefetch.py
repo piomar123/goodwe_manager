@@ -43,7 +43,7 @@ def past_cutoff(now: datetime, cutoff_time: dtime) -> bool:
 
 def run_prefetch_cycle(fetch_fn, target_date, sleep_fn, now_fn=datetime.now,
                        cutoff_time=CUTOFF_TIME, retry_interval_seconds=RETRY_INTERVAL_SECONDS,
-                       should_stop=lambda: False) -> bool:
+                       should_stop=lambda: False, on_success=lambda target_date: None) -> bool:
     """Repeatedly calls fetch_fn(target_date) until it succeeds, `cutoff_time`
     local time is reached for the day (gives up, logs error, returns
     False), or should_stop() becomes True (returns False without logging an
@@ -51,6 +51,15 @@ def run_prefetch_cycle(fetch_fn, target_date, sleep_fn, now_fn=datetime.now,
     RuntimeError from fetch_fn (query_pse_rce_15min's "not published yet"
     signal) is logged at info and retried; any other exception is logged at
     warning and also retried, on the same cadence. Returns True on success.
+
+    on_success, if given, is called with target_date immediately after a
+    successful fetch - used by main.py to trigger an MQTT export-price
+    republish without this module needing to know anything about MQTT.
+    Called outside fetch_fn's own try/except (and in its own try/except),
+    so a failure in on_success itself (e.g. main.py's MQTT republish
+    hitting a not-yet-running asyncio loop) can never be misclassified as
+    a "not published yet"/"unexpected error" fetch failure and trigger a
+    pointless retry of an already-successful fetch.
     """
     while not should_stop():
         if past_cutoff(now_fn(), cutoff_time):
@@ -59,19 +68,27 @@ def run_prefetch_cycle(fetch_fn, target_date, sleep_fn, now_fn=datetime.now,
         try:
             fetch_fn(target_date)
             logger.info(f"Prefetched RCE prices for {target_date}")
-            return True
         except RuntimeError as e:
             logger.info(f"RCE prices for {target_date} not published yet: {e}")
+            sleep_fn(retry_interval_seconds)
+            continue
         except Exception as e:
             logger.warning(f"Unexpected error prefetching RCE prices for {target_date}: {e}")
-        sleep_fn(retry_interval_seconds)
+            sleep_fn(retry_interval_seconds)
+            continue
+        try:
+            on_success(target_date)
+        except Exception as e:
+            logger.warning(f"on_success callback failed after prefetching RCE prices for {target_date}: {e}")
+        return True
     return False
 
 
 class RcePrefetchThread(threading.Thread):
-    def __init__(self):
+    def __init__(self, on_success=lambda target_date: None):
         super().__init__(name='RcePrefetchThread', daemon=True)
         self._should_stop = threading.Event()
+        self._on_success = on_success
 
     def run(self):
         while not self._should_stop.is_set():
@@ -84,6 +101,7 @@ class RcePrefetchThread(threading.Thread):
                 target_date=tomorrow,
                 sleep_fn=lambda seconds: self._should_stop.wait(seconds),
                 should_stop=self._should_stop.is_set,
+                on_success=self._on_success,
             )
 
     def finish(self):

@@ -110,6 +110,38 @@ class RunPrefetchCycleTest(unittest.TestCase):
         )
         self.assertFalse(result)
 
+    def test_calls_on_success_callback_after_a_successful_fetch(self):
+        calls = []
+        result = rce_prefetch.run_prefetch_cycle(
+            fetch_fn=lambda d: None,
+            target_date=date(2026, 1, 2),
+            sleep_fn=lambda s: None,
+            now_fn=lambda: datetime(2026, 1, 1, 14, 15),
+            on_success=lambda d: calls.append(d),
+        )
+        self.assertTrue(result)
+        self.assertEqual(calls, [date(2026, 1, 2)])
+
+    def test_on_success_callback_is_not_called_when_fetch_never_succeeds(self):
+        calls = []
+        clock = {'now': datetime(2026, 1, 1, 19, 59, 50)}
+
+        def fetch_fn(d):
+            raise RuntimeError("No data found")
+
+        def sleep_fn(seconds):
+            clock['now'] += timedelta(seconds=seconds)
+
+        result = rce_prefetch.run_prefetch_cycle(
+            fetch_fn=fetch_fn,
+            target_date=date(2026, 1, 2),
+            sleep_fn=sleep_fn,
+            now_fn=lambda: clock['now'],
+            on_success=lambda d: calls.append(d),
+        )
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
 
 if __name__ == '__main__':
     unittest.main()

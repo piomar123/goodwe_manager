@@ -10,9 +10,10 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Any, Mapping, Tuple
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 import dotenv
@@ -23,10 +24,14 @@ from flask import request
 from goodwe.sensor import EcoModeV2
 
 import eco_encoder
+import export_price
 import forecast
 import forecast_history
 import history
+import mqtt_bridge
+import pv_forecast_payload
 import storage
+import tariff_engine
 from announcer import MessageAnnouncer
 from error_logging import install_uncaught_exception_logging
 from forecast_prefetch import ForecastPrefetchThread
@@ -43,6 +48,13 @@ APP_PORT = int(os.environ.get('APP_PORT', 5000))
 # a flat constant for now, pending the adaptive-threshold formula explored
 # there).
 BACKUP_ACTIVE_THRESHOLD_W = float(os.environ.get('BACKUP_ACTIVE_THRESHOLD_W', 35))
+MQTT_HOST = os.environ.get('MQTT_HOST') or None
+MQTT_PORT = int(os.environ.get('MQTT_PORT', 1883))
+MQTT_USERNAME = os.environ.get('MQTT_USERNAME')
+MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD')
+MQTT_TOPIC_PREFIX = os.environ.get('MQTT_TOPIC_PREFIX', 'goodwe')
+TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
+WARSAW_TZ = ZoneInfo('Europe/Warsaw')
 
 # https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format
 # https://gist.github.com/werediver/4358735?permalink_comment_id=3421708
@@ -146,6 +158,11 @@ class AsyncioThread(threading.Thread):
         if loop is None:
             return
         try:
+            offline_future = asyncio.run_coroutine_threadsafe(mqtt.publish_offline_and_disconnect(), loop)
+            offline_future.result(timeout=5)
+        except Exception as e:
+            logger.warning(f"Could not publish MQTT offline status cleanly: {e}")
+        try:
             stop_future = asyncio.run_coroutine_threadsafe(self._stop_event_loop(), loop)
             stop_future.result(timeout=5)
         except concurrent.futures.TimeoutError:
@@ -195,9 +212,41 @@ class AsyncioThread(threading.Thread):
         logger.info(f'Connected to the inverter')
         self._db_conn = await storage.init_db_async(storage.DATA_DB_PATH, sensor_columns())
         try:
+            await mqtt.connect()
+        except Exception as e:
+            # MQTT being down must never stop inverter polling - this
+            # method's caller (_get_inverter_data_with_retry) wraps the
+            # whole method in a broad retry-on-any-exception loop meant for
+            # INVERTER connection failures; letting an unreachable MQTT
+            # broker's exception propagate through that same path would
+            # needlessly tear down and retry the entire inverter connection
+            # just because MQTT was down. mqtt_bridge.connect() deliberately
+            # doesn't catch its own __aenter__() failure (it surfaces
+            # failures to its caller by design), so main.py is responsible
+            # for handling that here.
+            logger.warning(f"Could not connect to MQTT broker: {e}")
+        try:
             await self._seed_hour_start_baseline()
+            await self._seed_day_start_baseline()
+            if mqtt.enabled:
+                await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ))
+                if TARIFF_IMPORT_CONFIG:
+                    try:
+                        _publish_import_prices()
+                    except Exception as e:
+                        # A bad TARIFF_IMPORT_CONFIG (missing file,
+                        # malformed/incomplete YAML) must never bounce the
+                        # inverter connection - this whole method is
+                        # wrapped by _get_inverter_data_with_retry's
+                        # broad retry-on-any-exception loop, which is
+                        # meant for INVERTER failures, not tariff config
+                        # problems. See spec: "MQTT/tariff features must
+                        # never destabilize inverter polling."
+                        logger.warning(f"Could not publish import prices from TARIFF_IMPORT_CONFIG: {e}")
+                _publish_pv_forecast()
             await self._backfill_hourly_summary()
             current_hour_start, _ = storage.current_hour_bounds(datetime.now())
+            current_day_start, _ = storage.current_day_bounds(datetime.now())
             pending_backfill_retries = 0
             while True:
                 read_start = time.monotonic()
@@ -223,6 +272,22 @@ class AsyncioThread(threading.Thread):
                 if new_hour_start != current_hour_start:
                     current_hour_start, pending_backfill_retries = await self._advance_hour_or_retry_backfill(
                         current_hour_start, new_hour_start, pending_backfill_retries)
+                if mqtt.enabled:
+                    await mqtt.publish_telemetry(sensors_data_with_calculated)
+                new_day_start, _ = storage.current_day_bounds(datetime.now())
+                if new_day_start != current_day_start:
+                    current_day_start = new_day_start
+                    if mqtt.enabled:
+                        await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ))
+                        if TARIFF_IMPORT_CONFIG:
+                            try:
+                                _publish_import_prices()
+                            except Exception as e:
+                                # Same rationale as the initial-publish
+                                # block above - a bad tariff config must
+                                # not propagate into the inverter retry
+                                # loop.
+                                logger.warning(f"Could not publish import prices from TARIFF_IMPORT_CONFIG: {e}")
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
@@ -234,6 +299,11 @@ class AsyncioThread(threading.Thread):
         hour_start_epoch, hour_end_epoch = storage.current_hour_bounds(datetime.now())
         baseline = await storage.get_current_hour_start_sample_async(self._db_conn, hour_start_epoch, hour_end_epoch)
         self._calculated_values_evaluator.seed_hour_start(baseline)
+
+    async def _seed_day_start_baseline(self):
+        day_start_epoch, day_end_epoch = storage.current_day_bounds(datetime.now())
+        baseline = await storage.get_current_hour_start_sample_async(self._db_conn, day_start_epoch, day_end_epoch)
+        self._calculated_values_evaluator.seed_day_start(baseline)
 
     @staticmethod
     async def _backfill_hourly_summary(verify_hour_start: Optional[int] = None) -> bool:
@@ -308,10 +378,51 @@ class AsyncioThread(threading.Thread):
             time.sleep(1)
 
 
+mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USERNAME,
+                              password=MQTT_PASSWORD, topic_prefix=MQTT_TOPIC_PREFIX)
+
+
+def _publish_export_prices():
+    payload = export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ)
+    asyncio_thread.run_coroutine_threadsafe(mqtt.publish_export_prices(payload))
+
+
+def _publish_import_prices():
+    if not TARIFF_IMPORT_CONFIG:
+        return
+    config = tariff_engine.load_config(TARIFF_IMPORT_CONFIG)
+    today = datetime.now().date()
+    payload = {
+        'raw_today': tariff_engine.bands_for_day(config, today, WARSAW_TZ),
+        'raw_tomorrow': tariff_engine.bands_for_day(config, today + timedelta(days=1), WARSAW_TZ),
+    }
+    asyncio_thread.run_coroutine_threadsafe(mqtt.publish_import_prices(payload))
+
+
+def _publish_pv_forecast():
+    # Reuses whatever ForecastPrefetchThread already just fetched and
+    # stored (forecast_history.db) rather than calling Solcast again -
+    # see spec Component 5. Predbat needs a 48h horizon (today + tomorrow)
+    # to plan around tonight's cheap-rate charge, and expects each half as
+    # a separate detailedForecast-shaped list (pv_forecast_today /
+    # pv_forecast_tomorrow), not one flat HH:MM map - see
+    # pv_forecast_payload.build_detailed_forecast.
+    today_date = datetime.now().date()
+    tomorrow_date = today_date + timedelta(days=1)
+    with _forecast_history_connection() as conn:
+        today_periods = forecast_history.get_latest_merged(conn, 'solcast', today_date.strftime('%Y-%m-%d'))
+        tomorrow_periods = forecast_history.get_latest_merged(conn, 'solcast', tomorrow_date.strftime('%Y-%m-%d'))
+    payload = {
+        'today': pv_forecast_payload.build_detailed_forecast(today_periods, today_date, WARSAW_TZ),
+        'tomorrow': pv_forecast_payload.build_detailed_forecast(tomorrow_periods, tomorrow_date, WARSAW_TZ),
+    }
+    asyncio_thread.run_coroutine_threadsafe(mqtt.publish_pv_forecast(payload))
+
+
 app = flask.Flask(__name__, static_url_path='/static')
 asyncio_thread = AsyncioThread(inverter_address=INVERTER_IP, daemon=False)
-rce_prefetch_thread = RcePrefetchThread()
-forecast_prefetch_thread = ForecastPrefetchThread()
+rce_prefetch_thread = RcePrefetchThread(on_success=lambda target_date: _publish_export_prices())
+forecast_prefetch_thread = ForecastPrefetchThread(on_solcast_updated=_publish_pv_forecast)
 
 
 @app.route('/')

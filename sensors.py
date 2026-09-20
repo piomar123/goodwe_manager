@@ -135,8 +135,12 @@ CALCULATED_VALUE_HEADERS = [
     '_hourly_meter_export',
     '_hourly_meter_import',
     '_hourly_load',
+    '_day_start_timestamp',
+    '_daily_meter_export',
+    '_daily_meter_import',
+    '_daily_load',
 ]
-TEXT_CALCULATED_COLUMNS = {'_hour_start_timestamp'}
+TEXT_CALCULATED_COLUMNS = {'_hour_start_timestamp', '_day_start_timestamp'}
 
 
 def sensor_columns() -> list:
@@ -154,16 +158,23 @@ def sensor_columns() -> list:
 class CalculatedValuesEvaluator:
     def __init__(self):
         self._hour_start_sensors = None
+        self._day_start_sensors = None
 
     def calculate_values(self, sensors_data: Mapping[str, Any]) -> dict:
         if self._hour_start_sensors is None or sensors_data['timestamp'][:13] != self._hour_start_sensors['timestamp'][
                                                                                  :13]:
             self._hour_start_sensors = sensors_data
+        if self._day_start_sensors is None or sensors_data['timestamp'][:10] != self._day_start_sensors['timestamp'][:10]:
+            self._day_start_sensors = sensors_data
         calculated_values = {
             '_hour_start_timestamp': self._hour_start_sensors['timestamp'],
             '_hourly_meter_export': f"{float(sensors_data['meter_e_total_exp']) - float(self._hour_start_sensors['meter_e_total_exp']):.2f}",
             '_hourly_meter_import': f"{float(sensors_data['meter_e_total_imp']) - float(self._hour_start_sensors['meter_e_total_imp']):.2f}",
             '_hourly_load': f"{float(sensors_data['e_load_total']) - float(self._hour_start_sensors['e_load_total']):.1f}",
+            '_day_start_timestamp': self._day_start_sensors['timestamp'],
+            '_daily_meter_export': f"{float(sensors_data['meter_e_total_exp']) - float(self._day_start_sensors['meter_e_total_exp']):.2f}",
+            '_daily_meter_import': f"{float(sensors_data['meter_e_total_imp']) - float(self._day_start_sensors['meter_e_total_imp']):.2f}",
+            '_daily_load': f"{float(sensors_data['e_load_total']) - float(self._day_start_sensors['e_load_total']):.1f}",
         }
         self._verify_header(calculated_values)
         return calculated_values
@@ -177,6 +188,12 @@ class CalculatedValuesEvaluator:
         yet (empty DB, or the last sample predates the current hour).
         """
         self._hour_start_sensors = dict(sensors_data) if sensors_data is not None else None
+
+    def seed_day_start(self, sensors_data: Optional[Mapping[str, Any]]) -> None:
+        """Same restore-from-a-prior-sample role as seed_hour_start, but
+        for the midnight-anchored daily baseline - see that method's
+        docstring."""
+        self._day_start_sensors = dict(sensors_data) if sensors_data is not None else None
 
     @staticmethod
     def headers():

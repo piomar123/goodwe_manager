@@ -3,13 +3,16 @@ Calculate profit from PV production for a given date, using hourly_summary
 data in SQLite (data.db) instead of the legacy CSV files.
 """
 import argparse
+import os
 import sqlite3
 from datetime import datetime
 
 import storage
+import tariff_engine
 from rce import query_pse_rce, parse_date
 
 IMPORT_PRICE_KWH = 1.1
+TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 
 
 def fetch_hourly_summary(conn: sqlite3.Connection, date: datetime) -> dict:
@@ -34,20 +37,22 @@ def fetch_hourly_summary(conn: sqlite3.Connection, date: datetime) -> dict:
 
 
 def compute_hour_income(hourly_export: float, hourly_import: float, load_kwh: float,
-                        rce_price_pln_per_mwh: float) -> dict:
+                        rce_price_pln_per_mwh: float, import_price_kwh: float = IMPORT_PRICE_KWH) -> dict:
     """Pure per-hour income calculation - same formula as before: a positive
     meter balance (net export) is valued at the RCE market price, a negative
-    balance (net import) at the flat IMPORT_PRICE_KWH, and the load itself is
-    separately valued at the flat import price to represent the cost avoided
-    by self-consumption.
+    balance (net import) at `import_price_kwh`, and the load itself is
+    separately valued at `import_price_kwh` to represent the cost avoided
+    by self-consumption. `import_price_kwh` defaults to the flat
+    IMPORT_PRICE_KWH constant; callers with a tariff config pass the real
+    per-hour zone-aware rate instead (see main()'s --tariff-config).
     """
     balance_kwh = hourly_export - hourly_import
     rce_price_kwh = rce_price_pln_per_mwh / 1000.
-    no_buy_pln = load_kwh * IMPORT_PRICE_KWH
+    no_buy_pln = load_kwh * import_price_kwh
     if balance_kwh > 0:
         meter_pln = balance_kwh * rce_price_kwh
     else:
-        meter_pln = balance_kwh * IMPORT_PRICE_KWH
+        meter_pln = balance_kwh * import_price_kwh
     return {
         'balance_kwh': balance_kwh,
         'rce_price_kwh': rce_price_kwh,
@@ -61,11 +66,14 @@ def main():
     parser = argparse.ArgumentParser(description="Calculate income from PV production for a given date")
     parser.add_argument("--date", help="Date for which to calculate the income (YYYY-MM-DD or DD.MM.YYYY)", type=str, required=True)
     parser.add_argument("--db-path", help="Path to the SQLite database", type=str, default=storage.DATA_DB_PATH)
+    parser.add_argument("--tariff-config", help="Path to a tariff_engine YAML config (defaults to TARIFF_IMPORT_CONFIG env var; omit both to use the flat IMPORT_PRICE_KWH)",
+                        type=str, default=TARIFF_IMPORT_CONFIG)
     args = parser.parse_args()
     print(vars(args))
 
     parsed_date = parse_date(args.date)
     lookup_date_str = parsed_date.strftime('%Y-%m-%d')
+    tariff_config = tariff_engine.load_config(args.tariff_config) if args.tariff_config else None
     print("Querying PSE...")
     rce = query_pse_rce(parsed_date)
 
@@ -97,7 +105,13 @@ def main():
         if rce_hour_price[0] != rce_lookup_time:
             raise ValueError(f"RCE time mismatch for {rce_lookup_time}, found: '{rce_hour_price[0]}' instead")
 
-        result = compute_hour_income(hourly_export, hourly_import, load_kwh, rce_hour_price[1])
+        if tariff_config is not None:
+            hour_dt = datetime(parsed_date.year, parsed_date.month, parsed_date.day, hour)
+            import_price_kwh = tariff_engine.price_at(tariff_config, hour_dt)
+        else:
+            import_price_kwh = IMPORT_PRICE_KWH
+
+        result = compute_hour_income(hourly_export, hourly_import, load_kwh, rce_hour_price[1], import_price_kwh)
         print(f"{rce_lookup_time}: gain: {result['gain_pln']:.2f} zł ({result['meter_pln']:.2f} + {result['no_buy_pln']:.2f}), "
               f"meter: +{hourly_export:.2f} -{hourly_import:.2f} = {result['balance_kwh']:.2f} kWh, "
               f"load: {load_kwh:.1f} kWh, "
