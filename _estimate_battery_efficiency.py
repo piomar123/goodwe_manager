@@ -538,9 +538,14 @@ def _fmt_loss(loss: Optional[float]) -> str:
 
 
 def main():
+    global BATTERY_OFFSET_W
     parser = argparse.ArgumentParser(
         description="Estimate Predbat's real battery_loss/battery_loss_discharge/inverter_loss settings from history")
     parser.add_argument("--db-path", type=str, default=storage.DATA_DB_PATH)
+    parser.add_argument("--battery-offset-w", type=float, default=BATTERY_OFFSET_W,
+                         help="BMS self-consumption trickle added back to every pbattery1 reading before "
+                              "classifying/measuring it (see BATTERY_OFFSET_W). Sweep this to find the value "
+                              "that brings battery_loss and battery_loss_discharge into agreement.")
     parser.add_argument("--battery-noise-w", type=float, default=DEFAULT_BATTERY_NOISE_W)
     parser.add_argument("--grid-idle-w", type=float, default=DEFAULT_GRID_IDLE_SUM_W)
     parser.add_argument("--pv-noise-w", type=float, default=DEFAULT_PV_NOISE_W)
@@ -554,6 +559,8 @@ def main():
                               "energy on it, for the same cross-register skew reason.")
     args = parser.parse_args()
 
+    BATTERY_OFFSET_W = args.battery_offset_w
+
     thresholds = Thresholds(battery_w=args.battery_noise_w, grid_idle_w=args.grid_idle_w,
                              pv_w=args.pv_noise_w)
 
@@ -564,10 +571,15 @@ def main():
             print(f"(db path: {args.db_path})")
             return
 
+        # Streamed via the cursor (not .fetchall()) - a full year of history
+        # is tens of millions of rows, and find_labeled_sessions() only ever
+        # needs one forward pass, so materializing them all into a Python
+        # list first just wastes memory (OOM'd a 3.7GB Raspberry Pi on a
+        # real 16M-row/365-day sample before this change).
         rows = conn.execute(
             "SELECT timestamp_epoch, pbattery1, pgrid, pgrid2, pgrid3, ppv, grid_mode FROM inverter_history "
             "ORDER BY timestamp_epoch"
-        ).fetchall()
+        )
         sessions = find_labeled_sessions(rows, thresholds)
         sessions = filter_min_duration(sessions, args.min_session_seconds)
         totals = measure_sessions(conn, sessions, args.edge_trim_samples)
