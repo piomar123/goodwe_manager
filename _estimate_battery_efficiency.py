@@ -76,6 +76,16 @@ import storage
 # trickle while keeping every real event (verified: discharge-direction
 # sessions are already all >=77W, so this doesn't affect that side).
 DEFAULT_BATTERY_NOISE_W = 60.0
+# Hypothesis: the BMS draws a small, roughly-constant amount of power
+# continuously (it's powered by the inverter at all times, not just
+# when charging/discharging), which pbattery1 reports as part of
+# whatever else is happening - not a threshold to filter out, but a
+# bias to correct on every sample. Best empirical estimate: the
+# charge-direction trickle cluster found while tuning
+# DEFAULT_BATTERY_NOISE_W averaged 31.9W (see GOODWE_SENSOR_NOTES.md) -
+# taken as the offset magnitude, sign chosen so a true-idle sample
+# (raw ~-31.9W, charge-direction) corrects back to ~0.
+BATTERY_OFFSET_W = 31.9
 # Zero, not a small positive margin: any nonzero PV, even a few watts,
 # is real DC power reaching the shared PV/battery bus on a hybrid
 # inverter, and battery_ac_charge/battery_ac_discharge require PV
@@ -138,12 +148,27 @@ def _sign(value: Optional[float], threshold: float) -> Optional[str]:
     return None
 
 
+def _corrected_pbattery1(pbattery1: Optional[float]) -> Optional[float]:
+    """Applies BATTERY_OFFSET_W as an additive correction, not just a
+    classification threshold: the BMS is powered continuously by the
+    inverter (hypothesis - see GOODWE_SENSOR_NOTES.md), so this constant
+    draw is present in every pbattery1 reading, not only near-idle ones.
+    Left uncorrected, it systematically overstates charge-direction
+    magnitude and understates discharge-direction magnitude by the same
+    amount everywhere, not just at low power - exactly the shape of the
+    negative-combined-loss anomaly this was introduced to test."""
+    if pbattery1 is None:
+        return None
+    return pbattery1 + BATTERY_OFFSET_W
+
+
 def _battery_direction(pbattery1: Optional[float], threshold: float) -> Optional[str]:
     """'charge'/'discharge' - pbattery1's sign convention is NOT what a
     naive reading suggests: verified against 90 days of production data
     in PR #33, positive = discharging, negative = charging (see
-    GOODWE_SENSOR_NOTES.md)."""
-    sign = _sign(pbattery1, threshold)
+    GOODWE_SENSOR_NOTES.md). Classifies on the offset-corrected value,
+    consistent with every other use of pbattery1 in this module."""
+    sign = _sign(_corrected_pbattery1(pbattery1), threshold)
     if sign == 'pos':
         return 'discharge'
     if sign == 'neg':
@@ -161,16 +186,33 @@ def _grid_power_sum(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Opt
     return abs(pgrid) + abs(pgrid2) + abs(pgrid3)
 
 
+def _grid_phases_agree(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Optional[float],
+                        threshold: float = 20.0) -> bool:
+    """True unless two non-negligible phases actively disagree in sign -
+    a real but phase-imbalanced flow (e.g. one phase's load pulling
+    import while another exports) that isn't attributable to a single
+    coherent AC-side energy transfer. Verified on real data: 23%/12% of
+    samples within battery_ac_charge/discharge sessions had disagreeing
+    phases (see GOODWE_SENSOR_NOTES.md) - summing their absolute values
+    would overstate the AC-side magnitude actually attributable to the
+    battery."""
+    signs = {_sign(v, threshold) for v in (pgrid, pgrid2, pgrid3)}
+    signs.discard(None)
+    return len(signs) <= 1
+
+
 def classify_sample(pbattery1: Optional[float], pgrid: Optional[float], pgrid2: Optional[float],
                      pgrid3: Optional[float], ppv: Optional[float], grid_mode: Optional[float],
                      thresholds: Thresholds) -> Optional[str]:
     """Classifies one sample into one of the four flow states (see module
     docstring), or None if it matches none of them cleanly (multiple
-    things active at once, everything idle, or grid_mode isn't
-    Connected - an islanded/off-grid period has different loss
-    characteristics and shouldn't be attributed to any of these four
-    normal-operation paths)."""
+    things active at once, everything idle, phase-imbalanced grid flow,
+    or grid_mode isn't Connected - an islanded/off-grid period has
+    different loss characteristics and shouldn't be attributed to any
+    of these four normal-operation paths)."""
     if grid_mode != GRID_MODE_CONNECTED:
+        return None
+    if not _grid_phases_agree(pgrid, pgrid2, pgrid3):
         return None
     battery_dir = _battery_direction(pbattery1, thresholds.battery_w)
     pv_producing = ppv is not None and ppv > thresholds.pv_w
@@ -269,7 +311,7 @@ SESSION_SPECS: Dict[str, dict] = {
         'input_power': lambda r: r['ppv'],
         'input_counter': 'e_day',
         'input_same_day': True,
-        'output_power': lambda r: _abs_or_none(r['pbattery1']),
+        'output_power': lambda r: _abs_or_none(_corrected_pbattery1(r['pbattery1'])),
         'output_counter': 'e_bat_charge_total',
         'output_same_day': False,
     },
@@ -277,12 +319,12 @@ SESSION_SPECS: Dict[str, dict] = {
         'input_power': _pgrid_sum_or_none,
         'input_counter': PGRID_ENERGY_COUNTERS,
         'input_same_day': False,
-        'output_power': lambda r: _abs_or_none(r['pbattery1']),
+        'output_power': lambda r: _abs_or_none(_corrected_pbattery1(r['pbattery1'])),
         'output_counter': 'e_bat_charge_total',
         'output_same_day': False,
     },
     BATTERY_AC_DISCHARGE: {
-        'input_power': lambda r: _abs_or_none(r['pbattery1']),
+        'input_power': lambda r: _abs_or_none(_corrected_pbattery1(r['pbattery1'])),
         'input_counter': 'e_bat_discharge_total',
         'input_same_day': False,
         'output_power': _pgrid_sum_or_none,

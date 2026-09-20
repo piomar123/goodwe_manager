@@ -9,6 +9,28 @@ THRESHOLDS = estimator.Thresholds(battery_w=200.0, pv_w=0.0, grid_idle_w=60.0)
 CONNECTED = estimator.GRID_MODE_CONNECTED
 
 
+class CorrectedPbattery1Test(unittest.TestCase):
+    def test_adds_the_offset(self):
+        self.assertAlmostEqual(estimator._corrected_pbattery1(-31.9), 0.0, places=6)
+
+    def test_none_stays_none(self):
+        self.assertIsNone(estimator._corrected_pbattery1(None))
+
+
+class GridPhasesAgreeTest(unittest.TestCase):
+    def test_all_same_sign_agrees(self):
+        self.assertTrue(estimator._grid_phases_agree(400.0, 400.0, 400.0))
+
+    def test_opposite_signs_disagree(self):
+        self.assertFalse(estimator._grid_phases_agree(400.0, -400.0, 400.0))
+
+    def test_near_zero_phase_ignored(self):
+        self.assertTrue(estimator._grid_phases_agree(400.0, 400.0, 5.0))
+
+    def test_all_near_zero_agrees(self):
+        self.assertTrue(estimator._grid_phases_agree(5.0, -5.0, 5.0))
+
+
 class ClassifySampleTest(unittest.TestCase):
     def test_battery_ac_charge(self):
         # pbattery1 negative = charging (verified sign, see PR #33) -
@@ -70,6 +92,22 @@ class ClassifySampleTest(unittest.TestCase):
         state = estimator.classify_sample(pbattery1=-700.0, pgrid=0.0, pgrid2=0.0, pgrid3=0.0,
                                            ppv=200.0, grid_mode=0, thresholds=THRESHOLDS)
         self.assertIsNone(state)
+
+    def test_phase_imbalanced_grid_rejects_the_sample(self):
+        # One phase importing while another exports isn't a single
+        # coherent AC-side flow - summing their magnitudes would
+        # overstate what's actually attributable to the battery.
+        state = estimator.classify_sample(pbattery1=-500.0, pgrid=400.0, pgrid2=-400.0, pgrid3=400.0,
+                                           ppv=0.0, grid_mode=CONNECTED, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
+    def test_phase_near_zero_does_not_count_as_disagreeing(self):
+        # A phase reading near-zero shouldn't block classification - it's
+        # only an actual sign conflict between two non-negligible phases
+        # that's disqualifying.
+        state = estimator.classify_sample(pbattery1=-500.0, pgrid=400.0, pgrid2=400.0, pgrid3=5.0,
+                                           ppv=0.0, grid_mode=CONNECTED, thresholds=THRESHOLDS)
+        self.assertEqual(state, estimator.BATTERY_AC_CHARGE)
 
 
 class FindLabeledSessionsTest(unittest.TestCase):
@@ -186,12 +224,15 @@ class MeasureSessionsTest(unittest.TestCase):
 
         t = totals[estimator.BATTERY_AC_CHARGE]
         self.assertEqual(t.session_count, 1)
-        # integral: 1200W AC (3x400) for 60s = 20Wh in, 1000W DC for 60s = 16.67Wh out
+        # integral: 1200W AC (3x400) for 60s = 20Wh in; DC is
+        # BATTERY_OFFSET_W-corrected (raw 1000W - 31.9W offset = 968.1W)
+        # for 60s = 16.135Wh out.
         self.assertAlmostEqual(t.input_integral_wh, 20.0, places=2)
-        self.assertAlmostEqual(t.output_integral_wh, 16.667, places=2)
+        self.assertAlmostEqual(t.output_integral_wh, 16.135, places=2)
         self.assertGreater(t.loss_integral(), 0)
         # e_total_exp delta: (50.02-50.0)*1000 = 20Wh in, e_bat_charge_total
-        # delta: (200.017-200.0)*1000 = 17Wh out
+        # delta: (200.017-200.0)*1000 = 17Wh out (the counter itself
+        # isn't offset-corrected, only the raw power series is)
         self.assertEqual(t.delta_sessions, 1)
         self.assertAlmostEqual(t.input_delta_wh, 20.0, places=2)
         self.assertAlmostEqual(t.output_delta_wh, 17.0, places=2)
