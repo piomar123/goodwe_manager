@@ -62,15 +62,12 @@ from typing import Dict, List, Optional, Tuple
 
 import storage
 
-# battery-grid-direction-from-sign (PR #33, merged to main) measured
-# pbattery1/grid-meter sign disagreement concentrated within a +/-200W
-# band on this hardware - a much wider noise floor than a "clean" sensor
-# would need, so both battery and grid-phase classification use it here
-# too rather than a smaller, seemingly-safer default that would actually
-# just be noise-dominated (see PR #35's finding of 5-second median
-# session length at a 20W threshold).
-DEFAULT_BATTERY_NOISE_W = 200.0
-DEFAULT_GRID_PHASE_NOISE_W = 200.0
+# PR #33's ~19%-of-Discharge-samples disagreement (concentrated within
+# +/-200W of zero) is cross-register poll timing skew, not power-value
+# noise (see GOODWE_SENSOR_NOTES.md) - a magnitude threshold doesn't fix
+# a timing problem, so this stays modest; the real transition guards are
+# DEFAULT_MIN_SESSION_SECONDS/DEFAULT_EDGE_TRIM_SAMPLES below.
+DEFAULT_BATTERY_NOISE_W = 30.0
 # PV can't read negative, so this only needs to separate "producing" from
 # sensor noise around zero, not disambiguate a sign - a much smaller
 # threshold is fine.
@@ -88,8 +85,7 @@ DEFAULT_EDGE_TRIM_SAMPLES = 2
 # "inverter AC output idle" (required only by pv_charge, to confirm
 # charging is happening via the DC-bus bypass rather than the AC path)
 # is a magnitude check on pgrid+pgrid2+pgrid3, using the *correct*
-# grid-facing field this time (see GOODWE_SENSOR_NOTES.md) - deliberately
-# small, not reused from DEFAULT_GRID_PHASE_NOISE_W.
+# grid-facing field this time (see GOODWE_SENSOR_NOTES.md).
 DEFAULT_GRID_IDLE_SUM_W = 60.0
 
 PV_AC = 'pv_ac'
@@ -107,7 +103,6 @@ GRID_MODE_CONNECTED = 1
 @dataclass
 class Thresholds:
     battery_w: float = DEFAULT_BATTERY_NOISE_W
-    grid_phase_w: float = DEFAULT_GRID_PHASE_NOISE_W
     pv_w: float = DEFAULT_PV_NOISE_W
     grid_idle_w: float = DEFAULT_GRID_IDLE_SUM_W
 
@@ -278,14 +273,31 @@ SESSION_ROW_COLUMNS = ('timestamp_epoch', 'timestamp', 'pbattery1', 'pgrid', 'pg
 @dataclass
 class SessionTypeTotals:
     session_count: int = 0
+    # Paired totals: only accumulated together, from sessions where BOTH
+    # sides had a usable delta - loss_delta()'s ratio is only meaningful
+    # across the same set of sessions on both sides.
     input_delta_wh: float = 0.0
-    input_integral_wh: float = 0.0
     output_delta_wh: float = 0.0
+    delta_sessions: int = 0
+    input_integral_wh: float = 0.0
     output_integral_wh: float = 0.0
-    delta_sessions: int = 0  # sessions that contributed a delta measurement (same_day guard, or no counter, may skip some)
+    # Diagnostic-only, single-side totals: accumulated independently of
+    # the other side, so the counter-backed side (e.g. battery, when
+    # pgrid has no matching energy counter at all - see
+    # GOODWE_SENSOR_NOTES.md) can still be compared against its own
+    # integral even when a full paired loss_delta() is impossible. The
+    # integral half is summed only over the SAME sessions that
+    # contributed a delta, so the two numbers describe the same
+    # population rather than being biased by session-count differences.
+    input_delta_wh_any: float = 0.0
+    input_integral_wh_when_delta_any: float = 0.0
+    input_delta_sessions_any: int = 0
+    output_delta_wh_any: float = 0.0
+    output_integral_wh_when_delta_any: float = 0.0
+    output_delta_sessions_any: int = 0
 
     def loss_delta(self) -> Optional[float]:
-        if self.input_delta_wh <= 0:
+        if self.delta_sessions == 0 or self.input_delta_wh <= 0:
             return None
         return 1 - (self.output_delta_wh / self.input_delta_wh)
 
@@ -293,6 +305,23 @@ class SessionTypeTotals:
         if self.input_integral_wh <= 0:
             return None
         return 1 - (self.output_integral_wh / self.input_integral_wh)
+
+    def _side_precision_note(self, side: str) -> Optional[str]:
+        """Compares a counter-backed side's delta sum against its own
+        integral sum, over the same sessions - a direct precision
+        cross-check independent of whether the other side has a counter
+        at all."""
+        delta_wh = getattr(self, f'{side}_delta_wh_any')
+        integral_wh = getattr(self, f'{side}_integral_wh_when_delta_any')
+        n = getattr(self, f'{side}_delta_sessions_any')
+        if n == 0 or integral_wh <= 0:
+            return None
+        pct_diff = (delta_wh - integral_wh) / integral_wh * 100.0
+        return f"{side}: delta={delta_wh:.1f}Wh vs integral={integral_wh:.1f}Wh ({pct_diff:+.1f}%, n={n})"
+
+    def precision_notes(self) -> List[str]:
+        notes = [self._side_precision_note('input'), self._side_precision_note('output')]
+        return [n for n in notes if n is not None]
 
 
 def _measure_session(conn: sqlite3.Connection, session: Session, spec: dict,
@@ -362,10 +391,19 @@ def measure_sessions(conn: sqlite3.Connection, sessions: List[Session],
         t.session_count += 1
         t.input_integral_wh += measurement['input_integral_wh']
         t.output_integral_wh += measurement['output_integral_wh']
-        if measurement['input_delta_wh'] is not None and measurement['output_delta_wh'] is not None \
-                and measurement['input_delta_wh'] > 0:
-            t.input_delta_wh += measurement['input_delta_wh']
-            t.output_delta_wh += measurement['output_delta_wh']
+        input_delta = measurement['input_delta_wh']
+        output_delta = measurement['output_delta_wh']
+        if input_delta is not None and input_delta > 0:
+            t.input_delta_wh_any += input_delta
+            t.input_integral_wh_when_delta_any += measurement['input_integral_wh']
+            t.input_delta_sessions_any += 1
+        if output_delta is not None:
+            t.output_delta_wh_any += output_delta
+            t.output_integral_wh_when_delta_any += measurement['output_integral_wh']
+            t.output_delta_sessions_any += 1
+        if input_delta is not None and output_delta is not None and input_delta > 0:
+            t.input_delta_wh += input_delta
+            t.output_delta_wh += output_delta
             t.delta_sessions += 1
     return totals
 
@@ -471,6 +509,8 @@ def main():
         print(f"  [{label}] sessions: {t.session_count} (delta-eligible: {t.delta_sessions})")
         print(f"    loss via energy-counter delta: {_fmt_loss(t.loss_delta())}")
         print(f"    loss via power integration:    {_fmt_loss(t.loss_integral())}")
+        for note in t.precision_notes():
+            print(f"    counter-vs-integral precision, {note}")
     print()
     print("Recommended apps.yaml values:")
     print(f"  inverter_loss             (delta-based):   {_fmt_loss(delta_estimate.inverter_loss)}")

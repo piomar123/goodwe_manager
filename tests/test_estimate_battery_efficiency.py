@@ -236,6 +236,26 @@ class MeasureSessionsTest(unittest.TestCase):
         # the large session's ~1000Wh should dominate the tiny session's ~3.3Wh
         self.assertGreater(t.input_integral_wh, 900.0)
 
+    def test_battery_ac_charge_output_side_precision_note_available_despite_no_full_loss_delta(self):
+        # battery_ac_charge's input side (pgrid) has no matching energy
+        # counter at all, so loss_delta() can never work - but the
+        # output side (battery, which does have e_bat_charge_total)
+        # should still be comparable against its own integral.
+        rows = [
+            (0, "2026-07-15 10:00:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.0, 80.0, 5.0),
+            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0),
+        ]
+        self._insert(rows)
+        sessions = [estimator.Session(estimator.BATTERY_AC_CHARGE, 0, 60)]
+
+        totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=0)
+        t = totals[estimator.BATTERY_AC_CHARGE]
+
+        self.assertIsNone(t.loss_delta())
+        notes = t.precision_notes()
+        self.assertEqual(len(notes), 1)
+        self.assertTrue(notes[0].startswith('output:'))
+
 
 class DeriveBatteryLossTest(unittest.TestCase):
     def test_backs_out_battery_only_loss_from_combined_and_inverter_loss(self):
@@ -255,6 +275,7 @@ class EstimateEfficiencyTest(unittest.TestCase):
         totals = {state: estimator.SessionTypeTotals() for state in estimator.ALL_STATES}
         totals[estimator.PV_AC].input_delta_wh = 100.0
         totals[estimator.PV_AC].output_delta_wh = 96.0  # loss 0.04
+        totals[estimator.PV_AC].delta_sessions = 1
 
         estimate = estimator.estimate_efficiency(totals, method='delta')
 

@@ -30,15 +30,22 @@ There are two, unrelated grid-facing quantities - easy to conflate, and we did:
   grid-idle classification, not something to reinvent.
 - **`meter_active_power1/2/3`/`meter_active_power_total`** (register
   36019-36025, a different register block from `active_power`) is a
-  second, independent reading of the same net grid quantity - almost
-  certainly from an external CT/smart-meter accessory rather than the
-  inverter's own internal sensing. Verified empirically against 7 days
-  of real data, grouped by `grid_in_out`: idle → 3.9W avg, exporting →
-  +1544W avg, importing → -448W avg. Same sign convention as
-  `active_power`, and the two agree closely - either is usable as "the
-  grid meter"; `meter_active_power_total` is one physical layer more
-  independent from the inverter's own PV/battery sensing, if that
-  matters for cross-checking.
+  second reading of the same net grid quantity. There is only one
+  physical external CT/smart-meter accessory on these hybrid inverters
+  (it's the only way the inverter could know what crosses the utility
+  connection at all), and the library confirms these two fields come
+  from genuinely separate Modbus reads of it: `_READ_RUNNING_DATA`
+  (0x891C, where `active_power` lives) vs. the dedicated
+  `_READ_METER_DATA`/`_READ_METER_DATA_EXTENDED[2]` (0x8CA0, where
+  `meter_active_power*` lives) - issued as two sequential requests per
+  poll, not one atomic one. `active_power` is almost certainly the
+  inverter firmware's own real-time-control copy of the same meter feed,
+  cached into its main telemetry block; `meter_active_power*` is that
+  meter queried directly. Same sign convention, verified empirically
+  against 7 days of real data grouped by `grid_in_out`: idle → 3.9W avg,
+  exporting → +1544W avg, importing → -448W avg - the two fields agree
+  closely but not exactly, consistent with being two separate reads of
+  one sensor rather than one shared register.
 - **`house_consumption`** (a `Calculated` sensor in `goodwe/et.py`) is
   documented in the library's own source as `ppv1+ppv2+ppv3+ppv4 +
   pbattery1(signed) - active_power(signed)` - i.e. exactly the KCL
@@ -72,21 +79,21 @@ commit message and `diagram-calc.js`'s comment above `batteryState()`).
 
 ## Noise / cross-sensor disagreement, verified against this hardware
 
-- **±200W band**: PR #33 found `pbattery1`'s sign disagrees with the
-  coarser `battery_mode` label for ~19% of all Discharge-mode samples,
-  concentrated (34%) within a ±200W band around zero. Any threshold
-  meant to separate "real activity" from noise on this hardware should
-  be at least this wide - a naive 20W threshold produces a median
-  session length of 5 seconds (pure noise-driven flapping), not real
-  events.
-- **Cross-register poll skew**: Goodwe's protocol reads registers
-  sequentially, not atomically, so different sensors (`pbattery1`,
-  `pgrid*`, `ppv`) can reflect slightly different real instants within
-  the same poll. This shows up specifically at genuine state
+- **Cross-register poll skew, not power-value noise**: Goodwe's
+  protocol reads registers sequentially, not atomically - different
+  sensors (`pbattery1`, `pgrid*`, `ppv`, and `active_power` vs.
+  `meter_active_power*` from an entirely separate Modbus command; see
+  above) can reflect slightly different real instants within the same
+  poll. PR #33's finding that `pbattery1`'s sign disagrees with the
+  coarser `battery_mode` label for ~19% of Discharge-mode samples
+  (concentrated within ±200W of zero) is this same timing effect, not
+  a noisy power reading - it shows up specifically at genuine state
   transitions (a few seconds where the sample set is internally
-  inconsistent) - not as steady-state noise, so a magnitude threshold
-  doesn't help. Guard by rejecting too-short sessions and trimming a
-  couple of samples off each session's start/end.
+  inconsistent), not as steady-state noise. A magnitude threshold
+  doesn't fix a timing problem: the real guards are rejecting
+  too-short sessions and trimming a couple of samples off each
+  session's start/end, which is what actually excludes the transition
+  window rather than papering over it with an oversized noise floor.
 - **Islanding zeroes out meter-derived fields**: during an
   islanded/off-grid period (`grid_mode != Connected` - see
   `GRID_MODES`/`grid_mode_label`), `active_power`/`meter_active_power*`
@@ -101,6 +108,28 @@ commit message and `diagram-calc.js`'s comment above `batteryState()`).
   `docs/superpowers/mockups/battery-negative-power-vs-sumabs-pgrid.html`)
   - avoid it as an AC-side quantity; use `pgrid`+`pgrid2`+`pgrid3`
   instead, which has continuous coverage through the same range.
+
+## Power sensors and their energy-counter equivalents
+
+| Power sensor | Lifetime energy counter | Today-only counter |
+|---|---|---|
+| `ppv` (= ppv1+ppv2+ppv3+ppv4) | `e_total` | `e_day` |
+| `pbattery1` > 0 (discharging) | `e_bat_discharge_total` | `e_bat_discharge_day` |
+| `pbattery1` < 0 (charging) | `e_bat_charge_total` | `e_bat_charge_day` |
+| `active_power` > 0 (exporting) | `e_total_exp` | `e_day_exp` |
+| `active_power` < 0 (importing) | `e_total_imp` | `e_day_imp` |
+| `meter_active_power_total`/`1`/`2`/`3` (exporting) | `meter_e_total_exp`/`exp1`/`exp2`/`exp3` | - (no today-only variant) |
+| `meter_active_power_total`/`1`/`2`/`3` (importing) | `meter_e_total_imp`/`imp1`/`imp2`/`imp3` | - (no today-only variant) |
+| `load_ptotal` | `e_load_total` | `e_load_day` |
+| `pgrid`/`pgrid2`/`pgrid3` | **none** - no lifetime/today counter exists for the inverter's own on-grid AC output specifically | - |
+
+The `pgrid` gap matters for any energy-conservation-style measurement
+using it directly (as `_estimate_battery_efficiency.py` now does): the
+AC side of a battery-driven session can only be cross-checked against
+raw power integration, never against a counter delta, since no such
+counter exists for that exact quantity - `e_total_exp`/`e_total_imp`
+track `active_power`'s net-grid framing instead, which is a different
+number whenever load is nonzero.
 
 ## Energy counter units
 
