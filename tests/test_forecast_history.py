@@ -124,6 +124,23 @@ class ForecastHistoryTest(unittest.TestCase):
         forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=2000)
         self.assertFalse(forecast_history.has_fetched_since(self.conn, 'solcast', 1000))
 
+    def test_has_fetched_date_since_true_when_that_date_has_a_snapshot_at_or_after_the_threshold(self):
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=2000)
+        self.assertTrue(forecast_history.has_fetched_date_since(self.conn, 'meteosource', '2026-01-01', 2000))
+        self.assertTrue(forecast_history.has_fetched_date_since(self.conn, 'meteosource', '2026-01-01', 1000))
+
+    def test_has_fetched_date_since_false_when_that_date_has_no_snapshot(self):
+        # Unlike has_fetched_since, a fresh snapshot for a *different* date
+        # doesn't count - this is what has_fetched_since can't tell apart,
+        # the gap that let Meteosource's "tomorrow" catch-up get silently
+        # skipped once "today" alone looked fresh.
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=2000)
+        self.assertFalse(forecast_history.has_fetched_date_since(self.conn, 'meteosource', '2026-01-02', 2000))
+
+    def test_has_fetched_date_since_false_when_that_dates_snapshot_is_older_than_the_threshold(self):
+        forecast_history.write_snapshot(self.conn, 'meteosource', '2026-01-01', {'07:00': 0.5}, now=1000)
+        self.assertFalse(forecast_history.has_fetched_date_since(self.conn, 'meteosource', '2026-01-01', 2000))
+
 
 if __name__ == '__main__':
     unittest.main()
