@@ -55,6 +55,7 @@ MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD')
 MQTT_TOPIC_PREFIX = os.environ.get('MQTT_TOPIC_PREFIX', 'goodwe')
 TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 RCE_EXPORT_GRANULARITY = os.environ.get('RCE_EXPORT_GRANULARITY', '15min')
+RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
 WARSAW_TZ = ZoneInfo('Europe/Warsaw')
 
 # https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format
@@ -230,7 +231,7 @@ class AsyncioThread(threading.Thread):
             await self._seed_hour_start_baseline()
             await self._seed_day_start_baseline()
             if mqtt.enabled:
-                await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY))
+                await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
                 if TARIFF_IMPORT_CONFIG:
                     try:
                         _publish_import_prices()
@@ -279,7 +280,7 @@ class AsyncioThread(threading.Thread):
                 if new_day_start != current_day_start:
                     current_day_start = new_day_start
                     if mqtt.enabled:
-                        await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY))
+                        await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
                         if TARIFF_IMPORT_CONFIG:
                             try:
                                 _publish_import_prices()
@@ -384,7 +385,7 @@ mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USER
 
 
 def _publish_export_prices():
-    payload = export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY)
+    payload = export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES)
     asyncio_thread.run_coroutine_threadsafe(mqtt.publish_export_prices(payload))
 
 

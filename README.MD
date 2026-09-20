@@ -44,6 +44,12 @@ market's own settlement period). Set `RCE_EXPORT_GRANULARITY=hourly` to
 average each hour's four quarters first instead, matching how PGE
 settles prosument export credit on an hourly basis.
 
+A negative RCE price publishes as `0.0` by default (`RCE_EXPORT_NEGATIVE_PRICES=zero`),
+matching net-billing paying nothing for it. Set `RCE_EXPORT_NEGATIVE_PRICES=raw`
+to publish the true negative value instead - note the 23% VAT bonus is
+never applied to a negative price either way, since the law doesn't
+define a bonus on a loss.
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 

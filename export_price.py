@@ -14,6 +14,20 @@ import rce_storage
 EXPORT_VAT_BONUS_MULTIPLIER = 1.23
 
 
+def _export_value(rce_pln: float, negative_prices: str) -> float:
+    """Converts a PLN/MWh RCE price into the zl/kWh export value Predbat
+    publishes. `negative_prices` is 'zero' (default - net-billing pays
+    nothing for a negative-price period, so publish 0.0) or 'raw'
+    (publish the true negative value). The VAT bonus multiplier only
+    applies to non-negative prices: the law doesn't yet define a bonus on
+    a value that isn't income, so a negative price is published as
+    rce_pln/1000 with no multiplier rather than making the loss look
+    23% larger."""
+    if rce_pln < 0:
+        return rce_pln / 1000.0 if negative_prices == 'raw' else 0.0
+    return rce_pln / 1000.0 * EXPORT_VAT_BONUS_MULTIPLIER
+
+
 def _hour_key(period: str) -> str:
     """Groups a 'HH:MM' (or DST fall-back 'HHa:MM') period string by its
     hour, keeping the 'a' suffix so the disambiguated fall-back hour
@@ -70,7 +84,9 @@ def _parse_period_start(period: str, day: date, tz: ZoneInfo) -> datetime:
     )
 
 
-def _bands_for_business_date(business_date_str: str, tz: ZoneInfo, granularity: str = '15min') -> List[dict]:
+def _bands_for_business_date(
+    business_date_str: str, tz: ZoneInfo, granularity: str = '15min', negative_prices: str = 'zero',
+) -> List[dict]:
     conn = rce_storage.init_db()
     try:
         if not rce_storage.is_cached(conn, business_date_str):
@@ -87,22 +103,29 @@ def _bands_for_business_date(business_date_str: str, tz: ZoneInfo, granularity: 
     for (period, rce_pln), (next_period, _) in zip(periods, periods[1:]):
         start = _parse_period_start(period, day, tz)
         end = _parse_period_start(next_period, day, tz)
-        value = rce_pln / 1000.0 * EXPORT_VAT_BONUS_MULTIPLIER
+        value = _export_value(rce_pln, negative_prices)
         bands.append({'from': start.isoformat(), 'to': end.isoformat(), 'value': value})
     return bands
 
 
-def build_export_price_payload(today: date, tz: ZoneInfo, granularity: str = '15min') -> dict:
+def build_export_price_payload(
+    today: date, tz: ZoneInfo, granularity: str = '15min', negative_prices: str = 'zero',
+) -> dict:
     """Returns {"raw_today": [...], "raw_tomorrow": [...]}. raw_tomorrow
     is an empty list (not an error) when tomorrow's RCE prices aren't
     cached yet - see spec Component 3's "Tomorrow not cached yet".
 
     `granularity` is '15min' (default, matches the RCE market's own
     settlement period) or 'hourly' (averages each hour's four quarters
-    before applying the VAT bonus, matching how PGE settles export
-    credit for prosumers on an hourly basis)."""
+    before pricing, matching how PGE settles export credit for
+    prosumers on an hourly basis).
+
+    `negative_prices` is 'zero' (default - a negative RCE price
+    publishes as 0.0, matching net-billing paying nothing for it) or
+    'raw' (publishes the true negative value, with no VAT bonus applied
+    since the law doesn't define a bonus on a loss)."""
     tomorrow = today + timedelta(days=1)
     return {
-        'raw_today': _bands_for_business_date(today.strftime('%Y-%m-%d'), tz, granularity),
-        'raw_tomorrow': _bands_for_business_date(tomorrow.strftime('%Y-%m-%d'), tz, granularity),
+        'raw_today': _bands_for_business_date(today.strftime('%Y-%m-%d'), tz, granularity, negative_prices),
+        'raw_tomorrow': _bands_for_business_date(tomorrow.strftime('%Y-%m-%d'), tz, granularity, negative_prices),
     }

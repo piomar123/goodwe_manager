@@ -115,6 +115,40 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         self.assertAlmostEqual(first_occurrence['value'], 0.3075, places=6)
         self.assertAlmostEqual(second_occurrence['value'], 0.615, places=6)
 
+    def test_negative_price_defaults_to_zero(self):
+        self._store('2026-07-15', [('00:00', -50.0), ('24:00', -50.0)])
+        payload = export_price.build_export_price_payload(date(2026, 7, 15), WARSAW)
+
+        self.assertEqual(payload['raw_today'][0]['value'], 0.0)
+
+    def test_negative_price_raw_publishes_true_value_without_vat_bonus(self):
+        self._store('2026-07-15', [('00:00', -50.0), ('24:00', -50.0)])
+        payload = export_price.build_export_price_payload(
+            date(2026, 7, 15), WARSAW, negative_prices='raw')
+
+        # -50 PLN/MWh -> -0.05 zl/kWh, no VAT bonus applied to a loss
+        self.assertAlmostEqual(payload['raw_today'][0]['value'], -0.05, places=6)
+
+    def test_positive_price_unaffected_by_negative_prices_setting(self):
+        self._store('2026-07-15', [('00:00', 400.0), ('24:00', 400.0)])
+        payload = export_price.build_export_price_payload(
+            date(2026, 7, 15), WARSAW, negative_prices='raw')
+
+        self.assertAlmostEqual(payload['raw_today'][0]['value'], 0.492, places=6)
+
+    def test_hourly_average_negative_then_negative_handling_applied(self):
+        # mean(-100, -100, 100, 100) = 0 - not negative, so the VAT bonus
+        # still applies to the averaged (non-negative) hourly value even
+        # though two of the four quarters were individually negative.
+        self._store('2026-07-15', [
+            ('00:00', -100.0), ('00:15', -100.0), ('00:30', 100.0), ('00:45', 100.0),
+            ('24:00', 100.0),
+        ])
+        payload = export_price.build_export_price_payload(
+            date(2026, 7, 15), WARSAW, granularity='hourly', negative_prices='raw')
+
+        self.assertAlmostEqual(payload['raw_today'][0]['value'], 0.0, places=6)
+
 
 if __name__ == '__main__':
     unittest.main()
