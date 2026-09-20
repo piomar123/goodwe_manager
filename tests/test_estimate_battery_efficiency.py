@@ -1,187 +1,304 @@
 import sqlite3
 import sys
-import time
 import unittest
 from unittest import mock
 
 import _estimate_battery_efficiency as estimator
 
+THRESHOLDS = estimator.Thresholds(battery_w=200.0, grid_phase_w=200.0, pv_w=50.0)
 
-class FindBatterySessionsTest(unittest.TestCase):
-    def test_splits_into_contiguous_same_sign_runs_above_noise_threshold(self):
-        # (timestamp_epoch, pbattery1) - positive = charging, negative = discharging,
-        # by this repo's existing sign convention (see sensors.py's pbattery1 comment context)
-        samples = [
-            (0, 500.0), (60, 600.0), (120, 550.0),   # charge session
-            (180, 5.0),                               # below noise threshold - a gap
-            (240, -400.0), (300, -450.0),              # discharge session
+
+class ClassifySampleTest(unittest.TestCase):
+    def test_grid_charge(self):
+        # importing on all 3 phases, battery charging, no PV
+        state = estimator.classify_sample(pbattery1=500.0, pgrid=-400.0, pgrid2=-400.0, pgrid3=-400.0,
+                                           ppv=0.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertEqual(state, estimator.GRID_CHARGE)
+
+    def test_grid_discharge(self):
+        state = estimator.classify_sample(pbattery1=-500.0, pgrid=400.0, pgrid2=400.0, pgrid3=400.0,
+                                           ppv=0.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertEqual(state, estimator.GRID_DISCHARGE)
+
+    def test_pv_export(self):
+        state = estimator.classify_sample(pbattery1=0.0, pgrid=400.0, pgrid2=400.0, pgrid3=400.0,
+                                           ppv=2000.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertEqual(state, estimator.PV_EXPORT)
+
+    def test_pv_charge(self):
+        state = estimator.classify_sample(pbattery1=1500.0, pgrid=0.0, pgrid2=0.0, pgrid3=0.0,
+                                           ppv=2000.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertEqual(state, estimator.PV_CHARGE)
+
+    def test_battery_to_load(self):
+        state = estimator.classify_sample(pbattery1=-500.0, pgrid=0.0, pgrid2=0.0, pgrid3=0.0,
+                                           ppv=0.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertEqual(state, estimator.BATTERY_TO_LOAD)
+
+    def test_pv_charge_rejects_large_phase_imbalanced_grid_flow_as_not_idle(self):
+        # Regression: _grid_direction() returning None (phases disagree
+        # in sign) used to be treated as "grid idle" here, letting a
+        # real but phase-imbalanced flow (one phase importing 3kW while
+        # another exports 3kW, netting near zero) contaminate a
+        # supposedly PV-only charging measurement.
+        state = estimator.classify_sample(pbattery1=1500.0, pgrid=3000.0, pgrid2=-3000.0, pgrid3=0.0,
+                                           ppv=2000.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
+    def test_phase_imbalanced_grid_is_unclassified_not_idle(self):
+        # netting near zero, but individual phases disagree in sign -
+        # a real but non-clean flow state, not "idle".
+        state = estimator.classify_sample(pbattery1=0.0, pgrid=400.0, pgrid2=-400.0, pgrid3=0.0,
+                                           ppv=0.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
+    def test_everything_idle_is_unclassified(self):
+        state = estimator.classify_sample(pbattery1=10.0, pgrid=10.0, pgrid2=10.0, pgrid3=10.0,
+                                           ppv=5.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
+    def test_multiple_signals_active_at_once_is_unclassified(self):
+        # PV producing AND grid importing AND battery charging all at
+        # once doesn't match any of the five clean paths.
+        state = estimator.classify_sample(pbattery1=500.0, pgrid=-400.0, pgrid2=-400.0, pgrid3=-400.0,
+                                           ppv=2000.0, grid_mode=estimator.GRID_MODE_CONNECTED, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
+    def test_islanded_sample_is_unclassified_even_if_it_otherwise_looks_like_pv_charge(self):
+        # Regression: a real islanded/off-grid sample was found where
+        # pgrid/pgrid2/pgrid3/load_ptotal all read exactly 0.0 (meter-
+        # derived fields stale/zeroed during an outage) while ppv and
+        # pbattery1 kept reporting normally - this would otherwise have
+        # looked exactly like a clean pv_charge sample.
+        state = estimator.classify_sample(pbattery1=700.0, pgrid=0.0, pgrid2=0.0, pgrid3=0.0,
+                                           ppv=200.0, grid_mode=0, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
+
+class FindLabeledSessionsTest(unittest.TestCase):
+    def test_splits_into_contiguous_same_state_runs(self):
+        rows = [
+            (0, 500.0, -400.0, -400.0, -400.0, 0.0, estimator.GRID_MODE_CONNECTED),   # grid_charge
+            (60, 550.0, -420.0, -420.0, -420.0, 0.0, estimator.GRID_MODE_CONNECTED),  # grid_charge
+            (120, 10.0, 10.0, 10.0, 10.0, 5.0, estimator.GRID_MODE_CONNECTED),         # idle - a gap
+            (180, -500.0, 400.0, 400.0, 400.0, 0.0, estimator.GRID_MODE_CONNECTED),   # grid_discharge
         ]
-        sessions = estimator.find_battery_sessions(samples, noise_threshold_w=20.0)
+        sessions = estimator.find_labeled_sessions(rows, THRESHOLDS)
 
         self.assertEqual(len(sessions), 2)
-        self.assertEqual(sessions[0].sign, 'charge')
+        self.assertEqual(sessions[0].state, estimator.GRID_CHARGE)
         self.assertEqual(sessions[0].start_epoch, 0)
-        self.assertEqual(sessions[0].end_epoch, 120)
-        self.assertEqual(sessions[1].sign, 'discharge')
+        self.assertEqual(sessions[0].end_epoch, 60)
+        self.assertEqual(sessions[1].state, estimator.GRID_DISCHARGE)
 
     def test_empty_input_yields_no_sessions(self):
-        self.assertEqual(estimator.find_battery_sessions([], noise_threshold_w=20.0), [])
+        self.assertEqual(estimator.find_labeled_sessions([], THRESHOLDS), [])
+
+    def test_islanded_stretch_ends_a_session_and_yields_none(self):
+        rows = [
+            (0, 700.0, 0.0, 0.0, 0.0, 200.0, estimator.GRID_MODE_CONNECTED),   # pv_charge
+            (60, 700.0, 0.0, 0.0, 0.0, 200.0, 0),  # grid_mode drops to Not Connected mid-run
+            (120, 700.0, 0.0, 0.0, 0.0, 200.0, estimator.GRID_MODE_CONNECTED),  # pv_charge resumes
+        ]
+        sessions = estimator.find_labeled_sessions(rows, THRESHOLDS)
+
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sessions[0].end_epoch, 0)
+        self.assertEqual(sessions[1].start_epoch, 120)
 
 
-class FindMatchedCyclePairsTest(unittest.TestCase):
-    def test_pairs_a_charge_and_a_later_discharge_returning_to_similar_soc(self):
-        # (timestamp_epoch, battery_soc)
-        soc_samples = [(0, 40.0), (3600, 70.0), (7200, 68.0), (10800, 41.0)]
-        # The SOC swing here (40 -> 70, a 30-point excursion) comfortably
-        # clears a 10.0-point min_excursion, so this preserves the test's
-        # original intent (a real charge/discharge round trip) while also
-        # exercising the new guard.
-        pairs = estimator.find_matched_cycle_pairs(soc_samples, max_gap_seconds=24 * 3600, soc_tolerance=5.0,
-                                                     min_excursion=10.0)
+class FilterMinDurationTest(unittest.TestCase):
+    def test_drops_sessions_shorter_than_threshold(self):
+        sessions = [
+            estimator.Session(estimator.GRID_CHARGE, 0, 3),      # 3s - too short
+            estimator.Session(estimator.GRID_DISCHARGE, 100, 200),  # 100s - kept
+        ]
 
-        self.assertEqual(len(pairs), 1)
-        self.assertEqual(pairs[0], (0, 10800))
+        filtered = estimator.filter_min_duration(sessions, min_seconds=5)
 
-    def test_no_pair_when_soc_never_returns_within_tolerance(self):
-        soc_samples = [(0, 40.0), (3600, 70.0), (7200, 90.0)]
-        pairs = estimator.find_matched_cycle_pairs(soc_samples, max_gap_seconds=24 * 3600, soc_tolerance=5.0,
-                                                     min_excursion=10.0)
+        self.assertEqual(filtered, [sessions[1]])
 
-        self.assertEqual(pairs, [])
+    def test_boundary_duration_equal_to_threshold_is_kept(self):
+        sessions = [estimator.Session(estimator.GRID_CHARGE, 0, 5)]
 
-    def test_no_pair_when_soc_barely_moves_even_within_tolerance(self):
-        # Consecutive 1Hz-style samples that never really depart from the
-        # starting SOC - before the min_excursion guard, every one of
-        # these adjacent pairs would spuriously qualify as its own
-        # "cycle" since they're trivially within soc_tolerance of each
-        # other.
-        soc_samples = [(0, 50.0), (1, 50.01), (2, 50.02), (3, 50.0), (4, 49.99)]
-        pairs = estimator.find_matched_cycle_pairs(soc_samples, max_gap_seconds=24 * 3600, soc_tolerance=3.0,
-                                                     min_excursion=10.0)
+        filtered = estimator.filter_min_duration(sessions, min_seconds=5)
 
-        self.assertEqual(pairs, [])
-
-    def test_one_pair_for_a_realistic_1hz_slow_charge_then_discharge_cycle(self):
-        # Realistic 1Hz sampling: SOC creeps up 0.01%/second for an hour
-        # (a ~36-point excursion), then back down over another hour. The
-        # old implementation (no min_excursion guard) would have produced
-        # thousands of spurious one-second "cycles" here instead of the
-        # one real charge/discharge round trip.
-        soc_samples = []
-        soc = 20.0
-        epoch = 0
-        for _ in range(3600):
-            soc_samples.append((epoch, round(soc, 4)))
-            soc += 0.01
-            epoch += 1
-        for _ in range(3600):
-            soc_samples.append((epoch, round(soc, 4)))
-            soc -= 0.01
-            epoch += 1
-        soc_samples.append((epoch, round(soc, 4)))  # back near the start
-
-        pairs = estimator.find_matched_cycle_pairs(soc_samples, max_gap_seconds=24 * 3600, soc_tolerance=1.0,
-                                                     min_excursion=10.0)
-
-        self.assertEqual(len(pairs), 1)
-
-    def test_completes_quickly_on_50000_samples(self):
-        # Regression guard against the old O(n^2) list-slicing behavior
-        # (confirmed by profiling: 20k samples took 0.065s, 80k took 1.0s,
-        # 160k took 4.1s - clean quadratic growth). This should stay well
-        # under a second with the index-based implementation.
-        soc_samples = []
-        soc = 20.0
-        epoch = 0
-        for _ in range(25000):
-            soc_samples.append((epoch, round(soc, 4)))
-            soc += 0.01
-            epoch += 1
-        for _ in range(25000):
-            soc_samples.append((epoch, round(soc, 4)))
-            soc -= 0.01
-            epoch += 1
-
-        start = time.monotonic()
-        estimator.find_matched_cycle_pairs(soc_samples, max_gap_seconds=24 * 3600, soc_tolerance=1.0,
-                                            min_excursion=10.0)
-        elapsed = time.monotonic() - start
-
-        self.assertLess(elapsed, 5.0)
-
-    def test_completes_quickly_on_flat_1hz_data_with_no_qualifying_cycle_anywhere(self):
-        # This is the actual worst case the min_excursion guard introduced:
-        # test_completes_quickly_on_50000_samples above is all genuine
-        # charge/discharge movement, so every start index quickly finds a
-        # qualifying end and the inner loop breaks early - it never
-        # exercises the slow path. A stretch with NO qualifying cycle at
-        # all (e.g. the battery sat idle for days, flat SOC) instead scans
-        # every start index all the way out to max_gap_seconds worth of
-        # samples before giving up, which is roughly quadratic in sample
-        # count - measured at ~90x slower than the old (buggy) code on
-        # flat data (61s at 40k samples vs 0.67s). Downsampling to
-        # 1-per-minute (as main() now does via downsample_to_interval
-        # before calling find_matched_cycle_pairs) shrinks the input by
-        # ~60x and keeps this fast even on a long flat stretch.
-        soc_samples = [(epoch, 50.0) for epoch in range(40000)]
-        downsampled = estimator.downsample_to_interval(soc_samples, 60)
-
-        start = time.monotonic()
-        pairs = estimator.find_matched_cycle_pairs(downsampled, max_gap_seconds=3 * 24 * 3600, soc_tolerance=3.0,
-                                                     min_excursion=10.0)
-        elapsed = time.monotonic() - start
-
-        self.assertEqual(pairs, [])
-        self.assertLess(elapsed, 5.0)
+        self.assertEqual(filtered, sessions)
 
 
-class DownsampleToIntervalTest(unittest.TestCase):
-    def test_keeps_only_the_first_sample_in_each_bucket(self):
-        samples = [(0, 1.0), (10, 2.0), (30, 3.0), (60, 4.0), (65, 5.0), (119, 6.0), (120, 7.0)]
-
-        downsampled = estimator.downsample_to_interval(samples, 60)
-
-        self.assertEqual(downsampled, [(0, 1.0), (60, 4.0), (120, 7.0)])
-
-    def test_empty_input_returns_empty_list(self):
-        self.assertEqual(estimator.downsample_to_interval([], 60), [])
-
-    def test_interval_larger_than_sample_gaps_still_yields_one_sample_per_bucket(self):
-        # Samples every 5s, but a 60s bucket - each bucket should still
-        # contribute exactly its first sample, not every sample within it.
-        samples = [(t, float(t)) for t in range(0, 180, 5)]
-
-        downsampled = estimator.downsample_to_interval(samples, 60)
-
-        self.assertEqual(downsampled, [(0, 0.0), (60, 60.0), (120, 120.0)])
-
-
-class EstimateInverterLossTest(unittest.TestCase):
+class MeasureSessionsTest(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(':memory:')
-        self.conn.execute("CREATE TABLE inverter_history (timestamp_epoch INTEGER, pbattery1 REAL, pgrid REAL, battery_soc REAL)")
+        self.conn.execute("""
+            CREATE TABLE inverter_history (
+                timestamp_epoch INTEGER, timestamp TEXT, pbattery1 REAL,
+                pgrid REAL, pgrid2 REAL, pgrid3 REAL, ppv REAL, load_ptotal REAL,
+                e_total_imp REAL, e_total_exp REAL, e_bat_charge_total REAL,
+                e_bat_discharge_total REAL, e_day REAL, e_load_total REAL
+            )
+        """)
 
-    def test_charge_session_with_known_ac_dc_ratio(self):
-        # AC-side draws consistently more than DC-side receives -> a
-        # positive, computable charge loss.
-        rows = [(0, 1000.0, 1100.0, 40.0), (60, 1000.0, 1100.0, 41.0), (120, 1000.0, 1100.0, 42.0)]
-        self.conn.executemany("INSERT INTO inverter_history VALUES (?, ?, ?, ?)", rows)
+    def _insert(self, rows):
+        self.conn.executemany(
+            "INSERT INTO inverter_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
         self.conn.commit()
 
-        sessions = estimator.find_battery_sessions([(r[0], r[1]) for r in rows], noise_threshold_w=20.0)
-        result = estimator.estimate_inverter_loss(self.conn, sessions)
+    def test_edge_trim_drops_samples_from_both_ends_before_measuring(self):
+        # A garbage first/last sample (as if cross-register skew at the
+        # transition made pgrid read something implausible) - trimming 1
+        # sample off each end should exclude both from the integral.
+        rows = [
+            (0, "2026-07-15 10:00:00", 1000.0, -99999.0, -99999.0, -99999.0, 0.0, 0.0,
+             100.0, 50.0, 200.0, 80.0, 5.0, 30.0),  # garbage edge sample
+            (60, "2026-07-15 10:01:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.02, 50.0, 200.017, 80.0, 5.0, 30.0),
+            (120, "2026-07-15 10:02:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.04, 50.0, 200.033, 80.0, 5.0, 30.0),
+            (180, "2026-07-15 10:03:00", 1000.0, 99999.0, 99999.0, 99999.0, 0.0, 0.0,
+             100.06, 50.0, 200.05, 80.0, 5.0, 30.0),  # garbage edge sample
+        ]
+        self._insert(rows)
+        sessions = [estimator.Session(estimator.GRID_CHARGE, 0, 180)]
 
-        charge_loss, charge_n = result['charge']
-        self.assertGreater(charge_loss, 0)
-        self.assertLess(charge_loss, 0.2)
-        self.assertEqual(charge_n, 1)
+        totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=1)
+
+        t = totals[estimator.GRID_CHARGE]
+        self.assertEqual(t.session_count, 1)
+        # only the middle two (clean, 400W) samples should contribute -
+        # 1200W AC for 60s = 20Wh, nowhere near the 99999W garbage values
+        self.assertAlmostEqual(t.input_integral_wh, 20.0, places=2)
+
+    def test_edge_trim_leaving_fewer_than_two_samples_is_skipped(self):
+        rows = [
+            (0, "2026-07-15 10:00:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.0, 50.0, 200.0, 80.0, 5.0, 30.0),
+            (60, "2026-07-15 10:01:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.02, 50.0, 200.017, 80.0, 5.0, 30.0),
+            (120, "2026-07-15 10:02:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.04, 50.0, 200.033, 80.0, 5.0, 30.0),
+        ]
+        self._insert(rows)
+        sessions = [estimator.Session(estimator.GRID_CHARGE, 0, 120)]
+
+        totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=2)
+
+        self.assertEqual(totals[estimator.GRID_CHARGE].session_count, 0)
+
+    def test_grid_charge_session_measures_both_delta_and_integral(self):
+        # AC-side (grid import, all 3 phases) consistently exceeds DC-side
+        # (battery charge) -> a positive, computable loss both ways.
+        rows = [
+            (0, "2026-07-15 10:00:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.0, 50.0, 200.0, 80.0, 5.0, 30.0),
+            (60, "2026-07-15 10:01:00", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             100.02, 50.0, 200.017, 80.0, 5.0, 30.0),
+        ]
+        self._insert(rows)
+        sessions = [estimator.Session(estimator.GRID_CHARGE, 0, 60)]
+
+        totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=0)
+
+        t = totals[estimator.GRID_CHARGE]
+        self.assertEqual(t.session_count, 1)
+        self.assertEqual(t.delta_sessions, 1)
+        # integral: 1200W AC (3x400) for 60s = 20Wh in, 1000W DC for 60s = 16.67Wh out
+        self.assertAlmostEqual(t.input_integral_wh, 20.0, places=2)
+        self.assertAlmostEqual(t.output_integral_wh, 16.667, places=2)
+        loss_integral = t.loss_integral()
+        self.assertGreater(loss_integral, 0)
+        # delta: (100.02-100.0)*1000 = 20Wh in, (200.017-200.0)*1000 = 17Wh out
+        self.assertAlmostEqual(t.input_delta_wh, 20.0, places=2)
+        self.assertAlmostEqual(t.output_delta_wh, 17.0, places=2)
+
+    def test_pv_session_skips_delta_when_crossing_midnight(self):
+        # e_day resets at midnight - a session straddling it must not
+        # measure a delta (would read as a nonsensical negative/garbage
+        # value), but the integral method is unaffected.
+        rows = [
+            (0, "2026-07-15 23:59:30", 1500.0, 0.0, 0.0, 0.0, 2000.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 15.0, 0.0),
+            (60, "2026-07-16 00:00:30", 1500.0, 0.0, 0.0, 0.0, 2000.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 0.5, 0.0),
+        ]
+        self._insert(rows)
+        sessions = [estimator.Session(estimator.PV_CHARGE, 0, 60)]
+
+        totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=0)
+
+        t = totals[estimator.PV_CHARGE]
+        self.assertEqual(t.session_count, 1)
+        self.assertEqual(t.delta_sessions, 0)
+        self.assertGreater(t.input_integral_wh, 0)
+
+    def test_energy_weighted_aggregation_not_averaged_per_session_ratio(self):
+        # Two grid_charge sessions: one tiny (noisy ratio if averaged
+        # naively), one large and clean. Energy-weighted totals should be
+        # dominated by the large session, not skewed 50/50 by the tiny one.
+        rows = [
+            # tiny session: 1 second, noisy-looking ratio
+            (0, "2026-07-15 10:00:00", 1000.0, -1000.0, -1000.0, -1000.0, 0.0, 0.0,
+             100.0, 50.0, 200.0, 80.0, 5.0, 30.0),
+            (1, "2026-07-15 10:00:01", 1000.0, -1000.0, -1000.0, -1000.0, 0.0, 0.0,
+             100.0008, 50.0, 200.0002, 80.0, 5.0, 30.0),
+            # large, clean session far later
+            (1000, "2026-07-15 10:16:40", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             110.0, 50.0, 209.0, 80.0, 5.0, 30.0),
+            (4600, "2026-07-15 11:16:40", 1000.0, -400.0, -400.0, -400.0, 0.0, 0.0,
+             111.0, 50.0, 209.833, 80.0, 5.0, 30.0),
+        ]
+        self._insert(rows)
+        sessions = [
+            estimator.Session(estimator.GRID_CHARGE, 0, 1),
+            estimator.Session(estimator.GRID_CHARGE, 1000, 4600),
+        ]
+
+        totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=0)
+        t = totals[estimator.GRID_CHARGE]
+
+        self.assertEqual(t.session_count, 2)
+        # the large session's ~1000Wh should dominate the tiny session's ~3.3Wh
+        self.assertGreater(t.input_delta_wh, 900.0)
+
+
+class DeriveBatteryLossDischargeTest(unittest.TestCase):
+    def test_backs_out_battery_only_loss_from_combined_and_inverter_loss(self):
+        # combined efficiency 0.90, inverter efficiency 0.95 ->
+        # battery efficiency = 0.90 / 0.95 ~= 0.9474 -> loss ~= 0.0526
+        result = estimator._derive_battery_loss_discharge(combined_loss=0.10, inverter_loss=0.05)
+
+        self.assertAlmostEqual(result, 0.05263, places=4)
+
+    def test_none_when_either_input_is_missing(self):
+        self.assertIsNone(estimator._derive_battery_loss_discharge(None, 0.05))
+        self.assertIsNone(estimator._derive_battery_loss_discharge(0.10, None))
+
+
+class EstimateEfficiencyTest(unittest.TestCase):
+    def test_inverter_loss_averages_the_three_paths(self):
+        totals = {state: estimator.SessionTypeTotals() for state in estimator.ALL_STATES}
+        totals[estimator.GRID_CHARGE].input_delta_wh = 100.0
+        totals[estimator.GRID_CHARGE].output_delta_wh = 96.0  # loss 0.04
+        totals[estimator.GRID_DISCHARGE].input_delta_wh = 100.0
+        totals[estimator.GRID_DISCHARGE].output_delta_wh = 95.0  # loss 0.05
+        totals[estimator.PV_EXPORT].input_delta_wh = 100.0
+        totals[estimator.PV_EXPORT].output_delta_wh = 97.0  # loss 0.03
+
+        estimate = estimator.estimate_efficiency(totals, method='delta')
+
+        self.assertAlmostEqual(estimate.inverter_loss, 0.04, places=6)
+
+    def test_no_data_yields_none_not_a_crash(self):
+        totals = {state: estimator.SessionTypeTotals() for state in estimator.ALL_STATES}
+
+        estimate = estimator.estimate_efficiency(totals, method='delta')
+
+        self.assertIsNone(estimate.inverter_loss)
+        self.assertIsNone(estimate.battery_loss)
+        self.assertIsNone(estimate.battery_loss_discharge)
 
 
 class MainOnEmptyDatabaseTest(unittest.TestCase):
     def test_does_not_crash_when_inverter_history_table_is_missing(self):
-        # An empty/never-initialized data.db (e.g. a fresh checkout that
-        # hasn't run main.py yet) shouldn't crash the script - it should
-        # print a "no data" style message instead.
         with mock.patch.object(sys, 'argv', ['_estimate_battery_efficiency.py', '--db-path', ':memory:']):
             try:
                 estimator.main()

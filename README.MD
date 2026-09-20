@@ -85,6 +85,10 @@ and streaming data to the frontend using Server Sent Events (SSE) for real-time 
 Data is written into a SQLite database (`data.db`, `inverter_history` table) and can be processed later
 by some scripts calculating the cost savings. Older `data-xxxx-xx-xx_xx-xx-xx.csv` files are legacy/historical
 only - the app no longer writes to them (see "Upgrading" above for importing them).
+See `GOODWE_SENSOR_NOTES.md` before writing anything that computes energy/power
+balances across PV, battery, grid, and load fields - several of the raw sensor
+names are easy to misread (which field is actually the grid meter, sign
+conventions the `goodwe` library leaves undocumented, real hardware noise/quirks).
 ## Documentation conventions
 
 Design docs for a feature under development live in `docs/superpowers/{specs,plans,notes}/`
