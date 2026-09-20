@@ -39,6 +39,11 @@ MQTT broker. Unset `MQTT_HOST` (the default) disables this entirely - no
 behavior change from before this feature existed. See PR #35 for the
 full topic list and Home Assistant/Predbat setup.
 
+RCE export prices publish at 15-minute granularity by default (the
+market's own settlement period). Set `RCE_EXPORT_GRANULARITY=hourly` to
+average each hour's four quarters first instead, matching how PGE
+settles prosument export credit on an hourly basis.
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 

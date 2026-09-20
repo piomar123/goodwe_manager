@@ -73,6 +73,48 @@ class BuildExportPricePayloadTest(unittest.TestCase):
 
         self.assertNotEqual(first_occurrence['from'], second_occurrence['from'])
 
+    def test_default_granularity_is_15min(self):
+        self._store('2026-07-15', [
+            ('00:00', 100.0), ('00:15', 200.0), ('00:30', 300.0), ('00:45', 400.0),
+            ('24:00', 400.0),
+        ])
+        payload = export_price.build_export_price_payload(date(2026, 7, 15), WARSAW)
+
+        self.assertEqual(len(payload['raw_today']), 4)
+
+    def test_hourly_granularity_averages_the_four_quarters(self):
+        self._store('2026-07-15', [
+            ('00:00', 100.0), ('00:15', 200.0), ('00:30', 300.0), ('00:45', 400.0),
+            ('01:00', 500.0), ('01:15', 500.0), ('01:30', 500.0), ('01:45', 500.0),
+            ('24:00', 500.0),
+        ])
+        payload = export_price.build_export_price_payload(date(2026, 7, 15), WARSAW, granularity='hourly')
+
+        self.assertEqual(len(payload['raw_today']), 2)
+        # mean(100,200,300,400) = 250 PLN/MWh -> 0.25 zl/kWh, x1.23 = 0.3075
+        self.assertAlmostEqual(payload['raw_today'][0]['value'], 0.3075, places=6)
+        self.assertEqual(payload['raw_today'][0]['from'][11:16], '00:00')
+        self.assertEqual(payload['raw_today'][0]['to'][11:16], '01:00')
+        self.assertEqual(payload['raw_today'][1]['from'][11:16], '01:00')
+        # the last hour's end is the '24:00' sentinel, i.e. next day 00:00
+        self.assertTrue(payload['raw_today'][1]['to'].startswith('2026-07-16T00:00:00'))
+
+    def test_hourly_granularity_on_dst_fall_back_keeps_both_ambiguous_hours_distinct(self):
+        self._store('2026-10-25', [
+            ('02:00', 100.0), ('02:15', 200.0), ('02:30', 300.0), ('02:45', 400.0),
+            ('02a:00', 500.0), ('02a:15', 500.0), ('02a:30', 500.0), ('02a:45', 500.0),
+            ('24:00', 500.0),
+        ])
+        payload = export_price.build_export_price_payload(date(2026, 10, 25), WARSAW, granularity='hourly')
+
+        bands_by_from = {band['from']: band for band in payload['raw_today']}
+        first_occurrence = bands_by_from['2026-10-25T02:00:00+02:00']
+        second_occurrence = bands_by_from['2026-10-25T02:00:00+01:00']
+
+        # mean(100,200,300,400) = 250 -> 0.3075; mean(500,500,500,500) = 500 -> 0.615
+        self.assertAlmostEqual(first_occurrence['value'], 0.3075, places=6)
+        self.assertAlmostEqual(second_occurrence['value'], 0.615, places=6)
+
 
 if __name__ == '__main__':
     unittest.main()

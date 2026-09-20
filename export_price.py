@@ -6,12 +6,48 @@ metric_octopus_export mechanism expects, applying the prosument export
 VAT bonus. See PR #35.
 """
 from datetime import date, datetime, timedelta
-from typing import List
+from typing import List, Tuple
 from zoneinfo import ZoneInfo
 
 import rce_storage
 
 EXPORT_VAT_BONUS_MULTIPLIER = 1.23
+
+
+def _hour_key(period: str) -> str:
+    """Groups a 'HH:MM' (or DST fall-back 'HHa:MM') period string by its
+    hour, keeping the 'a' suffix so the disambiguated fall-back hour
+    still forms its own group rather than merging with the first
+    (fold=0) occurrence of the same wall-clock hour."""
+    hh, _, _ = period.partition(':')
+    return hh
+
+
+def _average_by_hour(periods: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+    """Collapses 15-minute (period, rce_pln) rows into one row per hour,
+    keyed by the hour's first period string (e.g. '13:00') so downstream
+    band-building can treat it exactly like a single period - PGE settles
+    export credit on the hourly average of the four quarters, not each
+    quarter individually. The trailing '24:00' sentinel (rce.py's
+    convert_to_series_15min appends it as a same-value boundary marker,
+    not a real price) is passed through unaveraged so it still closes out
+    the final hourly band."""
+    real_periods = [p for p in periods if _hour_key(p[0]) != '24']
+    sentinel = [p for p in periods if _hour_key(p[0]) == '24']
+
+    sums: dict = {}
+    counts: dict = {}
+    first_period: dict = {}
+    for period, rce_pln in real_periods:
+        key = _hour_key(period)
+        sums[key] = sums.get(key, 0.0) + rce_pln
+        counts[key] = counts.get(key, 0) + 1
+        first_period.setdefault(key, period)
+    hourly = [
+        (first_period[key], sums[key] / counts[key])
+        for key in sorted(sums, key=lambda k: first_period[k])
+    ]
+    return hourly + sentinel
 
 
 def _parse_period_start(period: str, day: date, tz: ZoneInfo) -> datetime:
@@ -34,7 +70,7 @@ def _parse_period_start(period: str, day: date, tz: ZoneInfo) -> datetime:
     )
 
 
-def _bands_for_business_date(business_date_str: str, tz: ZoneInfo) -> List[dict]:
+def _bands_for_business_date(business_date_str: str, tz: ZoneInfo, granularity: str = '15min') -> List[dict]:
     conn = rce_storage.init_db()
     try:
         if not rce_storage.is_cached(conn, business_date_str):
@@ -42,6 +78,9 @@ def _bands_for_business_date(business_date_str: str, tz: ZoneInfo) -> List[dict]
         periods = rce_storage.get_cached_prices(conn, business_date_str)
     finally:
         conn.close()
+
+    if granularity == 'hourly':
+        periods = _average_by_hour(periods)
 
     day = datetime.strptime(business_date_str, '%Y-%m-%d').date()
     bands = []
@@ -53,12 +92,17 @@ def _bands_for_business_date(business_date_str: str, tz: ZoneInfo) -> List[dict]
     return bands
 
 
-def build_export_price_payload(today: date, tz: ZoneInfo) -> dict:
+def build_export_price_payload(today: date, tz: ZoneInfo, granularity: str = '15min') -> dict:
     """Returns {"raw_today": [...], "raw_tomorrow": [...]}. raw_tomorrow
     is an empty list (not an error) when tomorrow's RCE prices aren't
-    cached yet - see spec Component 3's "Tomorrow not cached yet"."""
+    cached yet - see spec Component 3's "Tomorrow not cached yet".
+
+    `granularity` is '15min' (default, matches the RCE market's own
+    settlement period) or 'hourly' (averages each hour's four quarters
+    before applying the VAT bonus, matching how PGE settles export
+    credit for prosumers on an hourly basis)."""
     tomorrow = today + timedelta(days=1)
     return {
-        'raw_today': _bands_for_business_date(today.strftime('%Y-%m-%d'), tz),
-        'raw_tomorrow': _bands_for_business_date(tomorrow.strftime('%Y-%m-%d'), tz),
+        'raw_today': _bands_for_business_date(today.strftime('%Y-%m-%d'), tz, granularity),
+        'raw_tomorrow': _bands_for_business_date(tomorrow.strftime('%Y-%m-%d'), tz, granularity),
     }
