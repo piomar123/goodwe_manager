@@ -404,7 +404,7 @@ def _publish_import_prices():
 def _publish_pv_forecast():
     # Reuses whatever ForecastPrefetchThread already just fetched and
     # stored (forecast_history.db) rather than calling Solcast again -
-    # see spec Component 5. Predbat needs a 48h horizon (today + tomorrow)
+    # see PR #35. Predbat needs a 48h horizon (today + tomorrow)
     # to plan around tonight's cheap-rate charge, and expects each half as
     # a separate detailedForecast-shaped list (pv_forecast_today /
     # pv_forecast_tomorrow), not one flat HH:MM map - see

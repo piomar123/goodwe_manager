@@ -24,21 +24,21 @@ components:
 
     bands:
       default:
-        - start: "22:00"
+        - days: "Work"
+          start: "22:00"
           end: "06:00"
-          days: "Work"
           price: cheap
         - days: "Sa,Su,Holiday"
           price: cheap
       summer:
-        - start: "15:00"
+        - days: "Work"
+          start: "15:00"
           end: "17:00"
-          days: "Work"
           price: cheap
       winter:
-        - start: "13:00"
+        - days: "Work"
+          start: "13:00"
           end: "15:00"
-          days: "Work"
           price: cheap
 
     default_price: expensive

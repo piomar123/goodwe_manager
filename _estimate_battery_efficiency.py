@@ -38,9 +38,9 @@ def find_battery_sessions(samples: List[Tuple[int, float]], noise_threshold_w: f
     """samples: [(timestamp_epoch, pbattery1_watts), ...], time-ordered.
     Splits into contiguous runs sharing the same sign (above
     noise_threshold_w in magnitude) - a sample within the noise band ends
-    the current run without starting a new one (see spec Component 6's
+    the current run without starting a new one (see PR #35's
     "contiguous run where pbattery1 holds one sign above a noise
-    threshold")."""
+    threshold" discussion)."""
     sessions = []
     current_sign = None
     current_start = None
@@ -67,9 +67,9 @@ def find_matched_cycle_pairs(soc_samples: List[Tuple[int, float]], max_gap_secon
     """soc_samples: [(timestamp_epoch, battery_soc), ...], time-ordered.
     Returns (start_epoch, end_epoch) pairs where SOC at end_epoch is
     within soc_tolerance of SOC at start_epoch, and end_epoch - start_epoch
-    <= max_gap_seconds - see spec Component 6's "matched cycle pairs
+    <= max_gap_seconds - see PR #35's "matched cycle pairs
     where SOC returns to roughly its starting level within a short
-    window". Greedy: each start_epoch matches at most one (the first
+    window" discussion. Greedy: each start_epoch matches at most one (the first
     qualifying) end_epoch, to avoid double-counting overlapping cycles.
     Once a pair is matched, every sample epoch inside its window is
     skipped as a candidate start, so a cycle's own SOC wobble in the
@@ -118,7 +118,7 @@ def estimate_inverter_loss(conn: sqlite3.Connection, sessions: List[BatterySessi
     against AC-side energy delivered. Returns
     {'charge': (loss_fraction, sample_count), 'discharge': (loss_fraction, sample_count)}.
     Sessions with fewer than 2 samples are skipped (no meaningful energy
-    integral). This is deliberately approximate - see spec Component 6 -
+    integral). This is deliberately approximate - see PR #35 -
     real-world PV/load noise means a session's AC-side energy isn't
     purely attributable to battery charging/discharging.
     """

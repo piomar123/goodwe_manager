@@ -113,7 +113,7 @@ def build_export_price_payload(
 ) -> dict:
     """Returns {"raw_today": [...], "raw_tomorrow": [...]}. raw_tomorrow
     is an empty list (not an error) when tomorrow's RCE prices aren't
-    cached yet - see spec Component 3's "Tomorrow not cached yet".
+    cached yet - see PR #35's "Tomorrow not cached yet" discussion.
 
     `granularity` is '15min' (default, matches the RCE market's own
     settlement period) or 'hourly' (averages each hour's four quarters

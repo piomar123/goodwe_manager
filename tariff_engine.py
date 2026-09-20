@@ -40,7 +40,7 @@ def _token_matches(token: str, d: date) -> bool:
 def day_spec_matches(day_spec: str, d: date) -> bool:
     """day_spec is a comma-separated list of tokens: weekday abbreviations
     (Mo,Tu,We,Th,Fr,Sa,Su), ranges (Mo-Fr), or the keywords Work/Holiday.
-    Matches if any token matches (OR semantics) - see spec Component 4.
+    Matches if any token matches (OR semantics) - see PR #35.
     """
     return any(_token_matches(token, d) for token in day_spec.split(','))
 
@@ -99,8 +99,8 @@ def _band_matches(band: dict, dt: datetime) -> bool:
 def component_price_at(component: dict, dt: datetime) -> float:
     """Resolves one component's price at `dt`: that component's own season
     bands first (in file order), then its `bands.default` (in file
-    order), then `default_price` - see spec Component 4's "Resolution
-    order"."""
+    order), then `default_price` - see PR #35's "Resolution order"
+    discussion."""
     season = season_for_date(component['season_boundaries'], dt.date()) if component.get('season_boundaries') else None
     bands = component.get('bands', {})
     season_bands = bands.get(season, []) if season else []
@@ -126,7 +126,7 @@ def bands_for_day(config: dict, day: date, tz: ZoneInfo) -> list:
     resolution and merged - fine-grained enough that no real tariff's
     band boundaries fall between samples, coarse enough to be cheap for a
     single day. Adjacent minutes with the same price merge into one
-    entry (see spec Component 4's "No forced 15-minute slicing").
+    entry (see PR #35's "No forced 15-minute slicing" discussion).
     Timestamps carry `tz`'s real UTC offset for that instant, so a DST
     transition day naturally produces a 23- or 25-hour span instead of a
     fixed 24."""

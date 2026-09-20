@@ -21,8 +21,8 @@ you have old `data-*.csv` files from before the switch to SQLite, run
 
 ## Tariff-aware import pricing (optional)
 
-`_calculate_income.py` and the MQTT bridge (see the Predbat bridge design
-doc) can price imported energy using a real time-of-use tariff schedule
+`_calculate_income.py` and the MQTT bridge (see PR #35) can price
+imported energy using a real time-of-use tariff schedule
 instead of a flat rate. Copy an example from `tariff_examples/` (e.g.
 `g12w_pge.yaml`) to `tariff_import.yaml` (already gitignored), fill in
 your actual rates, and set `TARIFF_IMPORT_CONFIG=tariff_import.yaml` in

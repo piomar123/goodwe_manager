@@ -143,7 +143,7 @@ class MqttBridge:
             await self._client.publish(self._topic(topic_suffix), payload, retain=retain)
         except Exception as e:
             # A broker hiccup must never take down inverter polling - see
-            # spec Component 1: "MQTT being down must never stop inverter
+            # PR #35: "MQTT being down must never stop inverter
             # polling/storage/SSE from working." Mark the client as
             # disconnected so the `self._client is None` check above
             # (re)triggers a rate-limited reconnect attempt next time,
