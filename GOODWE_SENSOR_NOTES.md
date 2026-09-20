@@ -131,7 +131,16 @@ effect around any state transition regardless of SOC.
 | `meter_active_power_total`/`1`/`2`/`3` (exporting) | `meter_e_total_exp`/`exp1`/`exp2`/`exp3` | - (no today-only variant) |
 | `meter_active_power_total`/`1`/`2`/`3` (importing) | `meter_e_total_imp`/`imp1`/`imp2`/`imp3` | - (no today-only variant) |
 | `load_ptotal` | `e_load_total` | `e_load_day` |
-| `active_power` | **none** - no lifetime/today counter tracks the net-meter-style quantity specifically | - |
+| `active_power` (exporting) | `meter_e_total_exp` (via `meter_active_power_total` - see below) | - |
+| `active_power` (importing) | `meter_e_total_imp` (via `meter_active_power_total` - see below) | - |
+
+`active_power` has no counter of its own in the `_READ_RUNNING_DATA`
+block. It doesn't need one: `active_power` and `meter_active_power_total`
+are the same physical net-grid quantity (see above), so `active_power`'s
+practical energy equivalent is `meter_active_power_total`'s own counters,
+`meter_e_total_exp`/`meter_e_total_imp` - just read from the separate
+`_READ_METER_DATA` block rather than being paired 1:1 by register
+proximity.
 
 **This was initially misattributed the other way around** (`e_total_exp`/
 `e_total_imp` assumed to belong to `active_power`, `pgrid` assumed to have
