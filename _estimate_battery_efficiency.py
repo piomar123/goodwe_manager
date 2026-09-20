@@ -5,48 +5,60 @@ One-off offline analysis: estimates Predbat's real config settings
 `inverter_loss` (one symmetric value, used both directions) from this
 household's inverter_history. Run manually; prints a report with
 recommended values and sample-size caveats - nothing here writes to
-Predbat's config automatically. See PR #35.
+Predbat's config automatically. See PR #35 and GOODWE_SENSOR_NOTES.md
+for the sensor-level findings this methodology depends on.
 
-Methodology: classifies each 1Hz sample into one of five mutually
-exclusive flow states based on the signs of PV production, battery
-power, and grid power (all three phases required to individually agree
-in sign, above a noise threshold - a phase-imbalanced reading nets
-close to zero but isn't a clean "idle", so it's left unclassified
-rather than folded into one), and requires grid_mode == Connected -
-an islanded/off-grid period (grid outage, backup mode) has its own,
-different loss characteristics and its meter-derived fields (pgrid,
-load_ptotal) can read zero/stale while DC-side power keeps flowing
-normally, which would otherwise look like (and get misattributed as)
-clean PV-only or battery-only flow. Contiguous same-state runs are one
-"session". Each session type measures energy on both sides of one
-conversion boundary, via two independent methods that get compared:
-the inverter's own cumulative energy counters (a value delta across
-the session) and trapezoidal integration of the raw power samples.
-Energy is summed globally per session type (across all its sessions)
-before taking one ratio, rather than averaging a ratio per session -
-a single short/noisy session's ratio would otherwise dominate a plain
-average (see PR #35's fix for exactly this on the old methodology).
+Methodology: classifies each 1Hz sample into one of four mutually
+exclusive flow states, requiring grid_mode == Connected throughout (an
+islanded/off-grid period has different loss characteristics, and its
+meter-derived fields can read zero/stale while DC-side power keeps
+flowing normally - see GOODWE_SENSOR_NOTES.md). Contiguous same-state
+runs are one "session", each measuring energy on both sides of a
+conversion boundary via two independent methods (the inverter's own
+cumulative energy counters, and trapezoidal integration of raw power),
+summed globally per session type before taking one ratio - not
+averaged per-session, since a single short/noisy session's ratio would
+otherwise dominate a plain average.
 
-- grid_charge / grid_discharge: battery <-> grid, PV ~0. Two
-  independent inverter_loss estimates (one per direction).
-- pv_export: PV production -> grid export, battery idle. A third,
-  physically independent inverter_loss estimate (PV's own DC/AC path,
-  not the battery's).
-- pv_charge: PV production -> battery charge, grid ~0. On a hybrid
-  inverter, PV and battery share the DC bus ahead of the single AC/DC
-  stage, so this path never crosses the inverter at all - the measured
-  gap is battery_loss (charge direction) alone.
-- battery_to_load: battery discharge -> house load, PV and grid ~0.
-  This path *does* cross the inverter (DC battery -> AC load), so it
-  measures a *combined* battery+inverter discharge loss; the
-  battery-only battery_loss_discharge is backed out by dividing by the
-  inverter_loss average from the three paths above, in efficiency
-  terms: combined_efficiency = battery_efficiency * inverter_efficiency.
+Only three of these four measurements are *clean* (uncontaminated by
+another loss source):
+
+- pv_ac: PV production -> the inverter's on-grid AC output
+  (`pgrid`+`pgrid2`+`pgrid3` directly - this already covers energy
+  delivered to load AND/OR exported, in one number, since it's the
+  inverter's own AC-side reading regardless of where that power ends
+  up; see GOODWE_SENSOR_NOTES.md on why `pgrid` is not "grid
+  import/export"). Battery idle throughout, so this cleanly isolates
+  `inverter_loss` - the only path here that doesn't also involve the
+  battery.
+- pv_charge: PV production -> battery charge, with the inverter's own
+  AC output near zero (no AC crossing at all). On a hybrid inverter,
+  PV and battery share the DC bus ahead of the single AC/DC stage, so
+  this path never touches inverter_loss - the measured gap is
+  `battery_loss` (charge direction) alone.
+
+The other two (battery charging/discharging via the AC bus, PV idle)
+each measure a *combined* battery+inverter loss, since both directions
+cross the inverter:
+
+- battery_ac_charge: battery charging while PV is idle - all of the
+  inverter's AC input goes to charging the battery. Combined loss =
+  inverter_loss * battery_loss(charge) - given inverter_loss from
+  pv_ac, `battery_loss` can be backed out here too, as a second,
+  usually much better-populated source than pv_charge.
+- battery_ac_discharge: battery discharging while PV is idle - all of
+  the inverter's AC output comes from the battery, whether it ends up
+  covering load or being exported (no distinction in loss either way,
+  since both go through the identical DC->AC stage - there's no
+  separate "battery to grid" vs "battery to load" loss). Combined loss
+  = inverter_loss * battery_loss_discharge; this is the *only* source
+  for battery_loss_discharge; there's no DC-bus bypass for discharging
+  the way pv_charge bypasses it for charging.
 """
 import argparse
 import sqlite3
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import storage
 
@@ -73,31 +85,18 @@ DEFAULT_PV_NOISE_W = 50.0
 # samples off each session's start/end before measuring energy on it.
 DEFAULT_MIN_SESSION_SECONDS = 5
 DEFAULT_EDGE_TRIM_SAMPLES = 2
-# "grid idle" (required by pv_export/pv_charge/battery_to_load) is a
-# magnitude check on the phase SUM, deliberately distinct from
-# DEFAULT_GRID_PHASE_NOISE_W's per-phase agreement test used by
-# grid_charge/grid_discharge. _grid_direction() returning None means
-# "phases disagree in sign", not "near zero" - a real but phase-
-# imbalanced flow (one phase importing 3kW while another exports 3kW)
-# nets close to zero yet is definitely not "the grid is idle", so
-# treating "unclassified direction" as "idle" would let real grid
-# contribution contaminate a PV-only or battery-only measurement.
-#
-# Verified against real data this needs to be small: a genuine
-# pv_charge session was found with pgrid/pgrid2/pgrid3 steady at
-# ~90-94W each (a ~270-280W sum, comfortably "idle" under a naive 300W
-# default) that was actually real, continuous grid import for baseline
-# house load running concurrently with PV charging the battery -
-# nowhere near idle relative to this household's PV (50-250W) and
-# battery (200-250W) levels in the same session.
+# "inverter AC output idle" (required only by pv_charge, to confirm
+# charging is happening via the DC-bus bypass rather than the AC path)
+# is a magnitude check on pgrid+pgrid2+pgrid3, using the *correct*
+# grid-facing field this time (see GOODWE_SENSOR_NOTES.md) - deliberately
+# small, not reused from DEFAULT_GRID_PHASE_NOISE_W.
 DEFAULT_GRID_IDLE_SUM_W = 60.0
 
-GRID_CHARGE = 'grid_charge'
-GRID_DISCHARGE = 'grid_discharge'
-PV_EXPORT = 'pv_export'
+PV_AC = 'pv_ac'
 PV_CHARGE = 'pv_charge'
-BATTERY_TO_LOAD = 'battery_to_load'
-ALL_STATES = (GRID_CHARGE, GRID_DISCHARGE, PV_EXPORT, PV_CHARGE, BATTERY_TO_LOAD)
+BATTERY_AC_CHARGE = 'battery_ac_charge'
+BATTERY_AC_DISCHARGE = 'battery_ac_discharge'
+ALL_STATES = (PV_AC, PV_CHARGE, BATTERY_AC_CHARGE, BATTERY_AC_DISCHARGE)
 
 # Matches static/js/diagram-calc.js's GRID_MODE.CONNECTED - same raw
 # grid_mode register, same convention, kept in sync deliberately rather
@@ -121,8 +120,7 @@ class Session:
 
 
 def _sign(value: Optional[float], threshold: float) -> Optional[str]:
-    """'pos'/'neg' above `threshold` in magnitude, else None - shared by
-    battery and per-phase grid classification."""
+    """'pos'/'neg' above `threshold` in magnitude, else None."""
     if value is None:
         return None
     if value > threshold:
@@ -132,62 +130,52 @@ def _sign(value: Optional[float], threshold: float) -> Optional[str]:
     return None
 
 
-def _grid_direction(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Optional[float],
-                     threshold: float) -> Optional[str]:
-    """'export' or 'import' only when all three phases individually
-    agree in sign above `threshold`. A phase-imbalanced reading (one
-    phase importing while another exports, netting near zero) is left
-    unclassified rather than folded into "idle" - it's a real but
-    non-clean flow state that shouldn't be attributed to either
-    direction."""
-    signs = (_sign(pgrid, threshold), _sign(pgrid2, threshold), _sign(pgrid3, threshold))
-    if signs[0] is None or signs[0] != signs[1] or signs[1] != signs[2]:
-        return None
-    return 'export' if signs[0] == 'pos' else 'import'
+def _battery_direction(pbattery1: Optional[float], threshold: float) -> Optional[str]:
+    """'charge'/'discharge' - pbattery1's sign convention is NOT what a
+    naive reading suggests: verified against 90 days of production data
+    in PR #33, positive = discharging, negative = charging (see
+    GOODWE_SENSOR_NOTES.md)."""
+    sign = _sign(pbattery1, threshold)
+    if sign == 'pos':
+        return 'discharge'
+    if sign == 'neg':
+        return 'charge'
+    return None
 
 
 def _grid_power_sum(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Optional[float]) -> Optional[float]:
+    """pgrid/pgrid2/pgrid3 is the inverter's own on-grid AC output per
+    phase (not a grid import/export meter - see GOODWE_SENSOR_NOTES.md),
+    so this is the AC-side magnitude regardless of whether that power
+    ends up covering load or being exported."""
     if pgrid is None or pgrid2 is None or pgrid3 is None:
         return None
     return abs(pgrid) + abs(pgrid2) + abs(pgrid3)
 
 
-def _grid_is_idle(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Optional[float],
-                   threshold: float) -> bool:
-    """True only when the phase-sum magnitude is small - NOT the same as
-    _grid_direction() returning None, which just means the phases
-    disagree in sign and says nothing about how much power is actually
-    flowing (see DEFAULT_GRID_IDLE_SUM_W)."""
-    total = _grid_power_sum(pgrid, pgrid2, pgrid3)
-    return total is not None and total < threshold
-
-
 def classify_sample(pbattery1: Optional[float], pgrid: Optional[float], pgrid2: Optional[float],
                      pgrid3: Optional[float], ppv: Optional[float], grid_mode: Optional[float],
                      thresholds: Thresholds) -> Optional[str]:
-    """Classifies one sample into one of the five flow states (see module
+    """Classifies one sample into one of the four flow states (see module
     docstring), or None if it matches none of them cleanly (multiple
     things active at once, everything idle, or grid_mode isn't
     Connected - an islanded/off-grid period has different loss
-    characteristics and shouldn't be attributed to any of these five
+    characteristics and shouldn't be attributed to any of these four
     normal-operation paths)."""
     if grid_mode != GRID_MODE_CONNECTED:
         return None
-    battery_sign = _sign(pbattery1, thresholds.battery_w)
-    grid_dir = _grid_direction(pgrid, pgrid2, pgrid3, thresholds.grid_phase_w)
-    grid_idle = _grid_is_idle(pgrid, pgrid2, pgrid3, thresholds.grid_idle_w)
+    battery_dir = _battery_direction(pbattery1, thresholds.battery_w)
     pv_producing = ppv is not None and ppv > thresholds.pv_w
+    grid_ac_idle = (_grid_power_sum(pgrid, pgrid2, pgrid3) or 0) < thresholds.grid_idle_w
 
-    if grid_dir == 'import' and battery_sign == 'pos' and not pv_producing:
-        return GRID_CHARGE
-    if grid_dir == 'export' and battery_sign == 'neg' and not pv_producing:
-        return GRID_DISCHARGE
-    if pv_producing and grid_dir == 'export' and battery_sign is None:
-        return PV_EXPORT
-    if pv_producing and battery_sign == 'pos' and grid_idle:
+    if pv_producing and battery_dir is None:
+        return PV_AC
+    if pv_producing and battery_dir == 'charge' and grid_ac_idle:
         return PV_CHARGE
-    if battery_sign == 'neg' and grid_idle and not pv_producing:
-        return BATTERY_TO_LOAD
+    if not pv_producing and battery_dir == 'charge':
+        return BATTERY_AC_CHARGE
+    if not pv_producing and battery_dir == 'discharge':
+        return BATTERY_AC_DISCHARGE
     return None
 
 
@@ -234,41 +222,27 @@ def _trapezoidal_energy_wh(power_samples: List[Tuple[int, float]]) -> float:
     return energy_ws / 3600.0
 
 
-
-
 def _abs_or_none(value: Optional[float]) -> Optional[float]:
     return abs(value) if value is not None else None
+
+
+def _pgrid_sum_or_none(r: dict) -> Optional[float]:
+    return _grid_power_sum(r['pgrid'], r['pgrid2'], r['pgrid3'])
 
 
 # Per session-type spec: which raw column(s) represent the "input"
 # (pre-conversion-loss) and "output" (post-loss) power/energy-counter
 # pair. `same_day` marks e_day (the only column here that resets daily,
-# unlike the lifetime e_total_*/e_bat_*_total/e_load_total counters) -
-# a session whose e_day delta would otherwise span a midnight rollover
-# has that delta measurement skipped (the integral method is unaffected).
+# unlike the lifetime e_total_*/e_bat_*_total counters) - a session
+# whose e_day delta would otherwise span a midnight rollover has that
+# delta measurement skipped (the integral method is unaffected).
 SESSION_SPECS: Dict[str, dict] = {
-    GRID_CHARGE: {
-        'input_power': lambda r: _grid_power_sum(r['pgrid'], r['pgrid2'], r['pgrid3']),
-        'input_counter': 'e_total_imp',
-        'input_same_day': False,
-        'output_power': lambda r: _abs_or_none(r['pbattery1']),
-        'output_counter': 'e_bat_charge_total',
-        'output_same_day': False,
-    },
-    GRID_DISCHARGE: {
-        'input_power': lambda r: _abs_or_none(r['pbattery1']),
-        'input_counter': 'e_bat_discharge_total',
-        'input_same_day': False,
-        'output_power': lambda r: _grid_power_sum(r['pgrid'], r['pgrid2'], r['pgrid3']),
-        'output_counter': 'e_total_exp',
-        'output_same_day': False,
-    },
-    PV_EXPORT: {
+    PV_AC: {
         'input_power': lambda r: r['ppv'],
         'input_counter': 'e_day',
         'input_same_day': True,
-        'output_power': lambda r: _grid_power_sum(r['pgrid'], r['pgrid2'], r['pgrid3']),
-        'output_counter': 'e_total_exp',
+        'output_power': _pgrid_sum_or_none,
+        'output_counter': None,  # no lifetime counter for the inverter's own on-grid output
         'output_same_day': False,
     },
     PV_CHARGE: {
@@ -279,19 +253,26 @@ SESSION_SPECS: Dict[str, dict] = {
         'output_counter': 'e_bat_charge_total',
         'output_same_day': False,
     },
-    BATTERY_TO_LOAD: {
+    BATTERY_AC_CHARGE: {
+        'input_power': _pgrid_sum_or_none,
+        'input_counter': None,
+        'input_same_day': False,
+        'output_power': lambda r: _abs_or_none(r['pbattery1']),
+        'output_counter': 'e_bat_charge_total',
+        'output_same_day': False,
+    },
+    BATTERY_AC_DISCHARGE: {
         'input_power': lambda r: _abs_or_none(r['pbattery1']),
         'input_counter': 'e_bat_discharge_total',
         'input_same_day': False,
-        'output_power': lambda r: r['load_ptotal'],
-        'output_counter': 'e_load_total',
+        'output_power': _pgrid_sum_or_none,
+        'output_counter': None,
         'output_same_day': False,
     },
 }
 
 SESSION_ROW_COLUMNS = ('timestamp_epoch', 'timestamp', 'pbattery1', 'pgrid', 'pgrid2', 'pgrid3', 'ppv',
-                        'load_ptotal', 'e_total_imp', 'e_total_exp', 'e_bat_charge_total',
-                        'e_bat_discharge_total', 'e_day', 'e_load_total')
+                        'e_bat_charge_total', 'e_bat_discharge_total', 'e_day')
 
 
 @dataclass
@@ -301,7 +282,7 @@ class SessionTypeTotals:
     input_integral_wh: float = 0.0
     output_delta_wh: float = 0.0
     output_integral_wh: float = 0.0
-    delta_sessions: int = 0  # sessions that contributed a delta measurement (same_day guard may skip some)
+    delta_sessions: int = 0  # sessions that contributed a delta measurement (same_day guard, or no counter, may skip some)
 
     def loss_delta(self) -> Optional[float]:
         if self.input_delta_wh <= 0:
@@ -343,7 +324,9 @@ def _measure_session(conn: sqlite3.Connection, session: Session, spec: dict,
 
     first, last = dict_rows[0], dict_rows[-1]
 
-    def counter_delta(counter_name: str, same_day: bool) -> Optional[float]:
+    def counter_delta(counter_name: Optional[str], same_day: bool) -> Optional[float]:
+        if counter_name is None:
+            return None
         if same_day and first['timestamp'][:10] != last['timestamp'][:10]:
             return None
         start_val, end_val = first[counter_name], last[counter_name]
@@ -389,25 +372,17 @@ def measure_sessions(conn: sqlite3.Connection, sessions: List[Session],
 
 @dataclass
 class EfficiencyEstimate:
-    inverter_loss: Optional[float]
-    inverter_loss_paths: Dict[str, Tuple[Optional[float], Optional[float]]]  # state -> (delta_loss, integral_loss)
-    battery_loss: Optional[float]  # charge direction (pv_charge)
+    inverter_loss: Optional[float]  # from pv_ac alone - the only uncontaminated path
+    battery_loss: Optional[float]  # charge direction, preferring battery_ac_charge (usually better populated)
+    battery_loss_pv_charge: Optional[float]  # cross-check via the DC-bus-bypass path, if any data
     battery_loss_discharge: Optional[float]
 
 
-def _average(values: List[float]) -> Optional[float]:
-    values = [v for v in values if v is not None]
-    if not values:
-        return None
-    return sum(values) / len(values)
-
-
-def _derive_battery_loss_discharge(combined_loss: Optional[float], inverter_loss: Optional[float]) -> Optional[float]:
-    """battery_to_load measures the *combined* battery+inverter discharge
-    path (DC battery -> AC load), since discharging always crosses the
-    inverter (unlike pv_charge's DC-bus bypass for the charge
-    direction). Backs out the battery-only factor: combined_efficiency
-    = battery_efficiency * inverter_efficiency."""
+def _derive_battery_loss(combined_loss: Optional[float], inverter_loss: Optional[float]) -> Optional[float]:
+    """battery_ac_charge/battery_ac_discharge each measure a *combined*
+    battery+inverter loss, since both directions cross the inverter.
+    Backs out the battery-only factor: combined_efficiency =
+    battery_efficiency * inverter_efficiency."""
     if combined_loss is None or inverter_loss is None:
         return None
     inverter_efficiency = 1 - inverter_loss
@@ -424,19 +399,15 @@ def estimate_efficiency(totals: Dict[str, SessionTypeTotals], method: str = 'del
     numbers use; both are still available per-path for comparison."""
     loss_fn = (lambda t: t.loss_delta()) if method == 'delta' else (lambda t: t.loss_integral())
 
-    inverter_paths = (GRID_CHARGE, GRID_DISCHARGE, PV_EXPORT)
-    inverter_loss = _average([loss_fn(totals[s]) for s in inverter_paths])
-    inverter_loss_paths = {
-        s: (totals[s].loss_delta(), totals[s].loss_integral()) for s in inverter_paths
-    }
-
-    battery_loss = loss_fn(totals[PV_CHARGE])
-    battery_loss_discharge = _derive_battery_loss_discharge(loss_fn(totals[BATTERY_TO_LOAD]), inverter_loss)
+    inverter_loss = loss_fn(totals[PV_AC])
+    battery_loss = _derive_battery_loss(loss_fn(totals[BATTERY_AC_CHARGE]), inverter_loss)
+    battery_loss_pv_charge = loss_fn(totals[PV_CHARGE])
+    battery_loss_discharge = _derive_battery_loss(loss_fn(totals[BATTERY_AC_DISCHARGE]), inverter_loss)
 
     return EfficiencyEstimate(
         inverter_loss=inverter_loss,
-        inverter_loss_paths=inverter_loss_paths,
         battery_loss=battery_loss,
+        battery_loss_pv_charge=battery_loss_pv_charge,
         battery_loss_discharge=battery_loss_discharge,
     )
 
@@ -457,7 +428,7 @@ def main():
         description="Estimate Predbat's real battery_loss/battery_loss_discharge/inverter_loss settings from history")
     parser.add_argument("--db-path", type=str, default=storage.DATA_DB_PATH)
     parser.add_argument("--battery-noise-w", type=float, default=DEFAULT_BATTERY_NOISE_W)
-    parser.add_argument("--grid-phase-noise-w", type=float, default=DEFAULT_GRID_PHASE_NOISE_W)
+    parser.add_argument("--grid-idle-w", type=float, default=DEFAULT_GRID_IDLE_SUM_W)
     parser.add_argument("--pv-noise-w", type=float, default=DEFAULT_PV_NOISE_W)
     parser.add_argument("--min-session-seconds", type=int, default=DEFAULT_MIN_SESSION_SECONDS,
                          help="Discard sessions shorter than this - at Goodwe's non-atomic per-register "
@@ -469,7 +440,7 @@ def main():
                               "energy on it, for the same cross-register skew reason.")
     args = parser.parse_args()
 
-    thresholds = Thresholds(battery_w=args.battery_noise_w, grid_phase_w=args.grid_phase_noise_w,
+    thresholds = Thresholds(battery_w=args.battery_noise_w, grid_idle_w=args.grid_idle_w,
                              pv_w=args.pv_noise_w)
 
     conn = sqlite3.connect(args.db_path)
@@ -494,21 +465,22 @@ def main():
 
     print("Predbat efficiency estimate (approximate - verify plausibility before use):")
     print()
-    for label, state in (("grid_charge", GRID_CHARGE), ("grid_discharge", GRID_DISCHARGE),
-                         ("pv_export", PV_EXPORT), ("pv_charge", PV_CHARGE),
-                         ("battery_to_load", BATTERY_TO_LOAD)):
+    for label, state in (("pv_ac", PV_AC), ("pv_charge", PV_CHARGE),
+                         ("battery_ac_charge", BATTERY_AC_CHARGE), ("battery_ac_discharge", BATTERY_AC_DISCHARGE)):
         t = totals[state]
         print(f"  [{label}] sessions: {t.session_count} (delta-eligible: {t.delta_sessions})")
         print(f"    loss via energy-counter delta: {_fmt_loss(t.loss_delta())}")
         print(f"    loss via power integration:    {_fmt_loss(t.loss_integral())}")
     print()
     print("Recommended apps.yaml values:")
-    print(f"  inverter_loss           (delta-based):    {_fmt_loss(delta_estimate.inverter_loss)}")
-    print(f"  inverter_loss           (integral-based):  {_fmt_loss(integral_estimate.inverter_loss)}")
-    print(f"  battery_loss            (delta-based):    {_fmt_loss(delta_estimate.battery_loss)}")
-    print(f"  battery_loss            (integral-based):  {_fmt_loss(integral_estimate.battery_loss)}")
-    print(f"  battery_loss_discharge  (delta-based):    {_fmt_loss(delta_estimate.battery_loss_discharge)}")
-    print(f"  battery_loss_discharge  (integral-based):  {_fmt_loss(integral_estimate.battery_loss_discharge)}")
+    print(f"  inverter_loss             (delta-based):   {_fmt_loss(delta_estimate.inverter_loss)}")
+    print(f"  inverter_loss             (integral-based): {_fmt_loss(integral_estimate.inverter_loss)}")
+    print(f"  battery_loss              (delta-based):   {_fmt_loss(delta_estimate.battery_loss)}")
+    print(f"  battery_loss              (integral-based): {_fmt_loss(integral_estimate.battery_loss)}")
+    print(f"  battery_loss (pv_charge cross-check, delta):    {_fmt_loss(delta_estimate.battery_loss_pv_charge)}")
+    print(f"  battery_loss (pv_charge cross-check, integral): {_fmt_loss(integral_estimate.battery_loss_pv_charge)}")
+    print(f"  battery_loss_discharge    (delta-based):   {_fmt_loss(delta_estimate.battery_loss_discharge)}")
+    print(f"  battery_loss_discharge    (integral-based): {_fmt_loss(integral_estimate.battery_loss_discharge)}")
     print()
     print("If the delta-based and integral-based numbers disagree substantially, the")
     print("energy counters (0.1 kWh resolution) are likely too coarse relative to typical")
