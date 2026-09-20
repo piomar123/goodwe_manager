@@ -77,6 +77,17 @@ That same investigation found real, physical BMS self-consumption: a
 calibration bias - it's real, always-flowing power (per PR #33's
 commit message and `diagram-calc.js`'s comment above `batteryState()`).
 
+One hypothesis (unconfirmed) for *why* PR #33 found `pbattery1` reading
+negative in ~19% of samples labeled Discharge by `battery_mode`: when
+the battery is full, the BMS caps max charge current at 0A (nothing
+more to charge), but the BMS itself still draws a small amount of power
+for its own operation - which could show up as a small negative
+(charge-direction) reading even while the mode label still says
+Discharge. If true, this is a distinct, real steady-state phenomenon
+tied to full-SOC specifically, separate from (and additional to) the
+cross-register poll timing skew described below, which is a transient
+effect around any state transition regardless of SOC.
+
 ## Noise / cross-sensor disagreement, verified against this hardware
 
 - **Cross-register poll skew, not power-value noise**: Goodwe's
@@ -116,20 +127,23 @@ commit message and `diagram-calc.js`'s comment above `batteryState()`).
 | `ppv` (= ppv1+ppv2+ppv3+ppv4) | `e_total` | `e_day` |
 | `pbattery1` > 0 (discharging) | `e_bat_discharge_total` | `e_bat_discharge_day` |
 | `pbattery1` < 0 (charging) | `e_bat_charge_total` | `e_bat_charge_day` |
-| `active_power` > 0 (exporting) | `e_total_exp` | `e_day_exp` |
-| `active_power` < 0 (importing) | `e_total_imp` | `e_day_imp` |
+| `pgrid`/`pgrid2`/`pgrid3` (sum, either direction) | `e_total_exp` + `e_total_imp` (summed) | `e_day_exp` + `e_day_imp` (summed) |
 | `meter_active_power_total`/`1`/`2`/`3` (exporting) | `meter_e_total_exp`/`exp1`/`exp2`/`exp3` | - (no today-only variant) |
 | `meter_active_power_total`/`1`/`2`/`3` (importing) | `meter_e_total_imp`/`imp1`/`imp2`/`imp3` | - (no today-only variant) |
 | `load_ptotal` | `e_load_total` | `e_load_day` |
-| `pgrid`/`pgrid2`/`pgrid3` | **none** - no lifetime/today counter exists for the inverter's own on-grid AC output specifically | - |
+| `active_power` | **none** - no lifetime/today counter tracks the net-meter-style quantity specifically | - |
 
-The `pgrid` gap matters for any energy-conservation-style measurement
-using it directly (as `_estimate_battery_efficiency.py` now does): the
-AC side of a battery-driven session can only be cross-checked against
-raw power integration, never against a counter delta, since no such
-counter exists for that exact quantity - `e_total_exp`/`e_total_imp`
-track `active_power`'s net-grid framing instead, which is a different
-number whenever load is nonzero.
+**This was initially misattributed the other way around** (`e_total_exp`/
+`e_total_imp` assumed to belong to `active_power`, `pgrid` assumed to have
+no counter) - corrected after empirically integrating both over 7 real
+days: `pgrid_sum`'s integral (168,087.6 Wh) matches `e_total_exp +
+e_total_imp`'s delta (168,400 Wh) within 0.2%, while `active_power`'s
+integral (102,084.7 Wh) is ~40% off from both. `active_power` (35140) and
+`e_total_exp`/`e_total_imp` (35195/35200) are all read together in the
+same `_READ_RUNNING_DATA` block as `pgrid` (35125-35135) - register
+proximity alone doesn't tell you which counter belongs to which power
+field, which is exactly why this was misattributed the first time; only
+the empirical integral comparison settles it.
 
 ## Energy counter units
 

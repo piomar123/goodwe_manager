@@ -68,10 +68,15 @@ import storage
 # a timing problem, so this stays modest; the real transition guards are
 # DEFAULT_MIN_SESSION_SECONDS/DEFAULT_EDGE_TRIM_SAMPLES below.
 DEFAULT_BATTERY_NOISE_W = 30.0
-# PV can't read negative, so this only needs to separate "producing" from
-# sensor noise around zero, not disambiguate a sign - a much smaller
-# threshold is fine.
-DEFAULT_PV_NOISE_W = 50.0
+# Zero, not a small positive margin: any nonzero PV, even a few watts,
+# is real DC power reaching the shared PV/battery bus on a hybrid
+# inverter, and battery_ac_charge/battery_ac_discharge require PV
+# fully absent to attribute 100% of the battery's DC energy to the AC
+# path alone - a nonzero-but-"idle" PV margin was found to leak into
+# and bias those two measurements (real data: DC-side battery energy
+# consistently exceeded the AC-side pgrid measurement, an otherwise
+# impossible result, at a 50W PV-idle margin).
+DEFAULT_PV_NOISE_W = 0.0
 # Goodwe's protocol reads registers sequentially, not atomically - at a
 # genuine state transition, different sensors (pbattery1, pgrid*, ppv)
 # can reflect slightly different real instants within the same poll.
@@ -231,13 +236,25 @@ def _pgrid_sum_or_none(r: dict) -> Optional[float]:
 # unlike the lifetime e_total_*/e_bat_*_total counters) - a session
 # whose e_day delta would otherwise span a midnight rollover has that
 # delta measurement skipped (the integral method is unaffected).
+# pgrid/pgrid2/pgrid3 has no single matching lifetime energy counter,
+# but e_total_exp + e_total_imp summed IS its equivalent - confirmed
+# empirically (7 days of real data: pgrid_sum integral 168,087.6Wh vs
+# e_total_exp+e_total_imp delta 168,400Wh, within 0.2%) and by register
+# layout (both counters live in the same _READ_RUNNING_DATA block as
+# pgrid itself, read atomically together - see GOODWE_SENSOR_NOTES.md).
+# This was initially misattributed to active_power (a different,
+# separately-read register whose integral came out ~40% smaller over
+# the same window) - active_power has no energy-counter equivalent at
+# all among the fields collected here.
+PGRID_ENERGY_COUNTERS = ('e_total_exp', 'e_total_imp')
+
 SESSION_SPECS: Dict[str, dict] = {
     PV_AC: {
         'input_power': lambda r: r['ppv'],
         'input_counter': 'e_day',
         'input_same_day': True,
         'output_power': _pgrid_sum_or_none,
-        'output_counter': None,  # no lifetime counter for the inverter's own on-grid output
+        'output_counter': PGRID_ENERGY_COUNTERS,
         'output_same_day': False,
     },
     PV_CHARGE: {
@@ -250,7 +267,7 @@ SESSION_SPECS: Dict[str, dict] = {
     },
     BATTERY_AC_CHARGE: {
         'input_power': _pgrid_sum_or_none,
-        'input_counter': None,
+        'input_counter': PGRID_ENERGY_COUNTERS,
         'input_same_day': False,
         'output_power': lambda r: _abs_or_none(r['pbattery1']),
         'output_counter': 'e_bat_charge_total',
@@ -261,13 +278,13 @@ SESSION_SPECS: Dict[str, dict] = {
         'input_counter': 'e_bat_discharge_total',
         'input_same_day': False,
         'output_power': _pgrid_sum_or_none,
-        'output_counter': None,
+        'output_counter': PGRID_ENERGY_COUNTERS,
         'output_same_day': False,
     },
 }
 
 SESSION_ROW_COLUMNS = ('timestamp_epoch', 'timestamp', 'pbattery1', 'pgrid', 'pgrid2', 'pgrid3', 'ppv',
-                        'e_bat_charge_total', 'e_bat_discharge_total', 'e_day')
+                        'e_bat_charge_total', 'e_bat_discharge_total', 'e_day', 'e_total_exp', 'e_total_imp')
 
 
 @dataclass
@@ -353,15 +370,24 @@ def _measure_session(conn: sqlite3.Connection, session: Session, spec: dict,
 
     first, last = dict_rows[0], dict_rows[-1]
 
-    def counter_delta(counter_name: Optional[str], same_day: bool) -> Optional[float]:
-        if counter_name is None:
+    def counter_delta(counter_names, same_day: bool) -> Optional[float]:
+        """counter_names is a single column name, or a tuple of names to
+        sum (pgrid has no single matching energy counter - its
+        equivalent is e_total_exp + e_total_imp summed; see
+        GOODWE_SENSOR_NOTES.md)."""
+        if counter_names is None:
             return None
+        if isinstance(counter_names, str):
+            counter_names = (counter_names,)
         if same_day and first['timestamp'][:10] != last['timestamp'][:10]:
             return None
-        start_val, end_val = first[counter_name], last[counter_name]
-        if start_val is None or end_val is None:
-            return None
-        return (float(end_val) - float(start_val)) * 1000.0  # kWh -> Wh
+        total_wh = 0.0
+        for counter_name in counter_names:
+            start_val, end_val = first[counter_name], last[counter_name]
+            if start_val is None or end_val is None:
+                return None
+            total_wh += (float(end_val) - float(start_val)) * 1000.0  # kWh -> Wh
+        return total_wh
 
     input_delta_wh = counter_delta(spec['input_counter'], spec['input_same_day'])
     output_delta_wh = counter_delta(spec['output_counter'], spec['output_same_day'])

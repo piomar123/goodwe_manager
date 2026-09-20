@@ -5,7 +5,7 @@ from unittest import mock
 
 import _estimate_battery_efficiency as estimator
 
-THRESHOLDS = estimator.Thresholds(battery_w=200.0, pv_w=50.0, grid_idle_w=60.0)
+THRESHOLDS = estimator.Thresholds(battery_w=200.0, pv_w=0.0, grid_idle_w=60.0)
 CONNECTED = estimator.GRID_MODE_CONNECTED
 
 
@@ -47,9 +47,19 @@ class ClassifySampleTest(unittest.TestCase):
                                            ppv=2000.0, grid_mode=CONNECTED, thresholds=THRESHOLDS)
         self.assertIsNone(state)
 
+    def test_battery_ac_charge_requires_pv_exactly_zero_not_just_below_a_margin(self):
+        # PV threshold is 0, not a small positive margin - any nonzero
+        # PV is real DC power reaching the shared bus and disqualifies
+        # this from being a clean battery-only-via-AC measurement (see
+        # DEFAULT_PV_NOISE_W's docstring: a nonzero-but-"idle" PV margin
+        # was found to bias battery_ac_charge/discharge on real data).
+        state = estimator.classify_sample(pbattery1=-500.0, pgrid=400.0, pgrid2=400.0, pgrid3=400.0,
+                                           ppv=10.0, grid_mode=CONNECTED, thresholds=THRESHOLDS)
+        self.assertIsNone(state)
+
     def test_everything_idle_is_unclassified(self):
         state = estimator.classify_sample(pbattery1=10.0, pgrid=10.0, pgrid2=10.0, pgrid3=10.0,
-                                           ppv=5.0, grid_mode=CONNECTED, thresholds=THRESHOLDS)
+                                           ppv=0.0, grid_mode=CONNECTED, thresholds=THRESHOLDS)
         self.assertIsNone(state)
 
     def test_islanded_sample_is_unclassified_even_if_it_otherwise_looks_clean(self):
@@ -67,7 +77,7 @@ class FindLabeledSessionsTest(unittest.TestCase):
         rows = [
             (0, -500.0, 400.0, 400.0, 400.0, 0.0, CONNECTED),   # battery_ac_charge
             (60, -550.0, 420.0, 420.0, 420.0, 0.0, CONNECTED),  # battery_ac_charge
-            (120, 10.0, 10.0, 10.0, 10.0, 5.0, CONNECTED),      # idle - a gap
+            (120, 10.0, 10.0, 10.0, 10.0, 0.0, CONNECTED),      # idle - a gap
             (180, 500.0, 400.0, 400.0, 400.0, 0.0, CONNECTED),  # battery_ac_discharge
         ]
         sessions = estimator.find_labeled_sessions(rows, THRESHOLDS)
@@ -120,21 +130,22 @@ class MeasureSessionsTest(unittest.TestCase):
             CREATE TABLE inverter_history (
                 timestamp_epoch INTEGER, timestamp TEXT, pbattery1 REAL,
                 pgrid REAL, pgrid2 REAL, pgrid3 REAL, ppv REAL,
-                e_bat_charge_total REAL, e_bat_discharge_total REAL, e_day REAL
+                e_bat_charge_total REAL, e_bat_discharge_total REAL, e_day REAL,
+                e_total_exp REAL, e_total_imp REAL
             )
         """)
 
     def _insert(self, rows):
         self.conn.executemany(
-            "INSERT INTO inverter_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            "INSERT INTO inverter_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
         self.conn.commit()
 
     def test_edge_trim_drops_samples_from_both_ends_before_measuring(self):
         rows = [
-            (0, "2026-07-15 10:00:00", -1000.0, 99999.0, 99999.0, 99999.0, 0.0, 200.0, 80.0, 5.0),
-            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0),
-            (120, "2026-07-15 10:02:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.033, 80.0, 5.0),
-            (180, "2026-07-15 10:03:00", -1000.0, -99999.0, -99999.0, -99999.0, 0.0, 200.05, 80.0, 5.0),
+            (0, "2026-07-15 10:00:00", -1000.0, 99999.0, 99999.0, 99999.0, 0.0, 200.0, 80.0, 5.0, 50.0, 0.0),
+            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0, 50.02, 0.0),
+            (120, "2026-07-15 10:02:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.033, 80.0, 5.0, 50.04, 0.0),
+            (180, "2026-07-15 10:03:00", -1000.0, -99999.0, -99999.0, -99999.0, 0.0, 200.05, 80.0, 5.0, 50.06, 0.0),
         ]
         self._insert(rows)
         sessions = [estimator.Session(estimator.BATTERY_AC_CHARGE, 0, 180)]
@@ -148,9 +159,9 @@ class MeasureSessionsTest(unittest.TestCase):
 
     def test_edge_trim_leaving_fewer_than_two_samples_is_skipped(self):
         rows = [
-            (0, "2026-07-15 10:00:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.0, 80.0, 5.0),
-            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0),
-            (120, "2026-07-15 10:02:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.033, 80.0, 5.0),
+            (0, "2026-07-15 10:00:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.0, 80.0, 5.0, 50.0, 0.0),
+            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0, 50.02, 0.0),
+            (120, "2026-07-15 10:02:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.033, 80.0, 5.0, 50.04, 0.0),
         ]
         self._insert(rows)
         sessions = [estimator.Session(estimator.BATTERY_AC_CHARGE, 0, 120)]
@@ -160,11 +171,13 @@ class MeasureSessionsTest(unittest.TestCase):
         self.assertEqual(totals[estimator.BATTERY_AC_CHARGE].session_count, 0)
 
     def test_battery_ac_charge_session_measures_both_delta_and_integral(self):
-        # AC-side (inverter's own on-grid output, all 3 phases) exceeds
-        # DC-side (battery charge) -> a positive, computable loss.
+        # AC-side (pgrid, whose energy equivalent is e_total_exp+
+        # e_total_imp summed - see GOODWE_SENSOR_NOTES.md) exceeds
+        # DC-side (battery charge) -> a positive, computable loss, both
+        # ways.
         rows = [
-            (0, "2026-07-15 10:00:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.0, 80.0, 5.0),
-            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0),
+            (0, "2026-07-15 10:00:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.0, 80.0, 5.0, 50.0, 0.0),
+            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0, 50.02, 0.0),
         ]
         self._insert(rows)
         sessions = [estimator.Session(estimator.BATTERY_AC_CHARGE, 0, 60)]
@@ -177,15 +190,17 @@ class MeasureSessionsTest(unittest.TestCase):
         self.assertAlmostEqual(t.input_integral_wh, 20.0, places=2)
         self.assertAlmostEqual(t.output_integral_wh, 16.667, places=2)
         self.assertGreater(t.loss_integral(), 0)
-        # no e_total_imp-style counter exists for the inverter's own AC
-        # output, so this is never delta-eligible
-        self.assertEqual(t.delta_sessions, 0)
-        self.assertIsNone(t.loss_delta())
+        # e_total_exp delta: (50.02-50.0)*1000 = 20Wh in, e_bat_charge_total
+        # delta: (200.017-200.0)*1000 = 17Wh out
+        self.assertEqual(t.delta_sessions, 1)
+        self.assertAlmostEqual(t.input_delta_wh, 20.0, places=2)
+        self.assertAlmostEqual(t.output_delta_wh, 17.0, places=2)
+        self.assertGreater(t.loss_delta(), 0)
 
     def test_pv_charge_session_measures_both_delta_and_integral(self):
         rows = [
-            (0, "2026-07-15 10:00:00", -1000.0, 0.0, 0.0, 0.0, 1200.0, 200.0, 80.0, 5.0),
-            (60, "2026-07-15 10:01:00", -1000.0, 0.0, 0.0, 0.0, 1200.0, 200.017, 80.0, 5.02),
+            (0, "2026-07-15 10:00:00", -1000.0, 0.0, 0.0, 0.0, 1200.0, 200.0, 80.0, 5.0, 0.0, 0.0),
+            (60, "2026-07-15 10:01:00", -1000.0, 0.0, 0.0, 0.0, 1200.0, 200.017, 80.0, 5.02, 0.0, 0.0),
         ]
         self._insert(rows)
         sessions = [estimator.Session(estimator.PV_CHARGE, 0, 60)]
@@ -201,8 +216,8 @@ class MeasureSessionsTest(unittest.TestCase):
         # e_day resets at midnight - a session straddling it must not
         # measure a delta, but the integral method is unaffected.
         rows = [
-            (0, "2026-07-15 23:59:30", -1500.0, 0.0, 0.0, 0.0, 2000.0, 200.0, 80.0, 15.0),
-            (60, "2026-07-16 00:00:30", -1500.0, 0.0, 0.0, 0.0, 2000.0, 200.5, 80.0, 0.5),
+            (0, "2026-07-15 23:59:30", -1500.0, 0.0, 0.0, 0.0, 2000.0, 200.0, 80.0, 15.0, 0.0, 0.0),
+            (60, "2026-07-16 00:00:30", -1500.0, 0.0, 0.0, 0.0, 2000.0, 200.5, 80.0, 0.5, 0.0, 0.0),
         ]
         self._insert(rows)
         sessions = [estimator.Session(estimator.PV_CHARGE, 0, 60)]
@@ -217,11 +232,11 @@ class MeasureSessionsTest(unittest.TestCase):
     def test_energy_weighted_aggregation_not_averaged_per_session_ratio(self):
         rows = [
             # tiny session: 1 second, noisy-looking ratio
-            (0, "2026-07-15 10:00:00", -1000.0, 1000.0, 1000.0, 1000.0, 0.0, 200.0, 80.0, 5.0),
-            (1, "2026-07-15 10:00:01", -1000.0, 1000.0, 1000.0, 1000.0, 0.0, 200.0008, 80.0, 5.0),
+            (0, "2026-07-15 10:00:00", -1000.0, 1000.0, 1000.0, 1000.0, 0.0, 200.0, 80.0, 5.0, 0.0, 100.0),
+            (1, "2026-07-15 10:00:01", -1000.0, 1000.0, 1000.0, 1000.0, 0.0, 200.0008, 80.0, 5.0, 0.0, 100.001),
             # large, clean session far later
-            (1000, "2026-07-15 10:16:40", -1000.0, 400.0, 400.0, 400.0, 0.0, 209.0, 80.0, 5.0),
-            (4600, "2026-07-15 11:16:40", -1000.0, 400.0, 400.0, 400.0, 0.0, 209.833, 80.0, 5.0),
+            (1000, "2026-07-15 10:16:40", -1000.0, 400.0, 400.0, 400.0, 0.0, 209.0, 80.0, 5.0, 0.0, 100.1),
+            (4600, "2026-07-15 11:16:40", -1000.0, 400.0, 400.0, 400.0, 0.0, 209.833, 80.0, 5.0, 0.0, 101.0),
         ]
         self._insert(rows)
         sessions = [
@@ -236,25 +251,22 @@ class MeasureSessionsTest(unittest.TestCase):
         # the large session's ~1000Wh should dominate the tiny session's ~3.3Wh
         self.assertGreater(t.input_integral_wh, 900.0)
 
-    def test_battery_ac_charge_output_side_precision_note_available_despite_no_full_loss_delta(self):
-        # battery_ac_charge's input side (pgrid) has no matching energy
-        # counter at all, so loss_delta() can never work - but the
-        # output side (battery, which does have e_bat_charge_total)
-        # should still be comparable against its own integral.
+    def test_precision_notes_surface_a_side_that_disagrees_with_its_own_integral(self):
+        # Both sides are counter-backed for battery_ac_discharge now
+        # (pgrid via e_total_exp+e_total_imp), so precision_notes()
+        # should report both, independent of the paired loss_delta().
         rows = [
-            (0, "2026-07-15 10:00:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.0, 80.0, 5.0),
-            (60, "2026-07-15 10:01:00", -1000.0, 400.0, 400.0, 400.0, 0.0, 200.017, 80.0, 5.0),
+            (0, "2026-07-15 10:00:00", 1000.0, 400.0, 400.0, 400.0, 0.0, 80.0, 200.0, 5.0, 50.0, 0.0),
+            (60, "2026-07-15 10:01:00", 1000.0, 400.0, 400.0, 400.0, 0.0, 80.0, 200.1, 5.0, 50.02, 0.0),
         ]
         self._insert(rows)
-        sessions = [estimator.Session(estimator.BATTERY_AC_CHARGE, 0, 60)]
+        sessions = [estimator.Session(estimator.BATTERY_AC_DISCHARGE, 0, 60)]
 
         totals = estimator.measure_sessions(self.conn, sessions, edge_trim_samples=0)
-        t = totals[estimator.BATTERY_AC_CHARGE]
+        t = totals[estimator.BATTERY_AC_DISCHARGE]
 
-        self.assertIsNone(t.loss_delta())
         notes = t.precision_notes()
-        self.assertEqual(len(notes), 1)
-        self.assertTrue(notes[0].startswith('output:'))
+        self.assertEqual(len(notes), 2)
 
 
 class DeriveBatteryLossTest(unittest.TestCase):
