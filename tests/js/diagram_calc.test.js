@@ -65,25 +65,33 @@ test('batteryState: Charge mode is green, direction charge, magnitude from abs(p
   assert.deepEqual(result, { watts: 364, direction: 'charge', color: 'green', flowColor: 'green', noBattery: false });
 });
 
-test('batteryState: Discharge mode is yellow (not orange - orange means grid-import elsewhere), direction discharge, sign of pbattery1 ignored', () => {
-  // Both a "Charge" and "Discharge" sample can carry a negative pbattery1
-  // (verified against production data - see spec) - direction/color must
-  // come purely from battery_mode, never the raw sign.
+test('batteryState: Discharge mode is yellow (status color from mode), but direction follows pbattery1\'s own sign, not the mode', () => {
+  // A "Discharge"-mode sample can carry a negative pbattery1 (verified
+  // against production data: ~19% of all Discharge-mode samples, 34%
+  // within the +/-200W noise band) - color/flowColor (the status) stay
+  // keyed on battery_mode, but direction now reflects the real reading.
   const result = batteryState({ pbattery1: '-33', battery_mode: '2', battery_soc: '50', battery_discharge_limit: '10' });
-  assert.equal(result.direction, 'discharge');
+  assert.equal(result.direction, 'charge');
   assert.equal(result.color, 'yellow');
   assert.equal(result.flowColor, 'yellow');
   assert.equal(result.watts, 33);
 });
 
-test('batteryState: To be charged / to be discharged map to charge/discharge', () => {
-  assert.equal(batteryState({ pbattery1: '0', battery_mode: '4', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'charge');
-  assert.equal(batteryState({ pbattery1: '0', battery_mode: '5', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'discharge');
+test('batteryState: To be charged / to be discharged carry no forced direction of their own - it comes from pbattery1\'s sign', () => {
+  assert.equal(batteryState({ pbattery1: '0', battery_mode: '4', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'none');
+  assert.equal(batteryState({ pbattery1: '150', battery_mode: '4', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'discharge');
+  assert.equal(batteryState({ pbattery1: '0', battery_mode: '5', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'none');
+  assert.equal(batteryState({ pbattery1: '-150', battery_mode: '5', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'charge');
 });
 
-test('batteryState: Standby is grey with no direction, even with real nonzero wattage', () => {
+test('batteryState: Standby is grey status, but a real nonzero reading still gets a real direction (BMS self-consumption trickle)', () => {
   const standby = batteryState({ pbattery1: '-30', battery_mode: '1', battery_soc: '100', battery_discharge_limit: '10' });
-  assert.deepEqual(standby, { watts: 30, direction: 'none', color: 'grey', flowColor: 'grey', noBattery: false });
+  assert.deepEqual(standby, { watts: 30, direction: 'charge', color: 'grey', flowColor: 'grey', noBattery: false });
+});
+
+test('batteryState: pbattery1 exactly 0 has no direction, regardless of mode', () => {
+  assert.equal(batteryState({ pbattery1: '0', battery_mode: '2', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'none');
+  assert.equal(batteryState({ pbattery1: '0', battery_mode: '3', battery_soc: '50', battery_discharge_limit: '10' }).direction, 'none');
 });
 
 test('batteryState: No battery is grey/none and flags noBattery', () => {
@@ -127,35 +135,51 @@ test('inverterState falls back to grey for an unrecognized code', () => {
   assert.equal(inverterState({ work_mode: '99', work_mode_label: 'Unknown' }).color, 'grey');
 });
 
-test('gridState: Exporting is green, magnitude from abs(meter_active_power_total)', () => {
+test('gridState: Exporting is green (status from grid_in_out), but reversed (arrow direction) follows the meter\'s own sign, not the status', () => {
+  // meter_active_power_total negative while grid_in_out says Exporting is
+  // exactly the kind of disagreement that happens in practice (verified:
+  // sign disagrees with the label ~0.16-1.35% of the time at >500W, more
+  // near 0) - color/exporting (status) stay green/true, reversed (arrow
+  // direction, meaning "flows toward Junction/import-wards") goes true
+  // because the raw reading is negative.
   const result = gridState({ meter_active_power_total: '-500', grid_in_out: '1', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 500, color: 'green', crossed: false, importing: false, exporting: true, directionKnown: true });
+  assert.deepEqual(result, { watts: 500, color: 'green', crossed: false, importing: false, exporting: true, reversed: true, directionKnown: true });
 });
 
-test('gridState: Importing is orange', () => {
+test('gridState: Importing is orange (status), but reversed follows the meter\'s sign - positive here means NOT reversed', () => {
   const result = gridState({ meter_active_power_total: '385', grid_in_out: '2', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 385, color: 'orange', crossed: false, importing: true, exporting: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 385, color: 'orange', crossed: false, importing: true, exporting: false, reversed: false, directionKnown: true });
 });
 
-test('gridState: Idle is grey', () => {
+test('gridState: Idle is grey, not reversed', () => {
   const result = gridState({ meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1' });
-  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: false, importing: false, exporting: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: false, importing: false, exporting: false, reversed: false, directionKnown: true });
 });
 
-test('gridState: Fault forces red and crossed, and direction becomes unknown', () => {
+test('gridState: Fault forces red and crossed, and direction becomes unknown (reversed forced false too)', () => {
   // grid_in_out could still say Importing during a fault - color/crossed
   // correctly override to red, and directionKnown must go false too
   // (this was the bug: defaulting to the "export" arrow whenever color
   // wasn't 'orange', which silently asserted export during a fault).
-  // importing/exporting must both go false too - a Fault makes direction
-  // itself unreliable, not just the color.
-  const result = gridState({ meter_active_power_total: '200', grid_in_out: '2', grid_mode: '2' });
-  assert.deepEqual(result, { watts: 200, color: 'red', crossed: true, importing: false, exporting: false, directionKnown: false });
+  // importing/exporting/reversed must all go false too - a Fault makes
+  // direction itself unreliable, not just the color, even though the
+  // meter's own sign is still available and would otherwise say reversed.
+  const result = gridState({ meter_active_power_total: '-200', grid_in_out: '2', grid_mode: '2' });
+  assert.deepEqual(result, { watts: 200, color: 'red', crossed: true, importing: false, exporting: false, reversed: false, directionKnown: false });
 });
 
 test('gridState: Not connected forces grey and crossed, direction stays known', () => {
   const result = gridState({ meter_active_power_total: '0', grid_in_out: '1', grid_mode: '0' });
-  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: true, importing: false, exporting: false, directionKnown: true });
+  assert.deepEqual(result, { watts: 0, color: 'grey', crossed: true, importing: false, exporting: false, reversed: false, directionKnown: true });
+});
+
+test('gridState: Not connected forces reversed false even with a nonzero (meaningless-while-disconnected) meter reading', () => {
+  // directionKnown deliberately stays true during NOT_CONNECTED (see the
+  // comment above gridState), but that must not let a stray/garbage meter
+  // reading flip the arrow - reversed has to use the same !crossed gate as
+  // importing/exporting, not directionKnown's looser one.
+  const result = gridState({ meter_active_power_total: '-50', grid_in_out: '1', grid_mode: '0' });
+  assert.deepEqual(result, { watts: 50, color: 'grey', crossed: true, importing: false, exporting: false, reversed: false, directionKnown: true });
 });
 
 test('loadState reports total load watts', () => {
@@ -351,7 +375,7 @@ test('edgeStates: a real phase overload never turns the Backup arrow red - only 
 
 test('edgeStates: Backup inverter-fed (islanding/fault) never stripes in a grid contribution', () => {
   const data = {
-    ppv: '1000', pbattery1: '-500', battery_mode: '2', battery_soc: '50', battery_discharge_limit: '25',
+    ppv: '1000', pbattery1: '500', battery_mode: '2', battery_soc: '50', battery_discharge_limit: '25',
     meter_active_power_total: '0', grid_in_out: '0', grid_mode: '0', // not connected
     load_ptotal: '200', backup_ptotal: '800', backup_i1: '1', backup_i2: '1', backup_i3: '1',
     work_mode: '2',
