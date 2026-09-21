@@ -297,7 +297,11 @@
             label: 'Solcast',
             data: points,
             backgroundColor: ChartTheme.withAlpha(c50Color, 0.3),
-            barPercentage: 1.0,
+            // Narrower than Meteosource's full-width bar (barPercentage
+            // 1.0) so Meteosource stays visible as a border on both sides
+            // rather than being fully covered - Chart.js centers the
+            // shrunk bar within the same category width.
+            barPercentage: 0.5,
             categoryPercentage: 1.0,
             grouped: false, // see meteosourceBarDataset() for why this is per-dataset, not a scale option
             order: 5, // above Meteosource's bar (order 10), below the Solcast Estimated Actual/Actual lines
