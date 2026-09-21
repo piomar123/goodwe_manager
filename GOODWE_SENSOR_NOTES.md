@@ -88,19 +88,65 @@ full-SOC specifically, separate from (and additional to) the
 cross-register poll timing skew described below, which is a transient
 effect around any state transition regardless of SOC.
 
-**Partially confirmed** via `_estimate_battery_efficiency.py`'s own
-session data: at a 30W charge/discharge threshold, 92% of sessions
-classified as charging (negative `pbattery1`) clustered tightly at
-31-33W average power - not noise, a real, narrow, always-present band -
-with a clean gap and zero sessions in [40,60)W before genuine
-higher-power charge events resume. The equivalent discharge-direction
-sessions showed no such band at all (minimum 77W). This is consistent
-with a real, roughly-constant ~31-33W trickle that's specifically
-charge-directional, matching the full-SOC BMS hypothesis - though it
-doesn't confirm the full-SOC mechanism itself, only that the trickle is
-real, narrow, and asymmetric between directions.
-`DEFAULT_BATTERY_NOISE_W` is set to 60W (not a smaller "just above
-noise" value) specifically to sit in that gap.
+**Confirmed** via `_estimate_battery_efficiency.py`'s own session data,
+two independent ways:
+
+1. At a 30W charge/discharge threshold, 92% of sessions classified as
+   charging (negative `pbattery1`) clustered tightly at 31-33W average
+   power - not noise, a real, narrow, always-present band - with a
+   clean gap and zero sessions in [40,60)W before genuine higher-power
+   charge events resume. The equivalent discharge-direction sessions
+   showed no such band at all (minimum 77W). `DEFAULT_BATTERY_NOISE_W`
+   is set to 60W (not a smaller "just above noise" value) specifically
+   to sit in that gap.
+2. Directly, from genuinely idle periods (PV producing nothing, the
+   inverter's own AC output also idle - see `grid_idle_w` - so nothing
+   is being asked to charge or discharge at all): raw `pbattery1`
+   averaged **-37.2W** across 17,783 sustained idle runs (edge-trimmed,
+   >=30s each) in a full year of history, median -34.8W; the single
+   longest, cleanest idle run (11.9 hours straight, immune to any
+   transition-skew concern) averaged -30.35W. This lines up with
+   finding 1 above and confirms the trickle isn't an artifact of the
+   threshold-based classification used to find it.
+
+Both findings point to the same real quantity, so `pbattery1` is
+corrected by adding back a constant `BATTERY_OFFSET_W` (31.9W, later
+reconfirmed to plausibly sit anywhere in 30-37W - see above) to *every*
+sample before use, not just samples near zero - the BMS's own
+self-consumption is present at all times, so left uncorrected it
+systematically overstates charge-direction magnitude and understates
+discharge-direction magnitude by the same amount everywhere, not just
+at low power. This is threaded through as `--battery-offset-w` on the
+CLI for re-tuning without editing the script.
+
+**The offset cannot be tuned to make `battery_loss` and
+`battery_loss_discharge` equal.** Sweeping `--battery-offset-w` from
+30-80W across a full year of history shows the gap between them
+shrinking only very slowly (~0.0006 per watt) within the physically
+plausible 30-37W band, and then *plateauing* around a 0.05-0.06 gap
+once well past it (45-80W) rather than continuing to close - pushing
+the offset further isn't a real path to equalizing the two losses. The
+residual asymmetry (roughly `battery_loss` 0.025-0.030 vs
+`battery_loss_discharge` 0.010-0.016 across that whole physically
+plausible range) is treated as genuine round-trip charge/discharge
+efficiency asymmetry, not a measurement artifact - consistent with
+Predbat modeling them as two separate config values rather than one.
+See `home-assistant-raspberry4`'s README for the final values chosen.
+
+## Grid phase sign disagreement
+
+`pgrid`/`pgrid2`/`pgrid3` can legitimately disagree in sign from each
+other - e.g. one phase's load pulling power while another phase is
+lightly loaded enough that its share of a battery/PV flow pushes it the
+other way. This is a real, phase-imbalanced household load, not sensor
+noise. Verified against a year of `battery_ac_charge`/
+`battery_ac_discharge` sessions: 23%/12% of samples respectively had two
+non-negligible phases actively disagreeing in sign. Summing absolute
+per-phase values in that state overstates the true AC-side magnitude
+attributable to a single coherent flow, so
+`_estimate_battery_efficiency.py`'s `classify_sample()` rejects any
+sample where phases disagree (`_grid_phases_agree()`) rather than trying
+to net them out.
 
 ## Noise / cross-sensor disagreement, verified against this hardware
 

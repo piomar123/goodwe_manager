@@ -40,6 +40,13 @@ MQTT broker. Unset `MQTT_HOST` (the default) disables this entirely - no
 behavior change from before this feature existed. See PR #35 for the
 full topic list and Home Assistant/Predbat setup.
 
+The daily-reset energy counters (`e_day_exp`, `e_day_imp`, `e_load_day`,
+`e_bat_charge_day`, `e_bat_discharge_day`) are published live but
+deliberately **not** written to `data.db` - they reset every midnight,
+so a lifetime of DB rows for them adds nothing that the lifetime
+counters (`e_total`, etc., which are persisted) don't already give
+historical analysis. See `sensors.py`'s `DB_SENSORS`.
+
 RCE export prices publish at 15-minute granularity by default (the
 market's own settlement period). Set `RCE_EXPORT_GRANULARITY=hourly` to
 average each hour's four quarters first instead, matching how PGE
@@ -77,6 +84,20 @@ decisions. Set these explicitly to a zł-appropriate value (e.g. `0.001`
 in place of `0.1`) in Predbat's `apps.yaml` rather than relying on the
 shipped defaults - this is a Predbat-side config note, not something
 goodwe_manager can fix on its end.
+
+### Estimating Predbat's battery/inverter loss config
+
+`_estimate_battery_efficiency.py` is a one-off, manually-run offline
+analysis (not part of the live app - see "Documentation conventions"
+below on the `_`-prefix convention) that estimates Predbat's
+`battery_loss`/`battery_loss_discharge`/`inverter_loss` config values
+from this household's actual `inverter_history`, instead of guessing at
+generic li-ion defaults. Run it against `data.db` (or a bounded extract
+of it - see `--db-path`) and read the printed report; nothing writes to
+Predbat's config automatically. See `GOODWE_SENSOR_NOTES.md` for the
+methodology and the sensor-level quirks (BMS self-consumption offset,
+grid phase sign disagreement, cross-register poll timing skew) it
+depends on and works around.
 
 ## Architecture
 
