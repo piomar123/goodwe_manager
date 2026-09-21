@@ -112,6 +112,14 @@ class AsyncioThread(threading.Thread):
     # going to be recoverable anyway. ~5 minutes at the loop's ~1s cadence
     # is generous - past that, give up and move on instead of spinning.
     _PENDING_BACKFILL_RETRY_LIMIT = 300
+    # A failed price publish otherwise only gets retried at the next
+    # natural trigger point (startup, or the next midnight rollover) -
+    # up to 24h of Predbat silently planning against a stale/empty
+    # retained payload with no signal anything is wrong. These track
+    # when to retry sooner instead; None means no retry is pending.
+    _export_price_retry_due_at: Optional[float] = None
+    _import_price_retry_due_at: Optional[float] = None
+    _PRICE_PUBLISH_RETRY_INTERVAL_SECONDS = 300
 
     def __init__(self,
                  group=None,
@@ -231,27 +239,8 @@ class AsyncioThread(threading.Thread):
             await self._seed_hour_start_baseline()
             await self._seed_day_start_baseline()
             if mqtt.enabled:
-                try:
-                    await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
-                except Exception as e:
-                    # A locked rce_prices.db (RcePrefetchThread writing
-                    # concurrently) or a malformed cached period must
-                    # never bounce the inverter connection - see the
-                    # tariff-config rationale below, same constraint.
-                    logger.warning(f"Could not publish export prices: {e}")
-                if TARIFF_IMPORT_CONFIG:
-                    try:
-                        _publish_import_prices()
-                    except Exception as e:
-                        # A bad TARIFF_IMPORT_CONFIG (missing file,
-                        # malformed/incomplete YAML) must never bounce the
-                        # inverter connection - this whole method is
-                        # wrapped by _get_inverter_data_with_retry's
-                        # broad retry-on-any-exception loop, which is
-                        # meant for INVERTER failures, not tariff config
-                        # problems. See spec: "MQTT/tariff features must
-                        # never destabilize inverter polling."
-                        logger.warning(f"Could not publish import prices from TARIFF_IMPORT_CONFIG: {e}")
+                await self._publish_export_prices_safely()
+                self._publish_import_prices_safely()
                 try:
                     _publish_pv_forecast()
                 except Exception as e:
@@ -289,34 +278,68 @@ class AsyncioThread(threading.Thread):
                     current_hour_start, pending_backfill_retries = await self._advance_hour_or_retry_backfill(
                         current_hour_start, new_hour_start, pending_backfill_retries)
                 if mqtt.enabled:
-                    await mqtt.publish_telemetry(sensors_data_with_calculated)
+                    try:
+                        # Bounds how long a half-open broker socket can
+                        # stall this 1Hz polling loop - aiomqtt's own
+                        # publish timeout defaults to 10s, which would
+                        # otherwise silently become this loop's de facto
+                        # per-iteration bound. A TimeoutError here isn't a
+                        # real inverter failure, so it must be caught
+                        # rather than left to propagate into
+                        # _get_inverter_data_with_retry's broad retry loop.
+                        await asyncio.wait_for(mqtt.publish_telemetry(sensors_data_with_calculated), timeout=5)
+                    except Exception as e:
+                        logger.warning(f"Could not publish telemetry: {e}")
                 new_day_start, _ = storage.current_day_bounds(datetime.now())
                 if new_day_start != current_day_start:
                     current_day_start = new_day_start
                     if mqtt.enabled:
-                        try:
-                            await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
-                        except Exception as e:
-                            # Same rationale as the initial-publish block
-                            # above - a locked rce_prices.db or malformed
-                            # cached period must not propagate into the
-                            # inverter retry loop.
-                            logger.warning(f"Could not publish export prices: {e}")
-                        if TARIFF_IMPORT_CONFIG:
-                            try:
-                                _publish_import_prices()
-                            except Exception as e:
-                                # Same rationale as the initial-publish
-                                # block above - a bad tariff config must
-                                # not propagate into the inverter retry
-                                # loop.
-                                logger.warning(f"Could not publish import prices from TARIFF_IMPORT_CONFIG: {e}")
+                        await self._publish_export_prices_safely()
+                        self._publish_import_prices_safely()
+                if mqtt.enabled:
+                    now_monotonic = time.monotonic()
+                    if (self._export_price_retry_due_at is not None
+                            and now_monotonic >= self._export_price_retry_due_at):
+                        await self._publish_export_prices_safely()
+                    if (self._import_price_retry_due_at is not None
+                            and now_monotonic >= self._import_price_retry_due_at):
+                        self._publish_import_prices_safely()
                 await asyncio.sleep(1)
                 if self._should_stop.is_set():
                     logger.info("Stopping the inverter communication routine")
                     return
         finally:
             await self._db_conn.close()
+
+    async def _publish_export_prices_safely(self) -> None:
+        """A locked rce_prices.db (RcePrefetchThread writing concurrently)
+        or a malformed cached period must never bounce the inverter
+        connection - this whole method is wrapped by
+        _get_inverter_data_with_retry's broad retry-on-any-exception
+        loop, which is meant for INVERTER failures, not price-publish
+        problems. On failure, schedules a retry sooner than the next
+        natural trigger (day rollover) - see _PRICE_PUBLISH_RETRY_INTERVAL_SECONDS."""
+        try:
+            await mqtt.publish_export_prices(export_price.build_export_price_payload(
+                datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
+            self._export_price_retry_due_at = None
+        except Exception as e:
+            logger.warning(f"Could not publish export prices: {e}")
+            self._export_price_retry_due_at = time.monotonic() + self._PRICE_PUBLISH_RETRY_INTERVAL_SECONDS
+
+    def _publish_import_prices_safely(self) -> None:
+        """Same rationale as _publish_export_prices_safely - a bad
+        TARIFF_IMPORT_CONFIG (missing file, malformed/incomplete YAML)
+        must never bounce the inverter connection, and a failure gets a
+        sooner retry than the next natural trigger."""
+        if not TARIFF_IMPORT_CONFIG:
+            return
+        try:
+            _publish_import_prices()
+            self._import_price_retry_due_at = None
+        except Exception as e:
+            logger.warning(f"Could not publish import prices from TARIFF_IMPORT_CONFIG: {e}")
+            self._import_price_retry_due_at = time.monotonic() + self._PRICE_PUBLISH_RETRY_INTERVAL_SECONDS
 
     async def _seed_hour_start_baseline(self):
         hour_start_epoch, hour_end_epoch = storage.current_hour_bounds(datetime.now())
@@ -405,9 +428,34 @@ mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USER
                               password=MQTT_PASSWORD, topic_prefix=MQTT_TOPIC_PREFIX)
 
 
+def _fire_and_forget(coro) -> None:
+    """run_coroutine_threadsafe's Future is otherwise never inspected by
+    these prefetch-thread callbacks (unlike the Flask-route call sites
+    elsewhere in this file, which call .result() right away) - without a
+    done-callback, an exception raised inside the coroutine (e.g. a
+    genuine MqttBridge bug, not the broker-down case _publish already
+    catches) would be silently swallowed instead of ever reaching a log."""
+    future = asyncio_thread.run_coroutine_threadsafe(coro)
+    future.add_done_callback(_log_fire_and_forget_exception)
+
+
+def _log_fire_and_forget_exception(future: concurrent.futures.Future) -> None:
+    exception = future.exception()
+    if exception is not None:
+        logger.error(f"Unhandled exception in a fire-and-forget MQTT publish: {exception}")
+
+
 def _publish_export_prices():
+    # In --dry-run, asyncio_thread's loop never starts _get_inverter_data
+    # (see main.run()'s `if not dry_run`), so mqtt.connect() never runs -
+    # without this guard, RcePrefetchThread's on_success callback would
+    # still reach mqtt._publish's opportunistic-reconnect path and
+    # attempt a real connection/publish to whatever broker is configured,
+    # defeating the point of dry-run.
+    if dry_run:
+        return
     payload = export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES)
-    asyncio_thread.run_coroutine_threadsafe(mqtt.publish_export_prices(payload))
+    _fire_and_forget(mqtt.publish_export_prices(payload))
 
 
 def _publish_import_prices():
@@ -419,13 +467,19 @@ def _publish_import_prices():
         'raw_today': tariff_engine.bands_for_day(config, today, WARSAW_TZ),
         'raw_tomorrow': tariff_engine.bands_for_day(config, today + timedelta(days=1), WARSAW_TZ),
     }
-    asyncio_thread.run_coroutine_threadsafe(mqtt.publish_import_prices(payload))
+    _fire_and_forget(mqtt.publish_import_prices(payload))
 
 
 def _publish_pv_forecast():
+    # Same dry-run guard as _publish_export_prices - this is also
+    # ForecastPrefetchThread's on_solcast_updated callback, which starts
+    # unconditionally regardless of dry_run.
+    if dry_run:
+        return
     # Reuses whatever ForecastPrefetchThread already just fetched and
     # stored (forecast_history.db) rather than calling Solcast again -
-    # see PR #35. Predbat needs a 48h horizon (today + tomorrow)
+    # see MQTT_TOPICS.md's `forecast/pv` section. Predbat needs a 48h
+    # horizon (today + tomorrow)
     # to plan around tonight's cheap-rate charge, and expects each half as
     # a separate detailedForecast-shaped list (pv_forecast_today /
     # pv_forecast_tomorrow), not one flat HH:MM map - see
@@ -439,7 +493,7 @@ def _publish_pv_forecast():
         'today': pv_forecast_payload.build_detailed_forecast(today_periods, today_date, WARSAW_TZ),
         'tomorrow': pv_forecast_payload.build_detailed_forecast(tomorrow_periods, tomorrow_date, WARSAW_TZ),
     }
-    asyncio_thread.run_coroutine_threadsafe(mqtt.publish_pv_forecast(payload))
+    _fire_and_forget(mqtt.publish_pv_forecast(payload))
 
 
 app = flask.Flask(__name__, static_url_path='/static')

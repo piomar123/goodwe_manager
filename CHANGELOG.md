@@ -19,3 +19,9 @@ grouped under `Unreleased` until that changes.
   startup and on every hour rollover). A `--full-rescan` option on
   `_backfill_hourly_summary.py` covers the rare case of a gap that needs
   reprocessing after data was manually corrected or imported out of order.
+- Daily-reset energy counters (`e_day_exp`, `e_day_imp`, `e_load_day`,
+  `e_bat_charge_day`, `e_bat_discharge_day`) are now MQTT/SSE-only, not
+  persisted to `data.db` (see `sensors.py`'s `DB_SENSORS`). If you're
+  re-running `_migrate_csv_to_sqlite.py` against old CSVs, their values for
+  these columns are silently dropped on import - harmless, since nothing
+  reads them from `data.db`.

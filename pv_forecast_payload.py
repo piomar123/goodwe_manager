@@ -2,8 +2,8 @@
 pv_forecast_payload.py
 Converts goodwe_manager's stored {"HH:MM": {"c10", "c50", "c90"}} solar
 forecast shape (forecast_history.get_latest_merged's return value) into
-Predbat's expected detailedForecast list shape - see PR #35, and
-Predbat's own templates/huawei.yaml
+Predbat's expected detailedForecast list shape - see MQTT_TOPICS.md's
+`forecast/pv` section, and Predbat's own templates/huawei.yaml
 (pv_forecast_today/pv_forecast_tomorrow + *_attribute: detailedForecast).
 """
 from datetime import date, datetime

@@ -37,8 +37,8 @@ requires auth) in `.env` to publish live telemetry, daily energy
 counters, RCE export prices, tariff-based import prices (if
 `TARIFF_IMPORT_CONFIG` is also set), and the combined PV forecast to your
 MQTT broker. Unset `MQTT_HOST` (the default) disables this entirely - no
-behavior change from before this feature existed. See PR #35 for the
-full topic list and Home Assistant/Predbat setup.
+behavior change from before this feature existed. See `MQTT_TOPICS.md`
+for the full topic/payload list and Home Assistant/Predbat setup.
 
 The daily-reset energy counters (`e_day_exp`, `e_day_imp`, `e_load_day`,
 `e_bat_charge_day`, `e_bat_discharge_day`) are published live but

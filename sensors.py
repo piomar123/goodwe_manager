@@ -125,8 +125,11 @@ SELECTED_SENSORS = [
 # MQTT telemetry for Home Assistant to track "today so far") - not worth a
 # lifetime of rows in data.db, since they reset to 0 every midnight and
 # _estimate_battery_efficiency.py-style historical analysis already prefers
-# the lifetime counters. `e_total` is the exception: kept in the DB since
-# it's the lifetime PV counter, not a daily-reset one.
+# the lifetime counters. `e_day` (PV, also daily-reset) is deliberately NOT
+# in this set despite looking like it belongs here: it's load-bearing for
+# _estimate_battery_efficiency.py's pv_ac measurement (its input counter,
+# with a midnight-rollover guard built specifically for it) - dropping it
+# would silently break inverter_loss estimation.
 _EPHEMERAL_ONLY_SENSORS = {
     'e_day_exp',
     'e_day_imp',

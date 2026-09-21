@@ -17,8 +17,10 @@ writing concurrently) or a malformed forecast_history.db snapshot would
 escalate into an inverter reconnect for a completely unrelated reason.
 """
 import asyncio
+import concurrent.futures
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -30,6 +32,18 @@ from sensors import sensor_columns, SELECTED_SENSORS
 
 import main
 import mqtt_bridge
+
+
+def _closed_coro_future(coro) -> concurrent.futures.Future:
+    """Stand-in for AsyncioThread.run_coroutine_threadsafe in tests that
+    don't have a real event loop running: closes the coroutine (avoiding
+    a "coroutine was never awaited" warning) and returns an
+    already-completed Future, since main.py's _fire_and_forget() calls
+    .add_done_callback() on whatever this returns."""
+    coro.close()
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    future.set_result(None)
+    return future
 
 
 class _FakeMqttClient:
@@ -128,7 +142,7 @@ class _SideChannelFailureDoesNotBounceInverterConnectionTestBase(unittest.TestCa
         # unconditional, unlike the two tariff-gated calls) uses it too,
         # so stub it out to a no-op here.
         self._orig_run_coro = main.asyncio_thread.run_coroutine_threadsafe
-        main.asyncio_thread.run_coroutine_threadsafe = lambda coro: coro.close()
+        main.asyncio_thread.run_coroutine_threadsafe = _closed_coro_future
 
         thread = main.AsyncioThread.__new__(main.AsyncioThread)
         thread._inverter_address = '127.0.0.1'
@@ -209,6 +223,74 @@ class PvForecastFailureDoesNotBounceInverterConnectionTest(_SideChannelFailureDo
 
     def test_get_inverter_data_does_not_raise_on_pv_forecast_failure(self):
         self._assert_get_inverter_data_does_not_raise("a PV forecast publish failure")
+
+
+class TelemetryPublishFailureDoesNotBounceInverterConnectionTest(_SideChannelFailureDoesNotBounceInverterConnectionTestBase):
+    """Forces mqtt.publish_telemetry to raise (standing in for the
+    asyncio.wait_for timeout it's now wrapped in - see main.py's telemetry
+    publish block) - proves the try/except around it keeps that error
+    from propagating too, same as the other side-channel publishes."""
+
+    def setUp(self):
+        super().setUp()
+        self._telemetry_patcher = mock.patch.object(
+            main.mqtt, 'publish_telemetry',
+            side_effect=asyncio.TimeoutError("simulated telemetry publish timeout"))
+        self._telemetry_patcher.start()
+
+    def tearDown(self):
+        self._telemetry_patcher.stop()
+        super().tearDown()
+
+    def test_get_inverter_data_does_not_raise_on_telemetry_timeout(self):
+        self._assert_get_inverter_data_does_not_raise("a telemetry publish timeout")
+
+
+class PricePublishRetrySchedulingTest(_SideChannelFailureDoesNotBounceInverterConnectionTestBase):
+    """Covers the pre-merge review finding that a failed price publish
+    previously had no retry before the next natural trigger (startup or
+    midnight rollover) - up to 24h of Predbat silently planning against a
+    stale/empty retained payload. _publish_export_prices_safely/
+    _publish_import_prices_safely now schedule a sooner retry
+    (_export_price_retry_due_at/_import_price_retry_due_at) on failure
+    and clear it on success; the main loop checks these every iteration."""
+
+    def test_export_price_failure_schedules_a_retry(self):
+        with mock.patch.object(main.export_price, 'build_export_price_payload',
+                                side_effect=RuntimeError("simulated rce_prices.db lock contention")):
+            asyncio.run(self.thread._publish_export_prices_safely())
+
+        self.assertIsNotNone(self.thread._export_price_retry_due_at)
+        self.assertGreater(self.thread._export_price_retry_due_at, time.monotonic())
+
+    def test_export_price_success_clears_a_pending_retry(self):
+        self.thread._export_price_retry_due_at = time.monotonic() + 100
+
+        asyncio.run(self.thread._publish_export_prices_safely())
+
+        self.assertIsNone(self.thread._export_price_retry_due_at)
+
+    def test_import_price_failure_schedules_a_retry(self):
+        # setUp already points TARIFF_IMPORT_CONFIG at a nonexistent file.
+        self.thread._publish_import_prices_safely()
+
+        self.assertIsNotNone(self.thread._import_price_retry_due_at)
+        self.assertGreater(self.thread._import_price_retry_due_at, time.monotonic())
+
+    def test_import_price_success_clears_a_pending_retry(self):
+        fd, path = tempfile.mkstemp(suffix='.yaml')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write("components:\n  total:\n    prices:\n      flat: 0.5\n    "
+                        "bands:\n      default:\n        - price: flat\n    default_price: flat\n")
+            main.TARIFF_IMPORT_CONFIG = path
+            self.thread._import_price_retry_due_at = time.monotonic() + 100
+
+            self.thread._publish_import_prices_safely()
+
+            self.assertIsNone(self.thread._import_price_retry_due_at)
+        finally:
+            os.remove(path)
 
 
 if __name__ == '__main__':

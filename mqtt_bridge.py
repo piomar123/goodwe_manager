@@ -3,7 +3,7 @@ mqtt_bridge.py
 Optional MQTT publish path for goodwe_manager - turns the existing
 inverter polling loop's already-fetched data into the topics Home
 Assistant/Predbat need, without a second connection to the inverter. See
-PR #35.
+MQTT_TOPICS.md for the full topic/payload list.
 
 Disabled entirely (every publish_* method becomes a no-op) when no
 MQTT_HOST is configured - a fresh checkout or another user's fork with no
@@ -119,6 +119,13 @@ class MqttBridge:
             await self._client.__aexit__(None, None, None)
         except Exception as e:
             logger.warning(f"Error disconnecting MQTT client: {e}")
+        finally:
+            # Otherwise a later publish_* call would reuse this closed
+            # client instead of going through the reconnect path - only
+            # a shutdown-only path today, but leaving a closed client in
+            # place is a bug waiting for a caller that publishes after
+            # disconnecting.
+            self._client = None
 
     async def publish_telemetry(self, payload: dict) -> None:
         await self._publish('telemetry', json.dumps(payload), retain=False)

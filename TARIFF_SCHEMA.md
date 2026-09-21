@@ -7,6 +7,7 @@ See `tariff_examples/g12w_pge.yaml` for a complete, real-world example
 ## Top level
 
 ```yaml
+country: PL   # optional, defaults to PL
 components:
   <component_name>:
     prices: { ... }
@@ -14,6 +15,10 @@ components:
     bands: { ... }
     default_price: <price_name>
 ```
+
+`country` is an ISO country code the `holidays` PyPI package recognizes
+- it controls which public holiday calendar the `Holiday`/`Work` day-spec
+keywords use (see below). Defaults to `PL` if omitted.
 
 `components` is a map of independently-scheduled tariff components,
 each evaluated separately and **summed** to get the total price at a
@@ -50,7 +55,8 @@ season_boundaries:
 
 Dates are `dd.mm` (no year - re-evaluated every year). A range wraps
 the year boundary automatically when `start > end` (winter above spans
-Oct-Mar through New Year's). Omit this key entirely for a
+Oct-Mar through New Year's). `29.02` falls back to the 28th in a
+non-leap year rather than erroring. Omit this key entirely for a
 season-independent component - `bands.default` becomes the only band
 list then.
 
@@ -85,10 +91,12 @@ from most specific to least specific.
 - **`days`**: a comma-separated list of tokens, OR'd together (any
   token matching is enough). Tokens can be:
   - weekday abbreviations: `Mo`, `Tu`, `We`, `Th`, `Fr`, `Sa`, `Su`
-  - ranges: `Mo-Fr`
-  - `Work` - Monday-Friday, excluding Polish public holidays
-  - `Holiday` - Polish public holidays (via the `holidays` package),
-    regardless of weekday
+  - ranges: `Mo-Fr`, wrapping the week if needed (e.g. `Fr-Mo` covers
+    Friday through Monday)
+  - `Work` - Monday-Friday, excluding public holidays (see `country`
+    above)
+  - `Holiday` - public holidays for `country` (via the `holidays`
+    package), regardless of weekday
   - example: `"Sa,Su,Holiday"` matches weekends and holidays
   - omit `days` entirely to match every day
 - **`start`/`end`**: `HH:MM` or `HH:MM:SS`, local time. `end` is
@@ -114,7 +122,8 @@ resolves to a price.
 - `bands_for_day(config, day, tz)` - builds the day's price schedule as
   a list of `{"from", "to", "value"}` intervals (merging adjacent
   same-price minutes, no forced slicing), used for the MQTT bridge's
-  `import_today` publish and Predbat's `metric_octopus_import`.
+  `prices/import` publish (see `MQTT_TOPICS.md`) and Predbat's
+  `metric_octopus_import`.
 - `_calculate_income.py --tariff-config <path>` reuses the same engine
   for historical income calculations, per-hour, instead of the flat
   `IMPORT_PRICE_KWH` constant.

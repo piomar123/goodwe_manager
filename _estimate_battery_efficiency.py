@@ -84,8 +84,15 @@ DEFAULT_BATTERY_NOISE_W = 60.0
 # charge-direction trickle cluster found while tuning
 # DEFAULT_BATTERY_NOISE_W averaged 31.9W (see GOODWE_SENSOR_NOTES.md) -
 # taken as the offset magnitude, sign chosen so a true-idle sample
-# (raw ~-31.9W, charge-direction) corrects back to ~0.
-BATTERY_OFFSET_W = 31.9
+# (raw ~-31.9W, charge-direction) corrects back to ~0. Threaded through
+# as a Thresholds field / --battery-offset-w rather than a global, so
+# main() can override it (e.g. for the sweep in GOODWE_SENSOR_NOTES.md)
+# without mutating module state.
+DEFAULT_BATTERY_OFFSET_W = 31.9
+# _grid_phases_agree's noise floor for "is a phase actively signed" -
+# see that function's docstring. Exposed the same way as the offset
+# above, for the same reason.
+DEFAULT_PHASE_AGREE_NOISE_W = 20.0
 # Zero, not a small positive margin: any nonzero PV, even a few watts,
 # is real DC power reaching the shared PV/battery bus on a hybrid
 # inverter, and battery_ac_charge/battery_ac_discharge require PV
@@ -105,6 +112,15 @@ DEFAULT_PV_NOISE_W = 0.0
 # samples off each session's start/end before measuring energy on it.
 DEFAULT_MIN_SESSION_SECONDS = 5
 DEFAULT_EDGE_TRIM_SAMPLES = 2
+# A gap this large between two consecutive same-state samples is not
+# normal ~1Hz polling jitter - it's a service restart/deploy or a
+# wifi/inverter outage. Without this guard, find_labeled_sessions()
+# would bridge straight across the gap: a single trapezoid would span
+# whatever time the logger was down, and a counter delta across that
+# gap would silently absorb everything that happened while unobserved -
+# both far worse than the normal per-sample skew the guards above
+# already handle.
+DEFAULT_MAX_SAMPLE_GAP_SECONDS = 30
 # "inverter AC output idle" (required only by pv_charge, to confirm
 # charging is happening via the DC-bus bypass rather than the AC path)
 # is a magnitude check on pgrid+pgrid2+pgrid3, using the *correct*
@@ -128,6 +144,8 @@ class Thresholds:
     battery_w: float = DEFAULT_BATTERY_NOISE_W
     pv_w: float = DEFAULT_PV_NOISE_W
     grid_idle_w: float = DEFAULT_GRID_IDLE_SUM_W
+    phase_agree_w: float = DEFAULT_PHASE_AGREE_NOISE_W
+    battery_offset_w: float = DEFAULT_BATTERY_OFFSET_W
 
 
 @dataclass
@@ -148,8 +166,8 @@ def _sign(value: Optional[float], threshold: float) -> Optional[str]:
     return None
 
 
-def _corrected_pbattery1(pbattery1: Optional[float]) -> Optional[float]:
-    """Applies BATTERY_OFFSET_W as an additive correction, not just a
+def _corrected_pbattery1(pbattery1: Optional[float], offset: float = DEFAULT_BATTERY_OFFSET_W) -> Optional[float]:
+    """Applies `offset` as an additive correction, not just a
     classification threshold: the BMS is powered continuously by the
     inverter (hypothesis - see GOODWE_SENSOR_NOTES.md), so this constant
     draw is present in every pbattery1 reading, not only near-idle ones.
@@ -159,16 +177,17 @@ def _corrected_pbattery1(pbattery1: Optional[float]) -> Optional[float]:
     negative-combined-loss anomaly this was introduced to test."""
     if pbattery1 is None:
         return None
-    return pbattery1 + BATTERY_OFFSET_W
+    return pbattery1 + offset
 
 
-def _battery_direction(pbattery1: Optional[float], threshold: float) -> Optional[str]:
+def _battery_direction(pbattery1: Optional[float], threshold: float,
+                        offset: float = DEFAULT_BATTERY_OFFSET_W) -> Optional[str]:
     """'charge'/'discharge' - pbattery1's sign convention is NOT what a
     naive reading suggests: verified against 90 days of production data
     in PR #33, positive = discharging, negative = charging (see
     GOODWE_SENSOR_NOTES.md). Classifies on the offset-corrected value,
     consistent with every other use of pbattery1 in this module."""
-    sign = _sign(_corrected_pbattery1(pbattery1), threshold)
+    sign = _sign(_corrected_pbattery1(pbattery1, offset), threshold)
     if sign == 'pos':
         return 'discharge'
     if sign == 'neg':
@@ -187,7 +206,7 @@ def _grid_power_sum(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Opt
 
 
 def _grid_phases_agree(pgrid: Optional[float], pgrid2: Optional[float], pgrid3: Optional[float],
-                        threshold: float = 20.0) -> bool:
+                        threshold: float = DEFAULT_PHASE_AGREE_NOISE_W) -> bool:
     """True unless two non-negligible phases actively disagree in sign -
     a real but phase-imbalanced flow (e.g. one phase's load pulling
     import while another exports) that isn't attributable to a single
@@ -212,9 +231,9 @@ def classify_sample(pbattery1: Optional[float], pgrid: Optional[float], pgrid2: 
     of these four normal-operation paths)."""
     if grid_mode != GRID_MODE_CONNECTED:
         return None
-    if not _grid_phases_agree(pgrid, pgrid2, pgrid3):
+    if not _grid_phases_agree(pgrid, pgrid2, pgrid3, thresholds.phase_agree_w):
         return None
-    battery_dir = _battery_direction(pbattery1, thresholds.battery_w)
+    battery_dir = _battery_direction(pbattery1, thresholds.battery_w, thresholds.battery_offset_w)
     pv_producing = ppv is not None and ppv > thresholds.pv_w
     grid_ac_idle = (_grid_power_sum(pgrid, pgrid2, pgrid3) or 0) < thresholds.grid_idle_w
 
@@ -231,18 +250,22 @@ def classify_sample(pbattery1: Optional[float], pgrid: Optional[float], pgrid2: 
 
 def find_labeled_sessions(rows: List[Tuple[int, Optional[float], Optional[float], Optional[float],
                                             Optional[float], Optional[float], Optional[float]]],
-                           thresholds: Thresholds) -> List[Session]:
+                           thresholds: Thresholds,
+                           max_gap_seconds: int = DEFAULT_MAX_SAMPLE_GAP_SECONDS) -> List[Session]:
     """rows: [(epoch, pbattery1, pgrid, pgrid2, pgrid3, ppv, grid_mode), ...],
     time-ordered. Splits into contiguous runs sharing the same
-    classify_sample() label - a sample matching no state, or a
-    different one, ends the current run."""
+    classify_sample() label - a sample matching no state, a different
+    one, or too large a time gap since the last sample (a service
+    restart/outage, not normal polling jitter - see
+    DEFAULT_MAX_SAMPLE_GAP_SECONDS) all end the current run."""
     sessions = []
     current_state = None
     current_start = None
     current_end = None
     for epoch, pbattery1, pgrid, pgrid2, pgrid3, ppv, grid_mode in rows:
         state = classify_sample(pbattery1, pgrid, pgrid2, pgrid3, ppv, grid_mode, thresholds)
-        if state != current_state:
+        gapped = current_end is not None and epoch - current_end > max_gap_seconds
+        if state != current_state or gapped:
             if current_state is not None:
                 sessions.append(Session(current_state, current_start, current_end))
             current_state, current_start = state, epoch
@@ -276,7 +299,10 @@ def _abs_or_none(value: Optional[float]) -> Optional[float]:
     return abs(value) if value is not None else None
 
 
-def _pgrid_sum_or_none(r: dict) -> Optional[float]:
+def _pgrid_sum_or_none(r: dict, offset: float = DEFAULT_BATTERY_OFFSET_W) -> Optional[float]:
+    """`offset` is unused here (pgrid needs no BMS correction) - accepted
+    only so every SESSION_SPECS power callable shares one calling
+    convention (see _measure_session)."""
     return _grid_power_sum(r['pgrid'], r['pgrid2'], r['pgrid3'])
 
 
@@ -298,9 +324,12 @@ def _pgrid_sum_or_none(r: dict) -> Optional[float]:
 # all among the fields collected here.
 PGRID_ENERGY_COUNTERS = ('e_total_exp', 'e_total_imp')
 
+# Every input_power/output_power callable takes (row, battery_offset_w) -
+# a uniform signature so _measure_session can call either without caring
+# which side actually uses the offset (only the pbattery1-derived ones do).
 SESSION_SPECS: Dict[str, dict] = {
     PV_AC: {
-        'input_power': lambda r: r['ppv'],
+        'input_power': lambda r, offset: r['ppv'],
         'input_counter': 'e_day',
         'input_same_day': True,
         'output_power': _pgrid_sum_or_none,
@@ -308,10 +337,10 @@ SESSION_SPECS: Dict[str, dict] = {
         'output_same_day': False,
     },
     PV_CHARGE: {
-        'input_power': lambda r: r['ppv'],
+        'input_power': lambda r, offset: r['ppv'],
         'input_counter': 'e_day',
         'input_same_day': True,
-        'output_power': lambda r: _abs_or_none(_corrected_pbattery1(r['pbattery1'])),
+        'output_power': lambda r, offset: _abs_or_none(_corrected_pbattery1(r['pbattery1'], offset)),
         'output_counter': 'e_bat_charge_total',
         'output_same_day': False,
     },
@@ -319,12 +348,12 @@ SESSION_SPECS: Dict[str, dict] = {
         'input_power': _pgrid_sum_or_none,
         'input_counter': PGRID_ENERGY_COUNTERS,
         'input_same_day': False,
-        'output_power': lambda r: _abs_or_none(_corrected_pbattery1(r['pbattery1'])),
+        'output_power': lambda r, offset: _abs_or_none(_corrected_pbattery1(r['pbattery1'], offset)),
         'output_counter': 'e_bat_charge_total',
         'output_same_day': False,
     },
     BATTERY_AC_DISCHARGE: {
-        'input_power': lambda r: _abs_or_none(_corrected_pbattery1(r['pbattery1'])),
+        'input_power': lambda r, offset: _abs_or_none(_corrected_pbattery1(r['pbattery1'], offset)),
         'input_counter': 'e_bat_discharge_total',
         'input_same_day': False,
         'output_power': _pgrid_sum_or_none,
@@ -392,7 +421,8 @@ class SessionTypeTotals:
 
 
 def _measure_session(conn: sqlite3.Connection, session: Session, spec: dict,
-                      edge_trim_samples: int = DEFAULT_EDGE_TRIM_SAMPLES) -> Optional[dict]:
+                      edge_trim_samples: int = DEFAULT_EDGE_TRIM_SAMPLES,
+                      battery_offset_w: float = DEFAULT_BATTERY_OFFSET_W) -> Optional[dict]:
     rows = conn.execute(
         f"SELECT {', '.join(SESSION_ROW_COLUMNS)} FROM inverter_history "
         "WHERE timestamp_epoch >= ? AND timestamp_epoch <= ? ORDER BY timestamp_epoch",
@@ -413,8 +443,8 @@ def _measure_session(conn: sqlite3.Connection, session: Session, spec: dict,
     if len(dict_rows) < 2:
         return None
 
-    input_series = [(r['timestamp_epoch'], spec['input_power'](r)) for r in dict_rows]
-    output_series = [(r['timestamp_epoch'], spec['output_power'](r)) for r in dict_rows]
+    input_series = [(r['timestamp_epoch'], spec['input_power'](r, battery_offset_w)) for r in dict_rows]
+    output_series = [(r['timestamp_epoch'], spec['output_power'](r, battery_offset_w)) for r in dict_rows]
     input_integral_wh = _trapezoidal_energy_wh([(t, v) for t, v in input_series if v is not None])
     output_integral_wh = _trapezoidal_energy_wh([(t, v) for t, v in output_series if v is not None])
 
@@ -451,16 +481,26 @@ def _measure_session(conn: sqlite3.Connection, session: Session, spec: dict,
 
 
 def measure_sessions(conn: sqlite3.Connection, sessions: List[Session],
-                      edge_trim_samples: int = DEFAULT_EDGE_TRIM_SAMPLES) -> Dict[str, SessionTypeTotals]:
+                      edge_trim_samples: int = DEFAULT_EDGE_TRIM_SAMPLES,
+                      battery_offset_w: float = DEFAULT_BATTERY_OFFSET_W) -> Dict[str, SessionTypeTotals]:
     """Sums input/output energy (both by counter-delta and by power
     integration) across every session of each type, then exposes one
     loss ratio per type per method via SessionTypeTotals - energy-
     weighted, not a plain average of per-session ratios (see module
-    docstring)."""
+    docstring).
+
+    Note `battery_offset_w` only affects the integral method: it
+    corrects the raw pbattery1 *power* series (see _corrected_pbattery1),
+    but the counter-delta method reads e_bat_charge_total/
+    e_bat_discharge_total directly, which cannot be offset-corrected
+    after the fact. Sweeping --battery-offset-w therefore only
+    meaningfully moves the integral-based loss numbers directly - it
+    only affects the delta-based ones indirectly, via which sessions get
+    classified into which state in the first place."""
     totals = {state: SessionTypeTotals() for state in ALL_STATES}
     for session in sessions:
         spec = SESSION_SPECS[session.state]
-        measurement = _measure_session(conn, session, spec, edge_trim_samples)
+        measurement = _measure_session(conn, session, spec, edge_trim_samples, battery_offset_w)
         if measurement is None:
             continue
         t = totals[session.state]
@@ -473,11 +513,19 @@ def measure_sessions(conn: sqlite3.Connection, sessions: List[Session],
             t.input_delta_wh_any += input_delta
             t.input_integral_wh_when_delta_any += measurement['input_integral_wh']
             t.input_delta_sessions_any += 1
-        if output_delta is not None:
+        if output_delta is not None and output_delta > 0:
             t.output_delta_wh_any += output_delta
             t.output_integral_wh_when_delta_any += measurement['output_integral_wh']
             t.output_delta_sessions_any += 1
-        if input_delta is not None and output_delta is not None and input_delta > 0:
+        # Both sides must have actually ticked, not just be non-None:
+        # counter resolution is 0.1kWh, so the smaller (post-loss) side
+        # ticks less often than the input side. A session where input
+        # ticked but output read exactly 0.0 isn't "zero output energy" -
+        # it's "too little energy to move a 0.1kWh counter yet" - and
+        # counting it here would silently score that session as loss=1.0,
+        # biasing loss_delta() upward. Same reasoning as the output_delta
+        # > 0 check just above, applied to the paired total.
+        if input_delta is not None and output_delta is not None and input_delta > 0 and output_delta > 0:
             t.input_delta_wh += input_delta
             t.output_delta_wh += output_delta
             t.delta_sessions += 1
@@ -538,17 +586,20 @@ def _fmt_loss(loss: Optional[float]) -> str:
 
 
 def main():
-    global BATTERY_OFFSET_W
     parser = argparse.ArgumentParser(
         description="Estimate Predbat's real battery_loss/battery_loss_discharge/inverter_loss settings from history")
     parser.add_argument("--db-path", type=str, default=storage.DATA_DB_PATH)
-    parser.add_argument("--battery-offset-w", type=float, default=BATTERY_OFFSET_W,
+    parser.add_argument("--battery-offset-w", type=float, default=DEFAULT_BATTERY_OFFSET_W,
                          help="BMS self-consumption trickle added back to every pbattery1 reading before "
-                              "classifying/measuring it (see BATTERY_OFFSET_W). Sweep this to find the value "
-                              "that brings battery_loss and battery_loss_discharge into agreement.")
+                              "classifying/measuring it (see DEFAULT_BATTERY_OFFSET_W). Sweep this to see its "
+                              "effect on battery_loss/battery_loss_discharge - note it only moves the "
+                              "integral-based numbers directly (see measure_sessions' docstring).")
     parser.add_argument("--battery-noise-w", type=float, default=DEFAULT_BATTERY_NOISE_W)
     parser.add_argument("--grid-idle-w", type=float, default=DEFAULT_GRID_IDLE_SUM_W)
     parser.add_argument("--pv-noise-w", type=float, default=DEFAULT_PV_NOISE_W)
+    parser.add_argument("--phase-agree-w", type=float, default=DEFAULT_PHASE_AGREE_NOISE_W,
+                         help="Noise floor below which a pgrid/pgrid2/pgrid3 phase doesn't count as actively "
+                              "signed for the phase-sign-agreement check (see _grid_phases_agree).")
     parser.add_argument("--min-session-seconds", type=int, default=DEFAULT_MIN_SESSION_SECONDS,
                          help="Discard sessions shorter than this - at Goodwe's non-atomic per-register "
                               "poll cadence, a session this short is more likely a transition artifact "
@@ -557,12 +608,14 @@ def main():
     parser.add_argument("--edge-trim-samples", type=int, default=DEFAULT_EDGE_TRIM_SAMPLES,
                          help="Drop this many samples off each session's start/end before measuring "
                               "energy on it, for the same cross-register skew reason.")
+    parser.add_argument("--max-gap-seconds", type=int, default=DEFAULT_MAX_SAMPLE_GAP_SECONDS,
+                         help="Split a session wherever consecutive samples are more than this far apart - "
+                              "a real outage/restart, not normal polling jitter (see DEFAULT_MAX_SAMPLE_GAP_SECONDS).")
     args = parser.parse_args()
 
-    BATTERY_OFFSET_W = args.battery_offset_w
-
     thresholds = Thresholds(battery_w=args.battery_noise_w, grid_idle_w=args.grid_idle_w,
-                             pv_w=args.pv_noise_w)
+                             pv_w=args.pv_noise_w, phase_agree_w=args.phase_agree_w,
+                             battery_offset_w=args.battery_offset_w)
 
     conn = sqlite3.connect(args.db_path)
     try:
@@ -580,9 +633,9 @@ def main():
             "SELECT timestamp_epoch, pbattery1, pgrid, pgrid2, pgrid3, ppv, grid_mode FROM inverter_history "
             "ORDER BY timestamp_epoch"
         )
-        sessions = find_labeled_sessions(rows, thresholds)
+        sessions = find_labeled_sessions(rows, thresholds, args.max_gap_seconds)
         sessions = filter_min_duration(sessions, args.min_session_seconds)
-        totals = measure_sessions(conn, sessions, args.edge_trim_samples)
+        totals = measure_sessions(conn, sessions, args.edge_trim_samples, thresholds.battery_offset_w)
     finally:
         conn.close()
 

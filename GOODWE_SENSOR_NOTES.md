@@ -175,10 +175,12 @@ to net them out.
   on `grid_mode == Connected` when isolating a clean energy path.
 - **`total_inverter_power`** (register 35138, distinct from `pgrid`
   and `active_power`) has its own confirmed reporting gap around
-  1150-1200W regardless of battery mode (see
-  `docs/superpowers/mockups/battery-negative-power-vs-sumabs-pgrid.html`)
-  - avoid it as an AC-side quantity; use `pgrid`+`pgrid2`+`pgrid3`
-  instead, which has continuous coverage through the same range.
+  1150-1200W regardless of battery mode (found while comparing it
+  against `pgrid`+`pgrid2`+`pgrid3` summed, in the mockup that
+  originally investigated this - since deleted per this repo's
+  spec/plan cleanup convention, see README.MD) - avoid it as an AC-side
+  quantity; use `pgrid`+`pgrid2`+`pgrid3` instead, which has continuous
+  coverage through the same range.
 
 ## Power sensors and their energy-counter equivalents
 

@@ -46,6 +46,25 @@ class DaySpecMatchesTest(unittest.TestCase):
         self.assertTrue(tariff_engine.day_spec_matches('Sa,Su,Holiday', wednesday_holiday))
         self.assertFalse(tariff_engine.day_spec_matches('Sa,Su,Holiday', date(2026, 9, 24)))  # an ordinary Thursday
 
+    def test_range_wraps_the_week(self):
+        # Fr-Mo should cover Friday through Monday, wrapping past Sunday -
+        # start_idx (4) > end_idx (0) must not just always fail to match.
+        friday, saturday, sunday, monday = (date(2026, 9, 25), date(2026, 9, 26),
+                                             date(2026, 9, 27), date(2026, 9, 28))
+        tuesday = date(2026, 9, 29)
+        self.assertTrue(tariff_engine.day_spec_matches('Fr-Mo', friday))
+        self.assertTrue(tariff_engine.day_spec_matches('Fr-Mo', saturday))
+        self.assertTrue(tariff_engine.day_spec_matches('Fr-Mo', sunday))
+        self.assertTrue(tariff_engine.day_spec_matches('Fr-Mo', monday))
+        self.assertFalse(tariff_engine.day_spec_matches('Fr-Mo', tuesday))
+
+    def test_country_selects_a_different_public_holiday_calendar(self):
+        # 2026-11-11 is a public holiday in Poland (Independence Day) but
+        # an ordinary Wednesday in Germany.
+        wednesday = date(2026, 11, 11)
+        self.assertTrue(tariff_engine.day_spec_matches('Holiday', wednesday, country='PL'))
+        self.assertFalse(tariff_engine.day_spec_matches('Holiday', wednesday, country='DE'))
+
 
 class TimeSpecMatchesTest(unittest.TestCase):
     def test_within_range(self):
@@ -86,6 +105,17 @@ class SeasonForDateTest(unittest.TestCase):
         self.assertEqual(tariff_engine.season_for_date(self.SEASON_BOUNDARIES, date(2026, 4, 1)), 'summer')
         self.assertEqual(tariff_engine.season_for_date(self.SEASON_BOUNDARIES, date(2026, 9, 30)), 'summer')
         self.assertEqual(tariff_engine.season_for_date(self.SEASON_BOUNDARIES, date(2026, 10, 1)), 'winter')
+
+    def test_leap_day_boundary_falls_back_to_the_28th_in_a_non_leap_year(self):
+        # 2026 is not a leap year - date(2026, 2, 29) would raise
+        # ValueError if taken literally; a season boundary shouldn't
+        # depend on whether the current year happens to be a leap year.
+        boundaries = {
+            'a': {'start': '01.01', 'end': '29.02'},
+            'b': {'start': '01.03', 'end': '31.12'},
+        }
+        self.assertEqual(tariff_engine.season_for_date(boundaries, date(2026, 2, 28)), 'a')
+        self.assertEqual(tariff_engine.season_for_date(boundaries, date(2026, 3, 1)), 'b')
 
 
 COMPONENT = {
@@ -171,6 +201,86 @@ class PriceAtTest(unittest.TestCase):
         self.assertAlmostEqual(tariff_engine.price_at(config, weekday), 0.7)
         saturday = datetime(2026, 7, 18, 10, 0)  # distribution=cheap(0.1) + sales=flat(0.5)
         self.assertAlmostEqual(tariff_engine.price_at(config, saturday), 0.6)
+
+    def test_top_level_country_key_controls_the_holiday_calendar(self):
+        component = {
+            'prices': {'cheap': 0.1, 'expensive': 0.2},
+            'bands': {'default': [{'days': 'Holiday', 'price': 'cheap'}]},
+            'default_price': 'expensive',
+        }
+        wednesday = datetime(2026, 11, 11, 10, 0)  # PL Independence Day, ordinary day in Germany
+        self.assertAlmostEqual(tariff_engine.price_at({'components': {'c': component}, 'country': 'PL'}, wednesday), 0.1)
+        self.assertAlmostEqual(tariff_engine.price_at({'components': {'c': component}, 'country': 'DE'}, wednesday), 0.2)
+        # No 'country' key at all defaults to PL, unchanged from before this key existed.
+        self.assertAlmostEqual(tariff_engine.price_at({'components': {'c': component}}, wednesday), 0.1)
+
+
+class ValidateConfigTest(unittest.TestCase):
+    def test_valid_config_raises_nothing(self):
+        tariff_engine.validate_config({'components': {'total': COMPONENT}})
+
+    def test_no_components_key(self):
+        with self.assertRaisesRegex(ValueError, "no 'components'"):
+            tariff_engine.validate_config({})
+
+    def test_missing_default_price(self):
+        with self.assertRaisesRegex(ValueError, "missing required 'default_price'"):
+            tariff_engine.validate_config({'components': {'c': {'prices': {'a': 0.1}, 'bands': {}}}})
+
+    def test_default_price_not_in_prices(self):
+        with self.assertRaisesRegex(ValueError, "is not in 'prices'"):
+            tariff_engine.validate_config(
+                {'components': {'c': {'prices': {'a': 0.1}, 'bands': {}, 'default_price': 'missing'}}})
+
+    def test_band_price_not_in_prices(self):
+        config = {'components': {'c': {
+            'prices': {'a': 0.1}, 'default_price': 'a',
+            'bands': {'default': [{'price': 'nonexistent'}]},
+        }}}
+        with self.assertRaisesRegex(ValueError, "band price 'nonexistent'"):
+            tariff_engine.validate_config(config)
+
+    def test_season_band_with_no_matching_season_boundary(self):
+        config = {'components': {'c': {
+            'prices': {'a': 0.1}, 'default_price': 'a',
+            'bands': {'summer': [{'price': 'a'}]},
+        }}}
+        with self.assertRaisesRegex(ValueError, "no matching entry in season_boundaries"):
+            tariff_engine.validate_config(config)
+
+    def test_start_without_end(self):
+        config = {'components': {'c': {
+            'prices': {'a': 0.1}, 'default_price': 'a',
+            'bands': {'default': [{'start': '10:00', 'price': 'a'}]},
+        }}}
+        with self.assertRaisesRegex(ValueError, "'start' without 'end'"):
+            tariff_engine.validate_config(config)
+
+    def test_unrecognized_day_token(self):
+        config = {'components': {'c': {
+            'prices': {'a': 0.1}, 'default_price': 'a',
+            'bands': {'default': [{'days': 'Xx', 'price': 'a'}]},
+        }}}
+        with self.assertRaisesRegex(ValueError, "unrecognized day token"):
+            tariff_engine.validate_config(config)
+
+    def test_season_boundary_missing_end(self):
+        config = {'components': {'c': {
+            'prices': {'a': 0.1}, 'default_price': 'a',
+            'bands': {}, 'season_boundaries': {'summer': {'start': '01.04'}},
+        }}}
+        with self.assertRaisesRegex(ValueError, "needs both 'start' and 'end'"):
+            tariff_engine.validate_config(config)
+
+    def test_reports_every_problem_not_just_the_first(self):
+        config = {'components': {'c': {
+            'prices': {'a': 0.1}, 'default_price': 'missing',
+            'bands': {'default': [{'price': 'also_missing'}]},
+        }}}
+        with self.assertRaises(ValueError) as ctx:
+            tariff_engine.validate_config(config)
+        self.assertIn('default_price', str(ctx.exception))
+        self.assertIn('also_missing', str(ctx.exception))
 
 
 class LoadConfigTest(unittest.TestCase):
