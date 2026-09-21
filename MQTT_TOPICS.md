@@ -160,19 +160,26 @@ mqtt:
     # *_attribute: detailedForecast config - two entities from the one
     # combined MQTT topic, each reshaped via json_attributes_template to
     # carry only its own day's list under the exact "detailedForecast" key
-    # Predbat expects.
+    # Predbat expects. The state must be the summed daily kWh, not a
+    # period count: Predbat's solcast.py cross-checks sum(pv_estimate)
+    # against the sensor's own state to detect kWh-per-slot vs.
+    # kW-average-per-slot data (factor 1.0 vs 2.0/4.0) - a state that
+    # isn't that sum matches neither factor and the forecast can't be
+    # scaled correctly.
     - name: "Goodwe PV Forecast Today"
       unique_id: goodwe_pv_forecast_today
       state_topic: "goodwe/forecast/pv"
-      value_template: "{{ value_json.today | length }}"
-      unit_of_measurement: "periods"
+      value_template: "{{ value_json.today | sum(attribute='pv_estimate') | round(2) }}"
+      unit_of_measurement: "kWh"
+      device_class: energy
       json_attributes_topic: "goodwe/forecast/pv"
       json_attributes_template: "{{ {'detailedForecast': value_json.today} | tojson }}"
     - name: "Goodwe PV Forecast Tomorrow"
       unique_id: goodwe_pv_forecast_tomorrow
       state_topic: "goodwe/forecast/pv"
-      value_template: "{{ value_json.tomorrow | length }}"
-      unit_of_measurement: "periods"
+      value_template: "{{ value_json.tomorrow | sum(attribute='pv_estimate') | round(2) }}"
+      unit_of_measurement: "kWh"
+      device_class: energy
       json_attributes_topic: "goodwe/forecast/pv"
       json_attributes_template: "{{ {'detailedForecast': value_json.tomorrow} | tojson }}"
 
