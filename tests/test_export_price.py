@@ -150,5 +150,15 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         self.assertAlmostEqual(payload['raw_today'][0]['value'], 0.0, places=6)
 
 
+class ExportValueRoundingTest(unittest.TestCase):
+    def test_positive_value_rounded_to_4_decimal_places(self):
+        # 298.032520325 / 1000 * 1.23 = 0.36657999999975 unrounded - float
+        # noise from the division/multiplication, not real RCE precision.
+        self.assertEqual(export_price.export_value(298.032520325, 'zero'), 0.3666)
+
+    def test_raw_negative_value_rounded_to_4_decimal_places(self):
+        self.assertEqual(export_price.export_value(-298.032520325, 'raw'), -0.298)
+
+
 if __name__ == '__main__':
     unittest.main()

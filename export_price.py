@@ -27,10 +27,12 @@ def export_value(rce_pln: float, negative_prices: str) -> float:
     Also reused by _calculate_income.py so historical income estimates
     are valued the same way the live MQTT bridge prices Predbat's export
     feed, rather than a plain rce_pln/1000 with no bonus/negative-price
-    handling."""
+    handling. Rounded to 4 decimal places (0.0001 zl/kWh) - finer than
+    that is just float noise from the /1000 and VAT multiplications, not
+    real precision in the RCE price."""
     if rce_pln < 0:
-        return rce_pln / 1000.0 if negative_prices == 'raw' else 0.0
-    return rce_pln / 1000.0 * EXPORT_VAT_BONUS_MULTIPLIER
+        return round(rce_pln / 1000.0, 4) if negative_prices == 'raw' else 0.0
+    return round(rce_pln / 1000.0 * EXPORT_VAT_BONUS_MULTIPLIER, 4)
 
 
 def _hour_key(period: str) -> str:
