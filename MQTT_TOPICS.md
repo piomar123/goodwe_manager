@@ -25,7 +25,7 @@ themselves.
 ## `prices/export` (retained, published at startup and on day rollover)
 
 ```json
-{"raw_today": [{"from": "2026-09-21T00:00:00+02:00", "to": "2026-09-21T00:15:00+02:00", "value": 0.42}, ...],
+{"raw_today": [{"start": "2026-09-21T00:00:00+02:00", "end": "2026-09-21T00:15:00+02:00", "value": 0.42}, ...],
  "raw_tomorrow": [...]}
 ```
 

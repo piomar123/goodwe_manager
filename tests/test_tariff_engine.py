@@ -317,17 +317,17 @@ class BandsForDayTest(unittest.TestCase):
         # 15:00-17:00 cheap window becomes ONE two-hour entry, not eight
         # 15-minute ones.
         bands = tariff_engine.bands_for_day(config, date(2026, 7, 15), WARSAW)
-        cheap_afternoon = [b for b in bands if b['from'].endswith('T15:00:00+02:00')]
+        cheap_afternoon = [b for b in bands if b['start'].endswith('T15:00:00+02:00')]
         self.assertEqual(len(cheap_afternoon), 1)
-        self.assertEqual(cheap_afternoon[0]['to'], '2026-07-15T17:00:00+02:00')
+        self.assertEqual(cheap_afternoon[0]['end'], '2026-07-15T17:00:00+02:00')
         self.assertEqual(cheap_afternoon[0]['value'], 0.50)
 
     def test_timestamps_are_timezone_aware_with_explicit_offset(self):
         config = {'components': {'total': COMPONENT}}
         bands = tariff_engine.bands_for_day(config, date(2026, 7, 15), WARSAW)
         for band in bands:
-            self.assertRegex(band['from'], r'\+\d{2}:\d{2}$')
-            self.assertRegex(band['to'], r'\+\d{2}:\d{2}$')
+            self.assertRegex(band['start'], r'\+\d{2}:\d{2}$')
+            self.assertRegex(band['end'], r'\+\d{2}:\d{2}$')
 
     def test_dst_spring_forward_day_has_23_hours_not_24(self):
         # 2026-03-29 is Poland's DST spring-forward day (clocks jump
@@ -335,14 +335,14 @@ class BandsForDayTest(unittest.TestCase):
         # silently produce a 24-hour one with a wrong offset.
         config = {'components': {'total': COMPONENT}}
         bands = tariff_engine.bands_for_day(config, date(2026, 3, 29), WARSAW)
-        self.assertEqual(bands[0]['from'], '2026-03-29T00:00:00+01:00')
-        self.assertEqual(bands[-1]['to'], '2026-03-30T00:00:00+02:00')
+        self.assertEqual(bands[0]['start'], '2026-03-29T00:00:00+01:00')
+        self.assertEqual(bands[-1]['end'], '2026-03-30T00:00:00+02:00')
 
     def test_covers_the_whole_day_with_no_gaps(self):
         config = {'components': {'total': COMPONENT}}
         bands = tariff_engine.bands_for_day(config, date(2026, 7, 15), WARSAW)
         for earlier, later in zip(bands, bands[1:]):
-            self.assertEqual(earlier['to'], later['from'])
+            self.assertEqual(earlier['end'], later['start'])
 
 
 if __name__ == '__main__':

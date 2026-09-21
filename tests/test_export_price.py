@@ -52,7 +52,7 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         self._store('2026-07-15', [('00:00', 400.0), ('24:00', 400.0)])
         payload = export_price.build_export_price_payload(date(2026, 7, 15), WARSAW)
 
-        self.assertRegex(payload['raw_today'][0]['from'], r'\+\d{2}:\d{2}$')
+        self.assertRegex(payload['raw_today'][0]['start'], r'\+\d{2}:\d{2}$')
 
     def test_dst_fall_back_ambiguous_hour_gets_distinct_offsets(self):
         # 2026-10-25 is a real Polish DST fall-back Sunday: local time
@@ -67,11 +67,11 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         ])
         payload = export_price.build_export_price_payload(date(2026, 10, 25), WARSAW)
 
-        bands_by_from = {band['from']: band for band in payload['raw_today']}
-        first_occurrence = bands_by_from['2026-10-25T02:15:00+02:00']
-        second_occurrence = bands_by_from['2026-10-25T02:15:00+01:00']
+        bands_by_start = {band['start']: band for band in payload['raw_today']}
+        first_occurrence = bands_by_start['2026-10-25T02:15:00+02:00']
+        second_occurrence = bands_by_start['2026-10-25T02:15:00+01:00']
 
-        self.assertNotEqual(first_occurrence['from'], second_occurrence['from'])
+        self.assertNotEqual(first_occurrence['start'], second_occurrence['start'])
 
     def test_default_granularity_is_15min(self):
         self._store('2026-07-15', [
@@ -93,11 +93,11 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         self.assertEqual(len(payload['raw_today']), 2)
         # mean(100,200,300,400) = 250 PLN/MWh -> 0.25 zl/kWh, x1.23 = 0.3075
         self.assertAlmostEqual(payload['raw_today'][0]['value'], 0.3075, places=6)
-        self.assertEqual(payload['raw_today'][0]['from'][11:16], '00:00')
-        self.assertEqual(payload['raw_today'][0]['to'][11:16], '01:00')
-        self.assertEqual(payload['raw_today'][1]['from'][11:16], '01:00')
+        self.assertEqual(payload['raw_today'][0]['start'][11:16], '00:00')
+        self.assertEqual(payload['raw_today'][0]['end'][11:16], '01:00')
+        self.assertEqual(payload['raw_today'][1]['start'][11:16], '01:00')
         # the last hour's end is the '24:00' sentinel, i.e. next day 00:00
-        self.assertTrue(payload['raw_today'][1]['to'].startswith('2026-07-16T00:00:00'))
+        self.assertTrue(payload['raw_today'][1]['end'].startswith('2026-07-16T00:00:00'))
 
     def test_hourly_granularity_on_dst_fall_back_keeps_both_ambiguous_hours_distinct(self):
         self._store('2026-10-25', [
@@ -107,9 +107,9 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         ])
         payload = export_price.build_export_price_payload(date(2026, 10, 25), WARSAW, granularity='hourly')
 
-        bands_by_from = {band['from']: band for band in payload['raw_today']}
-        first_occurrence = bands_by_from['2026-10-25T02:00:00+02:00']
-        second_occurrence = bands_by_from['2026-10-25T02:00:00+01:00']
+        bands_by_start = {band['start']: band for band in payload['raw_today']}
+        first_occurrence = bands_by_start['2026-10-25T02:00:00+02:00']
+        second_occurrence = bands_by_start['2026-10-25T02:00:00+01:00']
 
         # mean(100,200,300,400) = 250 -> 0.3075; mean(500,500,500,500) = 500 -> 0.615
         self.assertAlmostEqual(first_occurrence['value'], 0.3075, places=6)

@@ -109,7 +109,7 @@ def _bands_for_business_date(
         start = _parse_period_start(period, day, tz)
         end = _parse_period_start(next_period, day, tz)
         value = export_value(rce_pln, negative_prices)
-        bands.append({'from': start.isoformat(), 'to': end.isoformat(), 'value': value})
+        bands.append({'start': start.isoformat(), 'end': end.isoformat(), 'value': value})
     return bands
 
 

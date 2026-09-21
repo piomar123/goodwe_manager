@@ -120,7 +120,7 @@ resolves to a price.
 - `price_at(config, dt)` - the price at one instant (sums every
   component).
 - `bands_for_day(config, day, tz)` - builds the day's price schedule as
-  a list of `{"from", "to", "value"}` intervals (merging adjacent
+  a list of `{"start", "end", "value"}` intervals (merging adjacent
   same-price minutes, no forced slicing), used for the MQTT bridge's
   `prices/import` publish (see `MQTT_TOPICS.md`) and Predbat's
   `metric_octopus_import`.
