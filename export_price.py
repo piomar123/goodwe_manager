@@ -14,7 +14,7 @@ import rce_storage
 EXPORT_VAT_BONUS_MULTIPLIER = 1.23
 
 
-def _export_value(rce_pln: float, negative_prices: str) -> float:
+def export_value(rce_pln: float, negative_prices: str) -> float:
     """Converts a PLN/MWh RCE price into the zl/kWh export value Predbat
     publishes. `negative_prices` is 'zero' (default - net-billing pays
     nothing for a negative-price period, so publish 0.0) or 'raw'
@@ -22,7 +22,12 @@ def _export_value(rce_pln: float, negative_prices: str) -> float:
     applies to non-negative prices: the law doesn't yet define a bonus on
     a value that isn't income, so a negative price is published as
     rce_pln/1000 with no multiplier rather than making the loss look
-    23% larger."""
+    23% larger.
+
+    Also reused by _calculate_income.py so historical income estimates
+    are valued the same way the live MQTT bridge prices Predbat's export
+    feed, rather than a plain rce_pln/1000 with no bonus/negative-price
+    handling."""
     if rce_pln < 0:
         return rce_pln / 1000.0 if negative_prices == 'raw' else 0.0
     return rce_pln / 1000.0 * EXPORT_VAT_BONUS_MULTIPLIER
@@ -103,7 +108,7 @@ def _bands_for_business_date(
     for (period, rce_pln), (next_period, _) in zip(periods, periods[1:]):
         start = _parse_period_start(period, day, tz)
         end = _parse_period_start(next_period, day, tz)
-        value = _export_value(rce_pln, negative_prices)
+        value = export_value(rce_pln, negative_prices)
         bands.append({'from': start.isoformat(), 'to': end.isoformat(), 'value': value})
     return bands
 

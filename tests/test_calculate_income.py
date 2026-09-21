@@ -48,16 +48,31 @@ class FetchHourlySummaryTest(unittest.TestCase):
 
 
 class ComputeHourIncomeTest(unittest.TestCase):
-    def test_positive_balance_is_valued_at_the_rce_price(self):
+    def test_positive_balance_is_valued_at_the_rce_export_price_including_vat_bonus(self):
         result = income.compute_hour_income(hourly_export=5.0, hourly_import=1.0, load_kwh=3.0,
                                             rce_price_pln_per_mwh=400.0)
 
-        # balance = 4.0 kWh exported net, priced at 0.4 zl/kWh = 1.6 zl
+        # balance = 4.0 kWh exported net, priced at 0.4 zl/kWh x1.23 VAT bonus = 0.492 zl/kWh = 1.968 zl
         self.assertAlmostEqual(result['balance_kwh'], 4.0)
-        self.assertAlmostEqual(result['meter_pln'], 1.6)
+        self.assertAlmostEqual(result['meter_pln'], 1.968)
         # no_buy_pln values the load at the flat import price, independent of the meter balance
         self.assertAlmostEqual(result['no_buy_pln'], 3.0 * income.IMPORT_PRICE_KWH)
         self.assertAlmostEqual(result['gain_pln'], result['meter_pln'] + result['no_buy_pln'])
+
+    def test_negative_rce_price_defaults_to_zero_export_credit(self):
+        result = income.compute_hour_income(hourly_export=5.0, hourly_import=1.0, load_kwh=3.0,
+                                            rce_price_pln_per_mwh=-50.0)
+
+        self.assertAlmostEqual(result['balance_kwh'], 4.0)
+        self.assertAlmostEqual(result['meter_pln'], 0.0)
+
+    def test_negative_rce_price_raw_values_the_true_negative_price_with_no_bonus(self):
+        result = income.compute_hour_income(hourly_export=5.0, hourly_import=1.0, load_kwh=3.0,
+                                            rce_price_pln_per_mwh=-50.0, negative_prices='raw')
+
+        # -50 PLN/MWh -> -0.05 zl/kWh, no VAT bonus on a loss; 4.0 kWh net export = -0.2 zl
+        self.assertAlmostEqual(result['balance_kwh'], 4.0)
+        self.assertAlmostEqual(result['meter_pln'], -0.2)
 
     def test_negative_balance_is_valued_at_the_flat_import_price_not_the_rce_price(self):
         result = income.compute_hour_income(hourly_export=1.0, hourly_import=5.0, load_kwh=3.0,
