@@ -7,12 +7,14 @@ import os
 import sqlite3
 from datetime import datetime
 
+import export_price
 import storage
 import tariff_engine
 from rce import query_pse_rce, parse_date
 
 IMPORT_PRICE_KWH = 1.1
 TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
+DEFAULT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
 
 
 def fetch_hourly_summary(conn: sqlite3.Connection, date: datetime) -> dict:
@@ -37,25 +39,35 @@ def fetch_hourly_summary(conn: sqlite3.Connection, date: datetime) -> dict:
 
 
 def compute_hour_income(hourly_export: float, hourly_import: float, load_kwh: float,
-                        rce_price_pln_per_mwh: float, import_price_kwh: float = IMPORT_PRICE_KWH) -> dict:
-    """Pure per-hour income calculation - same formula as before: a positive
-    meter balance (net export) is valued at the RCE market price, a negative
-    balance (net import) at `import_price_kwh`, and the load itself is
-    separately valued at `import_price_kwh` to represent the cost avoided
-    by self-consumption. `import_price_kwh` defaults to the flat
+                        rce_price_pln_per_mwh: float, import_price_kwh: float = IMPORT_PRICE_KWH,
+                        negative_prices: str = DEFAULT_NEGATIVE_PRICES) -> dict:
+    """Pure per-hour income calculation - a positive meter balance (net
+    export) is valued at the RCE market export price, a negative balance
+    (net import) at `import_price_kwh`, and the load itself is separately
+    valued at `import_price_kwh` to represent the cost avoided by
+    self-consumption. `import_price_kwh` defaults to the flat
     IMPORT_PRICE_KWH constant; callers with a tariff config pass the real
     per-hour zone-aware rate instead (see main()'s --tariff-config).
+
+    The export leg is priced via export_price.export_value(), the same
+    function the live MQTT bridge uses for Predbat's export price feed -
+    this applies the prosument VAT bonus (x1.23) to a non-negative RCE
+    price, and handles a negative RCE price per `negative_prices` ('zero',
+    the default matching RCE_EXPORT_NEGATIVE_PRICES's own default - net
+    billing pays nothing for it; or 'raw' - publish/value the true
+    negative price, still with no VAT bonus). Without this, a flat
+    rce_pln/1000 would understate the real export credit by ~23%.
     """
     balance_kwh = hourly_export - hourly_import
-    rce_price_kwh = rce_price_pln_per_mwh / 1000.
+    export_price_kwh = export_price.export_value(rce_price_pln_per_mwh, negative_prices)
     no_buy_pln = load_kwh * import_price_kwh
     if balance_kwh > 0:
-        meter_pln = balance_kwh * rce_price_kwh
+        meter_pln = balance_kwh * export_price_kwh
     else:
         meter_pln = balance_kwh * import_price_kwh
     return {
         'balance_kwh': balance_kwh,
-        'rce_price_kwh': rce_price_kwh,
+        'rce_price_kwh': export_price_kwh,
         'no_buy_pln': no_buy_pln,
         'meter_pln': meter_pln,
         'gain_pln': meter_pln + no_buy_pln,
@@ -68,6 +80,10 @@ def main():
     parser.add_argument("--db-path", help="Path to the SQLite database", type=str, default=storage.DATA_DB_PATH)
     parser.add_argument("--tariff-config", help="Path to a tariff_engine YAML config (defaults to TARIFF_IMPORT_CONFIG env var; omit both to use the flat IMPORT_PRICE_KWH)",
                         type=str, default=TARIFF_IMPORT_CONFIG)
+    parser.add_argument("--negative-prices", help="How to value an hour with a negative RCE export price: "
+                        "'zero' (default, matches RCE_EXPORT_NEGATIVE_PRICES's own default - net billing pays "
+                        "nothing for it) or 'raw' (value the true negative price, still with no VAT bonus)",
+                        type=str, choices=('zero', 'raw'), default=DEFAULT_NEGATIVE_PRICES)
     args = parser.parse_args()
     print(vars(args))
 
@@ -111,7 +127,8 @@ def main():
         else:
             import_price_kwh = IMPORT_PRICE_KWH
 
-        result = compute_hour_income(hourly_export, hourly_import, load_kwh, rce_hour_price[1], import_price_kwh)
+        result = compute_hour_income(hourly_export, hourly_import, load_kwh, rce_hour_price[1], import_price_kwh,
+                                     args.negative_prices)
         print(f"{rce_lookup_time}: gain: {result['gain_pln']:.2f} zł ({result['meter_pln']:.2f} + {result['no_buy_pln']:.2f}), "
               f"meter: +{hourly_export:.2f} -{hourly_import:.2f} = {result['balance_kwh']:.2f} kWh, "
               f"load: {load_kwh:.1f} kWh, "

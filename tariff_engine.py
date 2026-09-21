@@ -206,7 +206,7 @@ def validate_config(config: dict) -> None:
 
 
 def bands_for_day(config: dict, day: date, tz: ZoneInfo) -> list:
-    """Builds one {"from", "to", "value"} entry per contiguous interval of
+    """Builds one {"start", "end", "value"} entry per contiguous interval of
     constant price across `day` (local `tz`), evaluated at 1-minute
     resolution and merged - fine-grained enough that no real tariff's
     band boundaries fall between samples, coarse enough to be cheap for a
@@ -235,4 +235,4 @@ def bands_for_day(config: dict, day: date, tz: ZoneInfo) -> list:
 
 
 def _band_entry(start: datetime, end: datetime, value: float) -> dict:
-    return {'from': start.isoformat(), 'to': end.isoformat(), 'value': value}
+    return {'start': start.isoformat(), 'end': end.isoformat(), 'value': value}
