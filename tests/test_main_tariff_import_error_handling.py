@@ -9,6 +9,12 @@ problems. Before the fix, both the initial-publish block and the
 midnight-rollover block called tariff_engine.load_config/bands_for_day
 with no try/except, so a FileNotFoundError or KeyError from a bad config
 would bounce the entire inverter connection every 5 seconds forever.
+
+Also covers the pre-merge review finding that the export-price and PV
+forecast publish calls right next to the tariff one had the exact same
+bug: no try/except, so e.g. a locked rce_prices.db (RcePrefetchThread
+writing concurrently) or a malformed forecast_history.db snapshot would
+escalate into an inverter reconnect for a completely unrelated reason.
 """
 import asyncio
 import os
@@ -88,13 +94,14 @@ def _fake_inverter():
     return inverter
 
 
-class BadTariffConfigDoesNotBounceInverterConnectionTest(unittest.TestCase):
-    """Runs the real AsyncioThread._get_inverter_data with a bad
-    TARIFF_IMPORT_CONFIG and a mocked inverter/goodwe.connect, and asserts
-    it does NOT raise - proving the try/except added around both call
-    sites (initial publish block and midnight-rollover block) actually
-    keeps a tariff config error from propagating into
-    _get_inverter_data_with_retry's inverter-failure retry loop."""
+class _SideChannelFailureDoesNotBounceInverterConnectionTestBase(unittest.TestCase):
+    """Shared scaffolding for proving a side-channel publish failure
+    (tariff config, export prices, PV forecast) never propagates out of
+    AsyncioThread._get_inverter_data - that method is wrapped by
+    _get_inverter_data_with_retry's broad retry-on-any-exception loop,
+    which exists for INVERTER connection failures only. Subclasses patch
+    whichever side channel they're testing to raise, then run
+    _get_inverter_data for real via test_does_not_raise."""
 
     def setUp(self):
         fd, self.db_path = tempfile.mkstemp(suffix='.db')
@@ -140,7 +147,7 @@ class BadTariffConfigDoesNotBounceInverterConnectionTest(unittest.TestCase):
         main.mqtt = self._orig_mqtt
         main.asyncio_thread.run_coroutine_threadsafe = self._orig_run_coro
 
-    def test_get_inverter_data_does_not_raise_on_bad_tariff_config(self):
+    def _assert_get_inverter_data_does_not_raise(self, failure_description):
         async def fake_connect(*args, **kwargs):
             return _fake_inverter()
 
@@ -148,8 +155,60 @@ class BadTariffConfigDoesNotBounceInverterConnectionTest(unittest.TestCase):
             try:
                 asyncio.run(self.thread._get_inverter_data())
             except Exception as e:
-                self.fail(f"_get_inverter_data raised {e!r} due to a bad TARIFF_IMPORT_CONFIG "
+                self.fail(f"_get_inverter_data raised {e!r} due to {failure_description} "
                           f"- this should have been caught and logged, not propagated")
+
+
+class BadTariffConfigDoesNotBounceInverterConnectionTest(_SideChannelFailureDoesNotBounceInverterConnectionTestBase):
+    """setUp already points TARIFF_IMPORT_CONFIG at a nonexistent file -
+    proves the try/except around both tariff-publish call sites (initial
+    publish block and midnight-rollover block) keeps that error from
+    propagating."""
+
+    def test_get_inverter_data_does_not_raise_on_bad_tariff_config(self):
+        self._assert_get_inverter_data_does_not_raise("a bad TARIFF_IMPORT_CONFIG")
+
+
+class ExportPriceFailureDoesNotBounceInverterConnectionTest(_SideChannelFailureDoesNotBounceInverterConnectionTestBase):
+    """Forces export_price.build_export_price_payload to raise (standing
+    in for e.g. a locked rce_prices.db, contended with RcePrefetchThread's
+    own writes) - proves the try/except added around the export-price
+    publish call sites keeps that error from propagating too."""
+
+    def setUp(self):
+        super().setUp()
+        self._export_price_patcher = mock.patch.object(
+            main.export_price, 'build_export_price_payload',
+            side_effect=RuntimeError("simulated rce_prices.db lock contention"))
+        self._export_price_patcher.start()
+
+    def tearDown(self):
+        self._export_price_patcher.stop()
+        super().tearDown()
+
+    def test_get_inverter_data_does_not_raise_on_export_price_failure(self):
+        self._assert_get_inverter_data_does_not_raise("an export-price publish failure")
+
+
+class PvForecastFailureDoesNotBounceInverterConnectionTest(_SideChannelFailureDoesNotBounceInverterConnectionTestBase):
+    """Forces _publish_pv_forecast to raise (standing in for e.g. a
+    missing/malformed forecast_history.db snapshot) - proves the
+    try/except added around its call site keeps that error from
+    propagating too."""
+
+    def setUp(self):
+        super().setUp()
+        self._forecast_patcher = mock.patch.object(
+            main, '_publish_pv_forecast',
+            side_effect=RuntimeError("simulated forecast_history.db read failure"))
+        self._forecast_patcher.start()
+
+    def tearDown(self):
+        self._forecast_patcher.stop()
+        super().tearDown()
+
+    def test_get_inverter_data_does_not_raise_on_pv_forecast_failure(self):
+        self._assert_get_inverter_data_does_not_raise("a PV forecast publish failure")
 
 
 if __name__ == '__main__':

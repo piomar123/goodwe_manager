@@ -231,7 +231,14 @@ class AsyncioThread(threading.Thread):
             await self._seed_hour_start_baseline()
             await self._seed_day_start_baseline()
             if mqtt.enabled:
-                await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
+                try:
+                    await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
+                except Exception as e:
+                    # A locked rce_prices.db (RcePrefetchThread writing
+                    # concurrently) or a malformed cached period must
+                    # never bounce the inverter connection - see the
+                    # tariff-config rationale below, same constraint.
+                    logger.warning(f"Could not publish export prices: {e}")
                 if TARIFF_IMPORT_CONFIG:
                     try:
                         _publish_import_prices()
@@ -245,7 +252,14 @@ class AsyncioThread(threading.Thread):
                         # problems. See spec: "MQTT/tariff features must
                         # never destabilize inverter polling."
                         logger.warning(f"Could not publish import prices from TARIFF_IMPORT_CONFIG: {e}")
-                _publish_pv_forecast()
+                try:
+                    _publish_pv_forecast()
+                except Exception as e:
+                    # Same rationale as the export-price/tariff blocks
+                    # above - a missing/malformed forecast_history.db
+                    # snapshot must not propagate into the inverter
+                    # retry loop.
+                    logger.warning(f"Could not publish PV forecast: {e}")
             await self._backfill_hourly_summary()
             current_hour_start, _ = storage.current_hour_bounds(datetime.now())
             current_day_start, _ = storage.current_day_bounds(datetime.now())
@@ -280,7 +294,14 @@ class AsyncioThread(threading.Thread):
                 if new_day_start != current_day_start:
                     current_day_start = new_day_start
                     if mqtt.enabled:
-                        await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
+                        try:
+                            await mqtt.publish_export_prices(export_price.build_export_price_payload(datetime.now().date(), WARSAW_TZ, RCE_EXPORT_GRANULARITY, RCE_EXPORT_NEGATIVE_PRICES))
+                        except Exception as e:
+                            # Same rationale as the initial-publish block
+                            # above - a locked rce_prices.db or malformed
+                            # cached period must not propagate into the
+                            # inverter retry loop.
+                            logger.warning(f"Could not publish export prices: {e}")
                         if TARIFF_IMPORT_CONFIG:
                             try:
                                 _publish_import_prices()
