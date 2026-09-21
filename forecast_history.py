@@ -136,6 +136,21 @@ def has_fetched_since(conn: sqlite3.Connection, source: str, since_epoch: int) -
     return row is not None
 
 
+def has_fetched_date_since(conn: sqlite3.Connection, source: str, date: str, since_epoch: int) -> bool:
+    """Like has_fetched_since, but scoped to one specific `date` rather than
+    any date. has_fetched_since's "any date counts" semantics are right for
+    sources whose single call fans out across many dates at once (Solcast),
+    but wrong for a source (Meteosource) fetched per-date in a loop: a
+    snapshot for one date must not make a *different*, still-missing date
+    look fresh - see forecast_prefetch.py's run_catch_up for why this
+    matters for Meteosource's today/tomorrow catch-up."""
+    row = conn.execute(
+        "SELECT 1 FROM forecast_snapshots WHERE source = ? AND date = ? AND fetched_at >= ? LIMIT 1",
+        (source, date, since_epoch),
+    ).fetchone()
+    return row is not None
+
+
 def get_latest_merged(conn: sqlite3.Connection, source: str, date: str) -> Dict:
     """The default ("latest") read: merges every snapshot for (source,
     date) period-by-period, oldest to newest, so a newer snapshot's periods

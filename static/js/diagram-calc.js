@@ -70,28 +70,31 @@
     return { watts: watts, active: watts > 0 };
   }
 
-  // Direction/color come from the numeric battery_mode, never from the
-  // sign of pbattery1 - verified unreliable against production data.
-  // Standby/No-battery get direction 'none': Standby's ~-30W idle
-  // trickle is real (BMS self-consumption), but has no defined direction,
-  // and there's no trustworthy way to know which way it's flowing -
-  // diagram-render.js renders 'none' as an undirected line, not a
-  // fabricated arrow.
+  // color/flowColor (the *status*) come from the numeric battery_mode -
+  // direction comes from pbattery1's own sign instead, decoupled from mode.
+  // Verified against 90 days of production data: ~19% of all Discharge-mode
+  // samples (34% within the +/-200W noise band around 0) actually read
+  // negative (charging-direction) even though mode still says Discharge -
+  // a mode-only direction misrepresents the real flow on a large fraction
+  // of exactly these near-zero samples, which is when direction is visually
+  // most noticeable (a thin, easy-to-stare-at arrow). Standby's ~-30W BMS
+  // self-consumption trickle is real and now shows as a (tiny) charge
+  // direction instead of being suppressed to 'none' - that's more accurate,
+  // not a regression: it really is flowing that way.
   // color here is a *status* color (can be red at the reserve floor) for
   // setNodeColor('node-battery', ...) only - flowColor (never red; see
   // below) is what any arrow/stripe fed by the battery should use instead,
   // so an alert state never gets misread as "an alert is flowing."
   function batteryState(data) {
-    var watts = Math.abs(toNumber(data.pbattery1));
+    var rawWatts = toNumber(data.pbattery1);
+    var watts = Math.abs(rawWatts);
     var mode = toNumber(data.battery_mode);
     var dischargeLimit = toNumber(data.battery_discharge_limit);
-    var direction = 'none';
+    var direction = rawWatts > 0 ? 'discharge' : rawWatts < 0 ? 'charge' : 'none';
     var flowColor = 'grey';
     if (mode === BATTERY_MODE.CHARGE || mode === BATTERY_MODE.TO_BE_CHARGED) {
-      direction = 'charge';
       flowColor = 'green';
     } else if (mode === BATTERY_MODE.DISCHARGE || mode === BATTERY_MODE.TO_BE_DISCHARGED) {
-      direction = 'discharge';
       // Yellow, not orange - orange already means grid-import throughout
       // this diagram, so a battery-discharge stripe sitting next to a
       // grid-import stripe in the same arrow (e.g. Load's) would be
@@ -120,14 +123,20 @@
     };
   }
 
-  // color/directionKnown come from the numeric grid_in_out/grid_mode, not
-  // the sign of meter_active_power_total. directionKnown is false during
-  // a Fault: red already flags the problem, and there's no reliable way
-  // to assert import-vs-export direction on top of that (verified: the
-  // 'red' color previously defaulted to the "export" arrow direction
-  // whenever the state wasn't explicitly 'orange', which is a fabricated
-  // direction during a fault, the same class of bug as the battery one
-  // above - see the mockup's Junction-Grid arrow fix).
+  // color (the *status*) comes from the numeric grid_in_out/grid_mode -
+  // the arrow's `reversed` direction comes from meter_active_power_total's
+  // own sign instead (positive = exporting, negative = importing - verified
+  // against 90 days of production data at |meter_active_power_total| >
+  // 500W: sign disagrees with grid_in_out's label only 0.16% of Exporting
+  // samples and 1.35% of Importing ones, i.e. the meter's sign is reliable
+  // enough to drive the arrow directly, same rationale as batteryState()).
+  // directionKnown is false during a Fault: red already flags the problem,
+  // and there's no reliable way to assert import-vs-export direction on
+  // top of that (verified: the 'red' color previously defaulted to the
+  // "export" arrow direction whenever the state wasn't explicitly 'orange',
+  // which is a fabricated direction during a fault, the same class of bug
+  // fixed for the battery arrow above - see the mockup's Junction-Grid
+  // arrow fix).
   //
   // directionKnown stays true during NOT_CONNECTED (deliberate, since
   // PR #9) even though crossed/importing/exporting are all forced false
@@ -135,28 +144,35 @@
   // that NOT_CONNECTED has never actually occurred on this install, see
   // docs/superpowers/notes/2026-09-13-grid-not-connected-investigation.md.
   function gridState(data) {
-    var watts = Math.abs(toNumber(data.meter_active_power_total));
+    var raw = toNumber(data.meter_active_power_total);
+    var watts = Math.abs(raw);
     var inOut = toNumber(data.grid_in_out);
     var mode = toNumber(data.grid_mode);
     var crossed = mode === GRID_MODE.FAULT || mode === GRID_MODE.NOT_CONNECTED;
-    // importing/exporting are the semantic source of truth other code
-    // should read (calc.gridState(data).importing, not
-    // calc.gridState(data).color === 'orange') - direction is only
-    // meaningful while the grid is actually connected and not faulted:
-    // grid_in_out can still read Importing/Exporting during a Fault
-    // (verified against production data), and is meaningless while
+    // importing/exporting are the semantic *status* other code should read
+    // (calc.gridState(data).importing, not calc.gridState(data).color ===
+    // 'orange') - meaningful only while the grid is actually connected and
+    // not faulted: grid_in_out can still read Importing/Exporting during a
+    // Fault (verified against production data), and is meaningless while
     // disconnected, so both crossed cases force both flags false rather
     // than trusting the raw code.
     var importing = !crossed && inOut === GRID_IN_OUT.IMPORTING;
     var exporting = !crossed && inOut === GRID_IN_OUT.EXPORTING;
     var color = mode === GRID_MODE.FAULT ? 'red' : importing ? 'orange' : exporting ? 'green' : 'grey';
+    var directionKnown = mode !== GRID_MODE.FAULT;
     return {
       watts: watts,
       color: color,
       crossed: crossed,
       importing: importing,
       exporting: exporting,
-      directionKnown: mode !== GRID_MODE.FAULT,
+      // Gated on !crossed, not directionKnown - directionKnown deliberately
+      // stays true during NOT_CONNECTED for historical reasons (see the
+      // comment above), but the meter's sign is just as meaningless while
+      // disconnected as grid_in_out is, so reversed must use the same gate
+      // as importing/exporting above, not directionKnown's looser one.
+      reversed: !crossed && raw < 0,
+      directionKnown: directionKnown,
     };
   }
 
@@ -355,7 +371,11 @@
     var gridEdge = {
       colorName: grid.color,
       thicknessPx: arrowThickness(grid.watts),
-      reversed: grid.importing,
+      // Arrow direction from grid.reversed (the meter's own sign), not
+      // grid.importing (the status flag used for colorName/stripes above) -
+      // see gridState()'s own comment for why these are deliberately
+      // decoupled now.
+      reversed: grid.reversed,
       directionKnown: grid.directionKnown,
       opacity: 1,
       stripes: grid.exporting ? fullSourceMix : null,

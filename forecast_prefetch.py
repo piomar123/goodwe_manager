@@ -17,6 +17,13 @@ overnight grid-charge sizing - the gap the old 4-slot schedule left
 entirely, its latest slot being 18:00). 2 Solcast calls/slot x 3 slots =
 6/day.
 
+Meteosource is fetched for both today and tomorrow at every forecast
+wake-time (and in catch-up), not just today: unlike Solcast's forecast
+call (which returns several future days in one round-trip), Meteosource
+is a single-date scrape, so tomorrow's date would otherwise never get a
+snapshot at all. Meteosource has no meaningful rate limit (unlike
+Solcast's scarce daily quota), so doubling its calls costs nothing.
+
 Actuals wake-time (Solcast estimated_actuals, both orientations): 23:00,
 once/day - safely after all three forecast slots and past sunset even at
 midsummer. Exact timing isn't critical: forecast_history.get_latest_merged's
@@ -159,28 +166,39 @@ def run_catch_up(conn, now: datetime, on_solcast_updated=lambda: None) -> None:
     and don't block the other catch-up fetches, same "safe to fail"
     framing as the scheduled fetches in the loop below.
 
-    Meteosource is the one exception to "per-source staleness": it fetches
-    whenever it's individually stale OR Solcast is about to fetch (even if
-    Meteosource alone looks fresh). Meteosource has no meaningful rate
-    limit, unlike Solcast's scarce daily quota, so there's no reason to
-    ever skip it when we're already paying for a Solcast call in the same
-    cycle - doing so only left them on different fetched_at values for no
-    savings (hit in production: a Solcast-only catch-up snapshot with no
-    Meteosource counterpart at that timestamp, see forecast.html's
-    Meteosource-driven chart/table backbone for why that's worse than it
-    sounds)."""
+    Meteosource is the one exception to "per-source staleness": each of
+    today/tomorrow fetches if that specific date is individually stale
+    (has_fetched_date_since, not has_fetched_since - a fresh snapshot for
+    one date must not mask a still-missing other date, since the two are
+    now fetched as separate, independently-failable calls) OR Solcast is
+    about to fetch, in which case *both* dates are (re-)fetched even if
+    individually fresh, so they land on Solcast's shared fetched_at.
+    Meteosource has no meaningful rate limit, unlike Solcast's scarce
+    daily quota, so there's no reason to ever skip it when we're already
+    paying for a Solcast call in the same cycle - doing so only left them
+    on different fetched_at values for no savings (hit in production: a
+    Solcast-only catch-up snapshot with no Meteosource counterpart at that
+    timestamp, see forecast.html's Meteosource-driven chart/table backbone
+    for why that's worse than it sounds)."""
     today = now.strftime('%Y-%m-%d')
+    tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
     fetch_epoch = int(now.timestamp())
 
     forecast_threshold = last_wake_time(now, FORECAST_WAKE_TIMES).timestamp()
-    meteosource_stale = not forecast_history.has_fetched_since(conn, 'meteosource', forecast_threshold)
     solcast_stale = not forecast_history.has_fetched_since(conn, 'solcast', forecast_threshold)
-    if meteosource_stale or solcast_stale:
+    if solcast_stale:
+        meteosource_dates = (today, tomorrow)
+    else:
+        meteosource_dates = tuple(
+            date_yyyymmdd for date_yyyymmdd in (today, tomorrow)
+            if not forecast_history.has_fetched_date_since(conn, 'meteosource', date_yyyymmdd, forecast_threshold)
+        )
+    for date_yyyymmdd in meteosource_dates:
         try:
-            fetch_and_store_meteosource(conn, today, now=fetch_epoch)
-            logger.info("Catch-up: fetched Meteosource forecast")
+            fetch_and_store_meteosource(conn, date_yyyymmdd, now=fetch_epoch)
+            logger.info(f"Catch-up: fetched Meteosource forecast for {date_yyyymmdd}")
         except Exception as e:
-            logger.warning(f"Catch-up Meteosource fetch failed: {e}")
+            logger.warning(f"Catch-up Meteosource fetch failed for {date_yyyymmdd}: {e}")
     if solcast_stale:
         try:
             fetch_and_store_solcast(conn, now=fetch_epoch)
@@ -228,12 +246,14 @@ class ForecastPrefetchThread(threading.Thread):
                 wake_time = datetime.now()
                 if next_wake == next_forecast:
                     today = wake_time.strftime('%Y-%m-%d')
+                    tomorrow = (wake_time + timedelta(days=1)).strftime('%Y-%m-%d')
                     fetch_epoch = int(wake_time.timestamp())
-                    try:
-                        fetch_and_store_meteosource(conn, today, now=fetch_epoch)
-                        logger.info(f"Prefetched Meteosource forecast for {today}")
-                    except Exception as e:
-                        logger.warning(f"Meteosource prefetch failed: {e}")
+                    for date_yyyymmdd in (today, tomorrow):
+                        try:
+                            fetch_and_store_meteosource(conn, date_yyyymmdd, now=fetch_epoch)
+                            logger.info(f"Prefetched Meteosource forecast for {date_yyyymmdd}")
+                        except Exception as e:
+                            logger.warning(f"Meteosource prefetch failed for {date_yyyymmdd}: {e}")
                     try:
                         fetch_and_store_solcast(conn, now=fetch_epoch)
                         logger.info("Prefetched Solcast forecast")
