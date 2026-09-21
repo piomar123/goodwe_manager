@@ -102,18 +102,45 @@ SELECTED_SENSORS = [
     'diagnose_result_label',
     'error_codes',
     'errors',
+    'e_total',
     'e_total_exp',
     'e_total_imp',
     'e_day',
+    'e_day_exp',
+    'e_day_imp',
     'e_load_total',
+    'e_load_day',
     'meter_e_total_exp',
     'meter_e_total_imp',
     'e_bat_charge_total',
+    'e_bat_charge_day',
     'e_bat_discharge_total',
+    'e_bat_discharge_day',
     'work_mode',
     'work_mode_label',
     'rssi',
 ]
+
+# Today-only counters that are only useful transiently (e.g. published in
+# MQTT telemetry for Home Assistant to track "today so far") - not worth a
+# lifetime of rows in data.db, since they reset to 0 every midnight and
+# _estimate_battery_efficiency.py-style historical analysis already prefers
+# the lifetime counters. `e_day` (PV, also daily-reset) is deliberately NOT
+# in this set despite looking like it belongs here: it's load-bearing for
+# _estimate_battery_efficiency.py's pv_ac measurement (its input counter,
+# with a midnight-rollover guard built specifically for it) - dropping it
+# would silently break inverter_loss estimation.
+_EPHEMERAL_ONLY_SENSORS = {
+    'e_day_exp',
+    'e_day_imp',
+    'e_load_day',
+    'e_bat_charge_day',
+    'e_bat_discharge_day',
+}
+
+# The subset of SELECTED_SENSORS actually persisted to data.db - see
+# _EPHEMERAL_ONLY_SENSORS above for what's excluded and why.
+DB_SENSORS = [name for name in SELECTED_SENSORS if name not in _EPHEMERAL_ONLY_SENSORS]
 
 # Columns whose values are text labels/codes, not continuous numeric
 # measurements. Everything else in SELECTED_SENSORS is stored as REAL.
@@ -135,35 +162,54 @@ CALCULATED_VALUE_HEADERS = [
     '_hourly_meter_export',
     '_hourly_meter_import',
     '_hourly_load',
+    '_day_start_timestamp',
+    '_daily_meter_export',
+    '_daily_meter_import',
+    '_daily_load',
 ]
-TEXT_CALCULATED_COLUMNS = {'_hour_start_timestamp'}
+TEXT_CALCULATED_COLUMNS = {'_hour_start_timestamp', '_day_start_timestamp'}
 
 
 def sensor_columns() -> list:
     """Ordered (column_name, sql_type) pairs for the inverter_history table,
-    in the same order as SELECTED_SENSORS + CalculatedValuesEvaluator.headers().
+    in the same order as DB_SENSORS + CalculatedValuesEvaluator.headers().
     """
     columns = []
-    for name in SELECTED_SENSORS:
+    for name in DB_SENSORS:
         columns.append((name, 'TEXT' if name in TEXT_SENSOR_COLUMNS else 'REAL'))
     for name in CALCULATED_VALUE_HEADERS:
         columns.append((name, 'TEXT' if name in TEXT_CALCULATED_COLUMNS else 'REAL'))
     return columns
 
 
+def db_row(sensors_data_with_calculated: Mapping[str, Any]) -> dict:
+    """Narrows a full sensors_data_with_calculated dict (SELECTED_SENSORS +
+    calculated fields, as published in MQTT telemetry/SSE) down to just the
+    columns actually persisted in data.db (DB_SENSORS + calculated fields) -
+    see DB_SENSORS for what's excluded and why."""
+    return {name: sensors_data_with_calculated[name] for name in DB_SENSORS + CALCULATED_VALUE_HEADERS}
+
+
 class CalculatedValuesEvaluator:
     def __init__(self):
         self._hour_start_sensors = None
+        self._day_start_sensors = None
 
     def calculate_values(self, sensors_data: Mapping[str, Any]) -> dict:
         if self._hour_start_sensors is None or sensors_data['timestamp'][:13] != self._hour_start_sensors['timestamp'][
                                                                                  :13]:
             self._hour_start_sensors = sensors_data
+        if self._day_start_sensors is None or sensors_data['timestamp'][:10] != self._day_start_sensors['timestamp'][:10]:
+            self._day_start_sensors = sensors_data
         calculated_values = {
             '_hour_start_timestamp': self._hour_start_sensors['timestamp'],
             '_hourly_meter_export': f"{float(sensors_data['meter_e_total_exp']) - float(self._hour_start_sensors['meter_e_total_exp']):.2f}",
             '_hourly_meter_import': f"{float(sensors_data['meter_e_total_imp']) - float(self._hour_start_sensors['meter_e_total_imp']):.2f}",
             '_hourly_load': f"{float(sensors_data['e_load_total']) - float(self._hour_start_sensors['e_load_total']):.1f}",
+            '_day_start_timestamp': self._day_start_sensors['timestamp'],
+            '_daily_meter_export': f"{float(sensors_data['meter_e_total_exp']) - float(self._day_start_sensors['meter_e_total_exp']):.2f}",
+            '_daily_meter_import': f"{float(sensors_data['meter_e_total_imp']) - float(self._day_start_sensors['meter_e_total_imp']):.2f}",
+            '_daily_load': f"{float(sensors_data['e_load_total']) - float(self._day_start_sensors['e_load_total']):.1f}",
         }
         self._verify_header(calculated_values)
         return calculated_values
@@ -177,6 +223,12 @@ class CalculatedValuesEvaluator:
         yet (empty DB, or the last sample predates the current hour).
         """
         self._hour_start_sensors = dict(sensors_data) if sensors_data is not None else None
+
+    def seed_day_start(self, sensors_data: Optional[Mapping[str, Any]]) -> None:
+        """Same restore-from-a-prior-sample role as seed_hour_start, but
+        for the midnight-anchored daily baseline - see that method's
+        docstring."""
+        self._day_start_sensors = dict(sensors_data) if sensors_data is not None else None
 
     @staticmethod
     def headers():

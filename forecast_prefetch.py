@@ -152,7 +152,7 @@ def fetch_and_store_solcast_actuals(conn, max_date: Optional[str] = None, now: O
         forecast_history.write_snapshot(conn, 'solcast_actuals', date_str, payload, now=now)
 
 
-def run_catch_up(conn, now: datetime) -> None:
+def run_catch_up(conn, now: datetime, on_solcast_updated=lambda: None) -> None:
     """Runs once at thread startup, before the normal wake-time loop below:
     fetches whatever's stale so a restart (deploy, crash, dev testing)
     doesn't leave /forecast empty until the next scheduled wake time.
@@ -205,6 +205,11 @@ def run_catch_up(conn, now: datetime) -> None:
             logger.info("Catch-up: fetched Solcast forecast")
         except Exception as e:
             logger.warning(f"Catch-up Solcast forecast fetch failed: {e}")
+        else:
+            try:
+                on_solcast_updated()
+            except Exception as e:
+                logger.warning(f"on_solcast_updated callback failed after catch-up Solcast fetch: {e}")
 
     actuals_threshold = last_wake_time(now, (ACTUALS_WAKE_TIME,)).timestamp()
     if not forecast_history.has_fetched_since(conn, 'solcast_actuals', actuals_threshold):
@@ -216,15 +221,16 @@ def run_catch_up(conn, now: datetime) -> None:
 
 
 class ForecastPrefetchThread(threading.Thread):
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, on_solcast_updated=lambda: None):
         super().__init__(name='ForecastPrefetchThread', daemon=True)
         self._should_stop = threading.Event()
         self._db_path = db_path
+        self._on_solcast_updated = on_solcast_updated
 
     def run(self):
         conn = forecast_history.init_db(self._db_path)
         try:
-            run_catch_up(conn, datetime.now())
+            run_catch_up(conn, datetime.now(), on_solcast_updated=self._on_solcast_updated)
             while not self._should_stop.is_set():
                 now = datetime.now()
                 next_forecast = next_wake_time(now, FORECAST_WAKE_TIMES)
@@ -253,6 +259,11 @@ class ForecastPrefetchThread(threading.Thread):
                         logger.info("Prefetched Solcast forecast")
                     except Exception as e:
                         logger.warning(f"Solcast prefetch failed: {e}")
+                    else:
+                        try:
+                            self._on_solcast_updated()
+                        except Exception as e:
+                            logger.warning(f"on_solcast_updated callback failed after Solcast prefetch: {e}")
                 if next_wake == next_actuals:
                     try:
                         fetch_and_store_solcast_actuals(conn, now=int(wake_time.timestamp()))

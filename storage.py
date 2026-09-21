@@ -27,6 +27,16 @@ def current_hour_bounds(now: datetime) -> Tuple[int, int]:
     return start_epoch, start_epoch + 3600
 
 
+def current_day_bounds(now: datetime) -> Tuple[int, int]:
+    """Returns (start_epoch, end_epoch) for the local calendar day
+    containing `now` - the day-anchored counterpart to
+    current_hour_bounds, used to seed CalculatedValuesEvaluator's daily
+    baseline the same way current_hour_bounds seeds its hourly one."""
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_epoch = int(day_start.timestamp())
+    return start_epoch, start_epoch + 24 * 3600
+
+
 def _column_ddl(columns: Iterable[Tuple[str, str]]) -> str:
     return ',\n            '.join(f'{name} {sql_type}' for name, sql_type in columns)
 

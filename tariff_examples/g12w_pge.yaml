@@ -1,0 +1,44 @@
+# tariff_examples/g12w_pge.yaml
+#
+# PGE Dystrybucja's G12w schedule (hours are published tariff-card
+# information - see PR #35 for sourcing). Rates below are this household's actual
+# gross zł/kWh (all taxes included) from its PGE invoice - if you're on a
+# different tariff/seller, replace "cheap"/"expensive" with your own
+# values. Copy this file to a location of your choice (e.g.
+# tariff_import.yaml, already gitignored) and point TARIFF_IMPORT_CONFIG
+# at it.
+
+components:
+  total:
+    prices:
+      cheap: 0.6907      # off-peak (strefa tańsza), zł/kWh gross, all taxes incl.
+      expensive: 1.3078  # peak (strefa droższa), zł/kWh gross, all taxes incl.
+
+    season_boundaries:
+      summer:
+        start: "01.04"
+        end: "30.09"
+      winter:
+        start: "01.10"
+        end: "31.03"
+
+    bands:
+      default:
+        - days: "Work"
+          start: "22:00"
+          end: "06:00"
+          price: cheap
+        - days: "Sa,Su,Holiday"
+          price: cheap
+      summer:
+        - days: "Work"
+          start: "15:00"
+          end: "17:00"
+          price: cheap
+      winter:
+        - days: "Work"
+          start: "13:00"
+          end: "15:00"
+          price: cheap
+
+    default_price: expensive

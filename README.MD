@@ -19,6 +19,86 @@ you have old `data-*.csv` files from before the switch to SQLite, run
 `python _migrate_csv_to_sqlite.py` once to import them into `data.db`
 (safe to re-run; already-migrated files are skipped).
 
+## Tariff-aware import pricing (optional)
+
+`_calculate_income.py` and the MQTT bridge (see PR #35) can price
+imported energy using a real time-of-use tariff schedule
+instead of a flat rate. Copy an example from `tariff_examples/` (e.g.
+`g12w_pge.yaml`) to `tariff_import.yaml` (already gitignored), fill in
+your actual rates, and set `TARIFF_IMPORT_CONFIG=tariff_import.yaml` in
+`.env`. Without this set, both keep using the flat `IMPORT_PRICE_KWH`
+constant, unchanged from today's behavior. See `TARIFF_SCHEMA.md` for
+the full YAML schema.
+
+## MQTT bridge for Home Assistant / Predbat (optional)
+
+Set `MQTT_HOST` (and `MQTT_USERNAME`/`MQTT_PASSWORD` if your broker
+requires auth) in `.env` to publish live telemetry, daily energy
+counters, RCE export prices, tariff-based import prices (if
+`TARIFF_IMPORT_CONFIG` is also set), and the combined PV forecast to your
+MQTT broker. Unset `MQTT_HOST` (the default) disables this entirely - no
+behavior change from before this feature existed. See `MQTT_TOPICS.md`
+for the full topic/payload list and Home Assistant/Predbat setup.
+
+The daily-reset energy counters (`e_day_exp`, `e_day_imp`, `e_load_day`,
+`e_bat_charge_day`, `e_bat_discharge_day`) are published live but
+deliberately **not** written to `data.db` - they reset every midnight,
+so a lifetime of DB rows for them adds nothing that the lifetime
+counters (`e_total`, etc., which are persisted) don't already give
+historical analysis. See `sensors.py`'s `DB_SENSORS`.
+
+RCE export prices publish at 15-minute granularity by default (the
+market's own settlement period). Set `RCE_EXPORT_GRANULARITY=hourly` to
+average each hour's four quarters first instead, matching how PGE
+settles prosument export credit on an hourly basis.
+
+A negative RCE price publishes as `0.0` by default (`RCE_EXPORT_NEGATIVE_PRICES=zero`),
+matching net-billing paying nothing for it. Set `RCE_EXPORT_NEGATIVE_PRICES=raw`
+to publish the true negative value instead - note the 23% VAT bonus is
+never applied to a negative price either way, since the law doesn't
+define a bonus on a loss.
+
+### Predbat setup note: zł-scale thresholds
+
+Everything this bridge publishes stays in zł, unconverted - Predbat's own
+cost-optimization math (comparing import cost vs. export revenue to plan
+actions) works identically regardless of currency scale, as long as
+import and export use the same unit. The one place scale genuinely
+matters is Predbat's absolute-currency **threshold** settings, tuned
+against its own pence-scale examples:
+
+- `metric_min_improvement` (default `0.0`) - minimum cost improvement
+  worth lowering the battery SoC for.
+- `metric_min_improvement_export` (default `0.1`) - minimum cost
+  improvement worth a forced export for.
+- `metric_min_improvement_export_freeze` (default `0.1`) - minimum cost
+  improvement worth freezing an export for.
+- `metric_min_improvement_plan` (default `2.0`) - minimum cost
+  improvement worth changing the whole plan for.
+
+Left at their pence-tuned defaults against zł-scale prices (roughly
+0.3-1.3 zł/kWh here), thresholds like `0.1` stop meaning "negligible"
+and start meaning "10-30% of a typical price difference," which can make
+Predbat silently skip real, worthwhile charge/discharge/export
+decisions. Set these explicitly to a zł-appropriate value (e.g. `0.001`
+in place of `0.1`) in Predbat's `apps.yaml` rather than relying on the
+shipped defaults - this is a Predbat-side config note, not something
+goodwe_manager can fix on its end.
+
+### Estimating Predbat's battery/inverter loss config
+
+`_estimate_battery_efficiency.py` is a one-off, manually-run offline
+analysis (not part of the live app - see "Documentation conventions"
+below on the `_`-prefix convention) that estimates Predbat's
+`battery_loss`/`battery_loss_discharge`/`inverter_loss` config values
+from this household's actual `inverter_history`, instead of guessing at
+generic li-ion defaults. Run it against `data.db` (or a bounded extract
+of it - see `--db-path`) and read the printed report; nothing writes to
+Predbat's config automatically. See `GOODWE_SENSOR_NOTES.md` for the
+methodology and the sensor-level quirks (BMS self-consumption offset,
+grid phase sign disagreement, cross-register poll timing skew) it
+depends on and works around.
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 
@@ -26,6 +106,10 @@ and streaming data to the frontend using Server Sent Events (SSE) for real-time 
 Data is written into a SQLite database (`data.db`, `inverter_history` table) and can be processed later
 by some scripts calculating the cost savings. Older `data-xxxx-xx-xx_xx-xx-xx.csv` files are legacy/historical
 only - the app no longer writes to them (see "Upgrading" above for importing them).
+See `GOODWE_SENSOR_NOTES.md` before writing anything that computes energy/power
+balances across PV, battery, grid, and load fields - several of the raw sensor
+names are easy to misread (which field is actually the grid meter, sign
+conventions the `goodwe` library leaves undocumented, real hardware noise/quirks).
 ## Documentation conventions
 
 Design docs for a feature under development live in `docs/superpowers/{specs,plans,notes}/`
