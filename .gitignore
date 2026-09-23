@@ -175,6 +175,8 @@ cython_debug/
 
 /playground/test.db
 /data*.csv
+/csv_archive/
+/manager.log.*
 /data.db
 /data.db-wal
 /data.db-shm

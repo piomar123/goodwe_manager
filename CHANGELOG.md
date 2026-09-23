@@ -19,6 +19,10 @@ grouped under `Unreleased` until that changes.
   startup and on every hour rollover). A `--full-rescan` option on
   `_backfill_hourly_summary.py` covers the rare case of a gap that needs
   reprocessing after data was manually corrected or imported out of order.
+- `manager.log` now rotates at 10MB (5 backups, `manager.log.1`..`.5`), and
+  `aiosqlite`'s per-operation DEBUG lines are no longer logged. An existing
+  oversized `manager.log` is rotated away on the first write past 10MB
+  after upgrading - archive or delete the resulting `manager.log.1`.
 - Daily-reset energy counters (`e_day_exp`, `e_day_imp`, `e_load_day`,
   `e_bat_charge_day`, `e_bat_discharge_day`) are now MQTT/SSE-only, not
   persisted to `data.db` (see `sensors.py`'s `DB_SENSORS`). If you're
