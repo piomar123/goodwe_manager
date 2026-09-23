@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import logging
+import logging.handlers
 import os
 import re
 import sqlite3
@@ -57,6 +58,11 @@ TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 RCE_EXPORT_GRANULARITY = os.environ.get('RCE_EXPORT_GRANULARITY', '15min')
 RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
 WARSAW_TZ = ZoneInfo('Europe/Warsaw')
+# manager.log rotation: normal DEBUG output is ~50KB/day, so this keeps
+# months of history while capping disk use at ~60MB even if something
+# starts spamming the log.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 # https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format
 # https://gist.github.com/werediver/4358735?permalink_comment_id=3421708
@@ -1012,17 +1018,25 @@ def listen():
     return flask.Response(stream_messages(flask.request.remote_addr), mimetype='text/event-stream')
 
 
-def main():
-    global dry_run
-    setup_plot_style()
-    matplotlib.use('agg')
-    file_handler = logging.FileHandler('manager.log')
+def configure_logging(log_path: str = 'manager.log') -> None:
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s - %(name)s - %(threadName)s - %(levelname)s - %(message)s',
-                        handlers=[file_handler, console_handler])
+                        handlers=[file_handler, console_handler],
+                        force=True)
     logging.getLogger('goodwe.protocol').setLevel(logging.INFO)
+    # aiosqlite logs two DEBUG lines per DB operation - ~350MB/day of noise
+    logging.getLogger('aiosqlite').setLevel(logging.INFO)
+
+
+def main():
+    global dry_run
+    setup_plot_style()
+    matplotlib.use('agg')
+    configure_logging()
     install_uncaught_exception_logging(logger)
     if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
         logger.warning("Running in dry-run mode without inverter connection")
