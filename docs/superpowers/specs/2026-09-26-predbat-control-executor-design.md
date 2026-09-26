@@ -155,7 +155,7 @@ Order of precedence each tick:
    - A target is "reached" only after 2 consecutive samples ≥ 30 s apart (the
      BMS SoC jumps; single-sample garbage exists).
 5. **Software reserve**: in `auto`, if SoC ≤ reserve → `freeze_charge` until
-   SoC ≥ reserve + 2. Values below 25 % are accepted but warned about in the
+   SoC ≥ reserve + 2. Values below 20 % are accepted but warned about in the
    dashboard (BMS SoC resyncs by ~4 points around 22-18 %). The inverter
    depth-of-discharge (45356) stays the hard floor.
 6. Otherwise the commanded mode.
@@ -243,17 +243,23 @@ linear in SoC, so it would over-estimate what is left below ~25 %.
 
 Changes in `apps.yaml` / Predbat settings (the HA repo, not this code):
 
-- **Keep plans out of the non-linear band**: `best_soc_min` (hard minimum the
-  planner may target) = 25 % of `soc_max`, and `best_soc_keep` (soft floor,
-  the user's "low only right before the next charge") starting at 30 %,
-  tuned from experience. Predbat then only plans down to where its linear
-  model is still right.
+- **Keep plans at the edge of the non-linear band**: `best_soc_min` (hard
+  minimum the planner may target) = 20 % of `soc_max`, and `best_soc_keep`
+  (soft floor, the user's "low only right before the next charge") = 25 %,
+  tuned from experience.
 - **Reserve** driven by Predbat into the executor's software reserve, never
-  below 22 % (executor warns below 25 %); the inverter DoD stays the hard
+  below 20 % (executor warns below 20 %); the inverter DoD stays the hard
   floor underneath.
 - **Usable capacity**: leave `soc_max` at the nominal 7.1 kWh (the linear
   middle is what Predbat plans with) and do not model the bottom band at all
   - the ~0.45 kWh it lacks is inside the reserve and never planned against.
+- **Low power charging/export**: enable Predbat's `set_charge_low_power` and
+  `set_export_low_power` switches, so charge and export windows run at the
+  lowest power that still reaches the target by the end of the window (less
+  battery stress and conversion loss; the BMS limit of ~3.4 kW is rarely
+  needed). The executor already takes any `power_w` from 100 W up to the
+  clamp, and `charge`/`export` hold that power exactly, so low power rates
+  are followed precisely.
 - **Severe weather**: Predbat `alerts:` (Meteoalarm) with `keep` raises the
   floor dynamically, as decided in the brainstorm.
 - Revisit after a month of executor data: compare Predbat's predicted SoC at
@@ -281,13 +287,13 @@ Changes in `apps.yaml` / Predbat settings (the HA repo, not this code):
 1. Merge with `CONTROL_MODE=off` (no behaviour change).
 2. `shadow` with Predbat control enabled (Predbat must not be read-only, or
    it sends nothing) until each mode has been commanded at least once -
-   typically a few hours around a planned charge or export window, not a
-   full day. Nothing is written, so Predbat simply sees the battery not
+   using Predbat's manual plan overrides (force charge / export / freeze
+   charge / freeze export slots) to trigger each mode on demand, so it
+   takes about an hour rather than a day. Nothing is written, so Predbat simply sees the battery not
    following its plan and re-plans from the measured SoC each cycle; the
    check is that the published `effective_mode`/registers match what
    Predbat asked for, including expiry refreshes and target-reached
-   switches. If the day's plan contains no such windows, skip straight to
-   step 3.
+   switches.
 3. Disable the eco slots, run the live acceptance test, then `on` with
    Predbat control enabled.
 4. After a week of stable running: set the inverter DoD lower and let the
