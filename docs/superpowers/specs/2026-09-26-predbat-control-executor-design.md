@@ -26,34 +26,51 @@ Success criteria:
 Non-goals:
 
 - The Polish export energy budget (rule A) - a later Predbat planner patch.
-- Delayed/Smart Charging (47609) and eco slots - untouched; eco slots stay
+- Delayed/Smart Charging (`smart_charging_enable`) and eco slots - untouched; eco slots stay
   the manual fallback. They also act in `auto`, so with `CONTROL_MODE=on`
   every enabled eco slot is reported as a warning in the state and dashboard
   (the user disables them; the executor never writes them).
-- Inverter-side watchdog - not supported by this firmware (47117/47118
-  writes are acked but not stored).
+- Inverter-side watchdog - not supported by this firmware (the API remote
+  timeout registers ack writes but don't store them).
 
 ## Measured inverter behaviour (2026-09-26, GW8KN-ET DSP 12.197 / ARM 31)
 
-| Executor mode | Registers | Behaviour measured |
-|---|---|---|
-| `auto` | 47511=1 | Normal self-use (eco slots still apply) |
-| `charge` P | 47511=11, 47512=P | Battery charges at exactly P (±7 W) whatever PV/load does; PV above P covers load, then exports; shortfall from grid |
-| `export` P | 47511=3, 47512=P | Battery discharges at exactly P; PV not curtailed; everything not used by the house is exported |
-| `freeze_charge` | 47511=1, 45355=0 | No discharge; surplus PV charges the battery; deficit from grid |
-| `freeze_export` | 47511=1, 45353=0 | No charging; surplus exported; battery covers deficit |
+Register names are the goodwe library's setting ids (`ems_mode`,
+`ems_power_limit` = EMS power setpoint, `battery_charge_current`,
+`battery_discharge_current`, `soc_upper_limit`, `work_mode`,
+`battery_discharge_depth`); addresses are in the notes.
 
-Not used: CHARGE_PV (2) - its setpoint is the max grid power for charging and
-it sends all PV to the battery with the whole load from the grid; SoC upper
-limit 47760 = SoC works for freeze export too but depends on the SoC reading,
-so `freeze_export` uses 45353.
+| Executor mode | Settings | Behaviour measured |
+|---|---|---|
+| `auto` | `ems_mode`=AUTO | Normal self-use (eco slots still apply) |
+| `charge` P | `ems_mode`=CHARGE_BATTERY, `ems_power_limit`=P | Battery charges at exactly P (±7 W) whatever PV/load does; PV above P covers load, then exports; shortfall from grid |
+| `export` P | `ems_mode`=DISCHARGE_PV, `ems_power_limit`=P | Battery discharges at exactly P; PV not curtailed; everything not used by the house is exported |
+| `freeze_charge` | `ems_mode`=AUTO, `battery_discharge_current`=0 | No discharge; surplus PV charges the battery; deficit from grid |
+| `freeze_export` | `ems_mode`=AUTO, `battery_charge_current`=0 | No charging; surplus exported; battery covers deficit |
+
+Not used: CHARGE_PV - its setpoint is the max grid power for charging and it
+sends all PV to the battery with the whole load from the grid;
+`soc_upper_limit` = SoC works for freeze export too but depends on the SoC
+reading, so `freeze_export` uses `battery_charge_current`.
+
+All EMS modes considered for the freeze states (✓ measured, ○ from the
+GoodWe protocol map's mode table only):
+
+| EMS mode | Behaviour | Fit |
+|---|---|---|
+| CHARGE_PV ✓ | all PV to battery, load from grid, grid charging up to setpoint | no - imports the load even with PV |
+| CONSERVE ○ | battery charged by PV only; "PV does not support the loads first"; discharge only off-grid | no - same load-from-grid problem as CHARGE_PV (it's an off-grid reserve mode) |
+| BATTERY_STANDBY ○ | battery neither charges nor discharges | no - freeze charge must store surplus, freeze export must cover deficit; standby does neither |
+| BUY_POWER / SELL_POWER ○ | battery balances to hold grid import/export at the setpoint | no - still charges and discharges |
+| IMPORT_AC / EXPORT_AC / DISCHARGE_BATTERY ○ | grid- or battery-first, PV (MPPT) curtailed | no - curtails PV |
+| AUTO + current limit 0 ✓ | one direction blocked, self-use otherwise | **yes** (both freezes) |
 
 Other facts the design relies on:
 
 - Mode changes take effect within one ~6 s sample.
 - Some registers only show a new value a few seconds after the write ack.
 - The dongle is sometimes unresponsive for ~20 s (reads fail after retries).
-- 45353/45355 are user-tuned limits (currently 19.0 A); BMS limit is 18 A
+- `battery_charge_current`/`battery_discharge_current` are user-tuned limits (currently 19.0 A); BMS limit is 18 A
   (`battery_charge_limit`/`battery_discharge_limit`, already polled).
 - EMS mode reportedly persists across inverter reboots (not verified here) -
   treated as persistent.
@@ -86,7 +103,8 @@ there is only ever one UDP client.
    read-back, writes only differing registers in a fixed order, schedules a
    verification read 3 s later, retries up to 3 times per register, then
    reports an error. Reads the control registers every 10 s (and after
-   writes) - five single-register reads, interleaved with polling.
+   writes) - six single-register reads (the four mode settings plus
+   `soc_upper_limit` and `work_mode`), interleaved with polling.
 3. **`mqtt_bridge.py`** (extended). Subscribes to `control/set` and
    `control/reserve/set` on (re)connect; a reader task parses JSON and hands
    commands to the executor; `publish_control_state()` publishes the
@@ -130,7 +148,8 @@ restart picks it up.
 {"mode": "charge", "effective_mode": "freeze_charge", "power_w": 3000, "target_soc": 80,
  "source": "predbat", "expires_at": "...", "applied": true, "since": "...",
  "override": null, "reserve_soc": 25, "reason": "target_soc reached",
- "registers": {"47511": 1, "47512": 0, "45353": 190, "45355": 0, "47760": 100},
+ "registers": {"ems_mode": 1, "ems_power_limit": 0, "battery_charge_current": 19.0,
+               "battery_discharge_current": 0, "soc_upper_limit": 100, "work_mode": 3},
  "last_error": null, "warnings": [], "writes_today": 14}
 ```
 
@@ -157,23 +176,23 @@ Order of precedence each tick:
 5. **Software reserve**: in `auto`, if SoC ≤ reserve → `freeze_charge` until
    SoC ≥ reserve + 2. Values below 20 % are accepted but warned about in the
    dashboard (BMS SoC resyncs by ~4 points around 22-18 %). The inverter
-   depth-of-discharge (45356) stays the hard floor.
+   depth of discharge (`battery_discharge_depth`) stays the hard floor.
 6. Otherwise the commanded mode.
 
 Every mode fully specifies all control registers, so switching never leaves a
 stale value behind:
 
-| Mode | 47511 | 47512 | 45353 | 45355 |
+| Mode | `ems_mode` | `ems_power_limit` | `battery_charge_current` | `battery_discharge_current` |
 |---|---|---|---|---|
-| `auto` | 1 | 0 | user | user |
-| `charge` P | 11 | P | user | user |
-| `export` P | 3 | P | user | user |
-| `freeze_charge` | 1 | 0 | user | 0 |
-| `freeze_export` | 1 | 0 | 0 | user |
+| `auto` | AUTO | 0 | user | user |
+| `charge` P | CHARGE_BATTERY | P | user | user |
+| `export` P | DISCHARGE_PV | P | user | user |
+| `freeze_charge` | AUTO | 0 | user | 0 |
+| `freeze_export` | AUTO | 0 | 0 | user |
 
 `user` = `CONTROL_CHARGE_CURRENT_A` / `CONTROL_DISCHARGE_CURRENT_A` from
 config (not captured from the inverter, so a crash that left 0 there can
-never become the new "normal"). 47760 is only read and reported (must be 100;
+never become the new "normal"). `soc_upper_limit` is only read and reported (must be 100;
 a different value is shown as a warning, not changed).
 
 Write order: EMS mode first when leaving a forced mode, setpoint first when
@@ -196,11 +215,11 @@ entering one; currents last when leaving a freeze, first when entering one.
   charging or discharging. Mitigation outside this spec: an HA automation
   alerting when `bridge/status` is offline while `control/state.mode != auto`.
 - **External changes** (SolarGo): switching work mode in SolarGo writes
-  47511=1/47512=0 and `clearECOtime` (47533=1, which also switches eco slots
+  `ems_mode`=AUTO / `ems_power_limit`=0 and `clearECOtime` (which also switches eco slots
   off). The executor sees the read-back differ and re-applies its desired
   registers within ~10 s, so manual SolarGo changes during an active command
   are overwritten; set a dashboard override to `auto` first. The executor
-  reports 47000 (work mode) and a changed value is a warning.
+  reports `work_mode` and a changed value is a warning.
 - **Flash wear**: writes only on change; `writes_today` in the state and a
   warning in the log above `CONTROL_MAX_WRITES_PER_DAY` (default 300). A
   typical Predbat day is expected to need 20-60 writes.
@@ -210,8 +229,8 @@ entering one; currents last when leaving a freeze, first when entering one.
 | Key | Default | Meaning |
 |---|---|---|
 | `CONTROL_MODE` | `off` | `off`, `shadow` (compute + publish state with `"shadow": true`, no writes), `on` |
-| `CONTROL_CHARGE_CURRENT_A` | - (required when not `off`) | normal 45353 value, e.g. 19.0 |
-| `CONTROL_DISCHARGE_CURRENT_A` | - (required when not `off`) | normal 45355 value |
+| `CONTROL_CHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_charge_current`, e.g. 19.0 |
+| `CONTROL_DISCHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_discharge_current` |
 | `CONTROL_MAX_BATTERY_W` | 3400 | power clamp |
 | `CONTROL_MAX_WRITES_PER_DAY` | 300 | warning threshold |
 
