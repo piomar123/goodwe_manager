@@ -132,7 +132,7 @@ there is only ever one UDP client.
 
 - `mode`: `auto | charge | export | freeze_charge | freeze_export`.
 - `power_w`: required for `charge`/`export`; clamped to
-  `[100, min(CONTROL_MAX_BATTERY_W, BMS limit A × battery V)]`; clamping is
+  `[100, min(CONTROL_MAX_BATTERY_W, BMS limit A × battery V)]` (the BMS part rounded down to 100 W, held within one step so voltage jitter causes no writes); clamping is
   reported in the state.
 - `target_soc`: optional for `charge`/`export` (see SoC targets).
 - `expires_at` (ISO 8601 with offset) or `ttl_s` (seconds): one of them is
@@ -189,7 +189,7 @@ Order of precedence each tick:
    - A target is "reached" only when the condition has held for 30 s (the
      BMS SoC jumps; single-sample garbage exists) - except on the first
      SoC sample after a new command, where an already-met target counts at
-     once.
+     once. Releasing a charge hold (and the reserve below) needs 30 s too.
 5. **Software reserve**: in `auto`, if SoC ≤ reserve → `freeze_charge` until
    SoC ≥ reserve + 2. Values below 20 % are accepted but warned about in the
    dashboard (BMS SoC resyncs by ~4 points around 22-18 %). `CONTROL_MIN_SOC`
@@ -197,9 +197,11 @@ Order of precedence each tick:
 6. Otherwise the commanded mode.
 
 **Freeze floor**: entering `freeze_charge` sets `battery_discharge_depth` to
-the current SoC (integer %, never below `CONTROL_MIN_SOC`). While frozen the
-floor follows a rising SoC in steps of 3 points (surplus PV charging must not
-be discharged again later) and never goes down. Without any SoC sample yet
+the current SoC (integer %, never below `CONTROL_MIN_SOC`) - the lowest SoC of
+the last 30 s, so a single garbage high sample can't put the floor above the
+real SoC. While frozen the floor follows a rising SoC in steps of 3 points
+(surplus PV charging must not be discharged again later; again the lowest SoC
+of the last 30 s) and never goes down. Without any SoC sample yet
 (startup, read failures) `freeze_charge` is not applied - `auto` with reason
 `waiting for SoC` - because a floor above the real SoC could make the
 inverter's DoD Holding charge from the grid. Leaving the freeze writes
