@@ -21,6 +21,7 @@
 - Commands: topic `<prefix>/control/set`, QoS 1, not retained; `expires_at` (ISO 8601 with offset) or `ttl_s`, max 60 min ahead, required unless `mode` is `auto`; power clamped to `[100, min(CONTROL_MAX_BATTERY_W, BMS limit A × battery V)]`.
 - Scoped stop: `{"mode":"auto","stop":"charge"|"export"}` only clears a command in that domain.
 - SoC targets: 30 s debounce, except on the first SoC sample after a new command; charge target reached → `freeze_charge`, back to `charge` below target − 3; export target reached → `auto`.
+- Off-grid (runtime `grid_mode` ≠ 1 or runtime `work_mode` = 2): immediately `auto` + user currents, above override/targets/reserve; back to normal after 60 s of on-grid samples. Any change of desired values resets the writer's retries/back-off/verify wait.
 - Software reserve: topic `<prefix>/control/reserve/set` (retained, integer %); in effective `auto`, SoC ≤ reserve (30 s) → `freeze_charge` until SoC ≥ reserve + 2; warn below 20 %.
 - Writer: read the six reported settings every 10 s and 3 s after writes; up to 3 attempts per setting, then `last_error` and 60 s back-off; failed reads are skipped, never raised.
 - State topic `<prefix>/control/state` retained, published on change and at least every 10 s.
@@ -30,11 +31,12 @@
 
 ## Review Focus
 
-1. Predbat sends `discharge_stop` + `charge_start` (or `charge_stop` + `discharge_start`) every cycle - the executor must not bounce through `auto` or write anything when the resulting command is unchanged. Pinned in Task 2 (`test_opposite_scoped_stop_is_ignored`) and Task 5 (`test_paired_stop_start_each_cycle_causes_no_writes`).
-2. A single garbage SoC sample (e.g. 0 or 100 for one poll) must not trip a target or the reserve. Pinned in Task 2 (`test_single_garbage_soc_sample_does_not_latch`).
-3. The MQTT broker drops and comes back: control topics must be re-subscribed and the retained reserve re-delivered. Pinned in Task 4 (`test_resubscribes_after_reconnect`).
-4. The dongle stops answering for ~20 s mid-cycle: the writer must neither raise into the poll loop nor spam writes. Pinned in Task 3 (`test_failed_reads_are_skipped_and_no_write_without_readback_change`).
-5. The manager restarts while the inverter was left in a freeze (a current at 0) or forced mode: the first steps must restore `auto` + user currents in the safe order. Pinned in Task 3 (`test_startup_reverts_leftover_freeze_export`).
+1. Grid outage while a freeze is active: the next tick must restore `auto` + user currents, even if earlier writes had failed and the writer is backing off. Pinned in Task 2 (`test_off_grid_restores_auto_over_everything`) and Task 3 (`test_new_desired_bypasses_backoff`). The inverter-side half (does discharge current 0 even apply off-grid?) is the supervised breaker test in Task 9.
+2. Predbat sends `discharge_stop` + `charge_start` (or `charge_stop` + `discharge_start`) every cycle - the executor must not bounce through `auto` or write anything when the resulting command is unchanged. Pinned in Task 2 (`test_opposite_scoped_stop_is_ignored`) and Task 5 (`test_paired_stop_start_each_cycle_causes_no_writes`).
+3. A single garbage SoC sample (e.g. 0 or 100 for one poll) must not trip a target or the reserve. Pinned in Task 2 (`test_single_garbage_soc_sample_does_not_latch`).
+4. The MQTT broker drops and comes back: control topics must be re-subscribed and the retained reserve re-delivered. Pinned in Task 4 (`test_resubscribes_after_reconnect`).
+5. The dongle stops answering for ~20 s mid-cycle: the writer must neither raise into the poll loop nor spam writes. Pinned in Task 3 (`test_failed_reads_are_skipped_and_no_write_without_readback_change`).
+6. The manager restarts while the inverter was left in a freeze (a current at 0) or forced mode: the first steps must restore `auto` + user currents in the safe order. Pinned in Task 3 (`test_startup_reverts_leftover_freeze_export`).
 
 ---
 
@@ -69,7 +71,7 @@
   - `make_override(mode: str, power_w: str|int|None, target_soc: str|int|None, duration_min: str|int, now: datetime) -> Command` (raises `CommandError`)
   - `@dataclass(frozen=True) class ControlConfig(mode: str, charge_current_a: float, discharge_current_a: float, max_battery_w: int=3400, max_writes_per_day: int=300)`
   - `config_from_env(env: Mapping[str, str]) -> ControlConfig | None` (raises `ValueError`)
-  - `@dataclass(frozen=True) class Sample(soc, battery_v, bms_charge_limit_a, bms_discharge_limit_a)` (all `float|None`) with `Sample.from_runtime(data: dict) -> Sample`
+  - `@dataclass(frozen=True) class Sample(soc, battery_v, bms_charge_limit_a, bms_discharge_limit_a, off_grid=False)` (first four `float|None`, `off_grid: bool`) with `Sample.from_runtime(data: dict) -> Sample`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -206,6 +208,16 @@ class SampleTest(unittest.TestCase):
     def test_out_of_range_soc_is_none(self):
         self.assertIsNone(control.Sample.from_runtime({'battery_soc': 250}).soc)
         self.assertIsNone(control.Sample.from_runtime({'battery_soc': 'None'}).soc)
+
+    def test_off_grid_detection(self):
+        # runtime grid_mode: 0 not connected, 1 connected, 2 fault;
+        # runtime work_mode 2 = Normal (Off-Grid). Missing values = on-grid.
+        cases = [({}, False), ({'grid_mode': 1}, False), ({'grid_mode': 1, 'work_mode': 1}, False),
+                 ({'grid_mode': 2}, True), ({'grid_mode': 0}, True), ({'grid_mode': 1, 'work_mode': 2}, True),
+                 ({'grid_mode': '2.0', 'work_mode': '2.0'}, True)]
+        for data, expected in cases:
+            with self.subTest(data):
+                self.assertEqual(control.Sample.from_runtime(data).off_grid, expected)
 
 
 if __name__ == '__main__':
@@ -399,14 +411,21 @@ class Sample:
     battery_v: Optional[float] = None
     bms_charge_limit_a: Optional[float] = None
     bms_discharge_limit_a: Optional[float] = None
+    off_grid: bool = False
 
     @staticmethod
     def from_runtime(data: dict) -> 'Sample':
         soc = _float_or_none(data.get('battery_soc'))
         if soc is not None and not 0 <= soc <= 100:
             soc = None
+        # Runtime (not the work_mode *setting*): grid_mode 0 not connected /
+        # 2 fault, work_mode 2 Normal (Off-Grid) - the history shows outages
+        # as grid_mode 2 + work_mode 2.
+        grid_mode = _float_or_none(data.get('grid_mode'))
+        work_mode = _float_or_none(data.get('work_mode'))
+        off_grid = (grid_mode is not None and grid_mode != 1) or work_mode == 2
         return Sample(soc, _float_or_none(data.get('vbattery1')), _float_or_none(data.get('battery_charge_limit')),
-                      _float_or_none(data.get('battery_discharge_limit')))
+                      _float_or_none(data.get('battery_discharge_limit')), off_grid)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -440,7 +459,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
     - `set_override(cmd: Command) -> None`, `clear_override() -> None`
     - `set_reserve(soc: int|None) -> None`, property `reserve -> int|None`
     - `tick(sample: Sample, now: datetime) -> dict[str, int|float]` (keys = `MODE_SETTINGS`)
-    - `snapshot(now: datetime) -> dict` (keys: `mode`, `effective_mode`, `power_w`, `power_applied_w`, `power_clamped`, `target_soc`, `source`, `expires_at`, `since`, `override`, `reserve_soc`, `reason`, `command_error`, `shadow`)
+    - `snapshot(now: datetime) -> dict` (keys: `mode`, `effective_mode`, `power_w`, `power_applied_w`, `power_clamped`, `target_soc`, `source`, `expires_at`, `since`, `override`, `reserve_soc`, `reason`, `command_error`, `shadow`, `off_grid`)
   - `compute_warnings(readback: dict, eco_slots_enabled: list[bool]|None, reserve: int|None, initial_work_mode: int|None) -> list[str]`
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/test_control.py`, above the `if __name__` block)
@@ -637,6 +656,49 @@ class ExecutorOverrideTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(50), at(0))['battery_charge_current'], 19.0)
 
 
+AUTO_SETTINGS = {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 19.0, 'battery_discharge_current': 18.5}
+
+
+class ExecutorOffGridTest(unittest.TestCase):
+    def test_off_grid_restores_auto_over_everything(self):
+        cmds = [Command(Mode.FREEZE_CHARGE, expires_at=at(900)), Command(Mode.FREEZE_EXPORT, expires_at=at(900)),
+                Command(Mode.EXPORT, 2000, None, 'p', at(900)), charge(2000, 90)]
+        for cmd in cmds:
+            with self.subTest(cmd.mode):
+                ex = control.Executor(CFG)
+                ex.submit(cmd)
+                self.assertEqual(ex.tick(S(50, off_grid=True), NOW), AUTO_SETTINGS)
+                snap = ex.snapshot(NOW)
+                self.assertEqual((snap['reason'], snap['off_grid'], snap['mode']), ('off-grid', True, cmd.mode.value))
+
+    def test_off_grid_beats_override_and_reserve(self):
+        ex = control.Executor(CFG)
+        ex.set_reserve(60)
+        ex.set_override(Command(Mode.FREEZE_CHARGE, source='dashboard', expires_at=at(900)))
+        ex.tick(S(50, off_grid=True), at(0))
+        self.assertEqual(ex.tick(S(50, off_grid=True), at(60)), AUTO_SETTINGS)
+
+    def test_back_on_grid_needs_60s_in_a_row(self):
+        ex = control.Executor(CFG)
+        ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(900)))
+        ex.tick(S(50, off_grid=True), at(0))
+        self.assertEqual(ex.tick(S(50), at(30))['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(50, off_grid=True), at(40))['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(50), at(50))['battery_discharge_current'], 18.5)  # timer restarts here
+        self.assertEqual(ex.tick(S(50), at(109))['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(50), at(110))['battery_discharge_current'], 0)
+        self.assertFalse(ex.snapshot(at(110))['off_grid'])
+
+    def test_command_still_expires_while_off_grid(self):
+        ex = control.Executor(CFG)
+        ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(30)))
+        ex.tick(S(50, off_grid=True), at(0))
+        ex.tick(S(50, off_grid=True), at(31))
+        ex.tick(S(50), at(40))
+        self.assertEqual(ex.tick(S(50), at(100)), AUTO_SETTINGS)
+        self.assertEqual(ex.snapshot(at(100))['reason'], 'command expired')
+
+
 class ExecutorSnapshotTest(unittest.TestCase):
     def test_snapshot_fields(self):
         ex = control.Executor(control.ControlConfig('shadow', 19.0, 18.5))
@@ -685,6 +747,7 @@ TARGET_DEBOUNCE = timedelta(seconds=30)
 CHARGE_TARGET_HYSTERESIS = 3
 RESERVE_HYSTERESIS = 2
 RESERVE_WARN_BELOW = 20
+OFF_GRID_RELEASE = timedelta(seconds=60)
 
 
 class _Debounce:
@@ -726,6 +789,8 @@ class Executor:
         self._reset_latches()
         self._reserve_latched = False
         self._reserve_deb = _Debounce()
+        self._off_grid = False
+        self._on_grid_since: Optional[datetime] = None
 
     # --- inputs ---------------------------------------------------------
     def submit(self, cmd: Command) -> None:
@@ -762,14 +827,30 @@ class Executor:
 
     # --- decision -------------------------------------------------------
     def tick(self, sample: Sample, now: datetime) -> dict:
-        active, reason = self._active(now)
-        mode, reason = self._targets(active, sample, now, reason)
-        mode, reason = self._apply_reserve(mode, sample, now, reason)
+        active, reason = self._active(now)  # always: keeps expiry running off-grid too
+        if self._update_off_grid(sample.off_grid, now):
+            # Backup side depends on the battery: never keep a current at 0.
+            active, mode, reason = None, Mode.AUTO, 'off-grid'
+        else:
+            mode, reason = self._targets(active, sample, now, reason)
+            mode, reason = self._apply_reserve(mode, sample, now, reason)
         power = self._clamp(active.power_w if active is not None and mode in POWERED_MODES else None, mode, sample)
         if mode is not self._effective or self._since is None:
             self._since = now
         self._effective, self._reason, self._power_applied = mode, reason, power
         return self._settings(mode, power)
+
+    def _update_off_grid(self, off_grid: bool, now: datetime) -> bool:
+        if off_grid:
+            self._off_grid, self._on_grid_since = True, None
+            return True
+        if self._off_grid:
+            if self._on_grid_since is None:
+                self._on_grid_since = now
+            if now - self._on_grid_since < OFF_GRID_RELEASE:
+                return True
+            self._off_grid, self._on_grid_since = False, None
+        return False
 
     def _clear_command(self, reason: str) -> None:
         self._command = None
@@ -882,6 +963,7 @@ class Executor:
             'reason': self._reason,
             'command_error': self._command_error,
             'shadow': self._config.mode == 'shadow',
+            'off_grid': self._off_grid,
         }
 
 
@@ -1076,6 +1158,16 @@ class ControlWriterTest(unittest.TestCase):
         run_steps(w, clock, FREEZE_EXPORT, 20)  # t=62..82
         self.assertGreater(len(inv.writes), writes_before)  # retried after 60 s
 
+    def test_new_desired_bypasses_backoff(self):
+        clock, inv, w = self.make(base_values(), delay=10_000)
+        run_steps(w, clock, FREEZE_EXPORT, 12)  # error at t=9, back-off until t=69
+        self.assertIsNotNone(w.last_error)
+        writes_before = len(inv.writes)
+        freeze_charge = {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 19.0,
+                         'battery_discharge_current': 0}
+        run_steps(w, clock, freeze_charge, 0)  # one step
+        self.assertEqual(inv.writes[writes_before:], [('battery_discharge_current', 0)])
+
     def test_failed_reads_are_skipped_and_no_write_without_readback_change(self):
         clock, inv, w = self.make(base_values())
         run_steps(w, clock, AUTO, 2)
@@ -1191,6 +1283,7 @@ class ControlWriter:
         self._backoff_until: Optional[float] = None
         self._attempts: dict = {}
         self._warned_writes = False
+        self._last_desired: Optional[dict] = None
 
     def applied(self, desired: Optional[dict]) -> bool:
         return desired is not None and all(_matches(n, desired[n], self.readback.get(n)) for n in MODE_SETTINGS)
@@ -1202,6 +1295,13 @@ class ControlWriter:
             await self._read_all(now)
         if desired is None:
             return
+        if desired != self._last_desired:
+            # New target (e.g. off-grid restore): start fresh - don't let a
+            # back-off or pending verification from the old target delay it.
+            self._last_desired = dict(desired)
+            self._attempts.clear()
+            self._backoff_until = None
+            self._verify_at = None
         if self.applied(desired):
             self._attempts.clear()
             self._backoff_until = None
@@ -2339,6 +2439,7 @@ No code. Each step needs the user present; stop and ask before any step that wri
   5. `{"mode":"charge","power_w":1000,"ttl_s":60,"source":"test"}` then wait 70 s → back to `auto`, currents at 19 A.
   6. `{"mode":"freeze_export","ttl_s":600,"source":"test"}` then `systemctl --user restart goodwe_manager` → within ~10 s of restart `auto` + user currents.
   7. Dashboard override `freeze_charge` 15 min while sending `export` commands → override wins, state shows both.
+  8. **Grid-breaker test** (user at the breaker, evening or load > PV, SoC well above DoD): first confirm the Pi and the Wi-Fi dongle are powered from the backup circuit. Set `freeze_charge` (`ttl_s` 600), then switch the inverter's grid breaker off. Watch the backup loads and the log: `control/state.off_grid` true within a few seconds, currents back to 19 A, battery supplying the backup side. Note whether the backup side stayed powered *before* the restore landed - if it dropped, the inverter honours the 0 A limit off-grid and freeze charge must use another mechanism before going `on`. Switch the breaker back on; after the inverter reconnects and 60 s pass, `off_grid` false and `freeze_charge` back.
   Record results in the notes file.
 
 - [ ] **Step 5: Enable Predbat control** (Predbat out of read-only) and watch the first charge/export window; check `writes_today` at the end of the day (expected 20-60).

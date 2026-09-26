@@ -212,8 +212,9 @@ entering one; currents last when leaving a freeze, first when entering one.
 
 ## Off-grid (grid outage)
 
-The 1-year history has 18 outage days, several of them hours long
-(13 h on 22-23 Apr 2026). A freeze during an outage is dangerous:
+The 1-year history has off-grid samples on 21 days - many are
+seconds-long blips, but several outages lasted hours (13 h on 22-23 Apr
+2026, 3-4 h on 8 Apr, 4 May and 20 Aug). A freeze during an outage is dangerous:
 `freeze_charge` (discharge current 0) could leave the backup circuits
 without battery power, `freeze_export` (charge current 0) blocks PV from
 charging the battery that the house now depends on.
