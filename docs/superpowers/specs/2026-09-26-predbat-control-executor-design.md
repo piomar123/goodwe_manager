@@ -131,9 +131,17 @@ there is only ever one UDP client.
   `[100, min(CONTROL_MAX_BATTERY_W, BMS limit A × battery V)]`; clamping is
   reported in the state.
 - `target_soc`: optional for `charge`/`export` (see SoC targets).
-- `expires_at`: required unless `mode` is `auto`; max 60 min ahead
-  (Predbat re-sends each 5-min cycle with `repeat: true`, so ~15 min is
-  typical). Past or missing → rejected.
+- `expires_at` (ISO 8601 with offset) or `ttl_s` (seconds): one of them is
+  required unless `mode` is `auto`; max 60 min ahead (Predbat re-sends each
+  5-min cycle with `repeat: true`, so ~15 min is typical). Past, missing or
+  too far → rejected.
+- `stop` (optional, only with `mode: auto`): `"charge"` or `"export"`. A
+  scoped stop only takes effect when the current command is in that domain
+  (`charge`/`freeze_charge` resp. `export`/`freeze_export`); otherwise it is
+  ignored. Predbat sends the opposite stop before every start
+  (`discharge_stop` before `charge_start`, `charge_stop` before
+  `discharge_start`), each cycle - unscoped, that would flip the inverter to
+  `auto` and back every 5 minutes.
 - Re-sending an identical command only refreshes `expires_at` - no writes.
 - Invalid JSON/fields → rejected, logged, and reported in the state's
   `last_error`; the current command stays in force.
@@ -171,8 +179,10 @@ Order of precedence each tick:
      target.
    - `export` with `target_soc`: once SoC ≤ target → `auto` (Predbat "hold
      exporting" = stop).
-   - A target is "reached" only after 2 consecutive samples ≥ 30 s apart (the
-     BMS SoC jumps; single-sample garbage exists).
+   - A target is "reached" only when the condition has held for 30 s (the
+     BMS SoC jumps; single-sample garbage exists) - except on the first
+     SoC sample after a new command, where an already-met target counts at
+     once.
 5. **Software reserve**: in `auto`, if SoC ≤ reserve → `freeze_charge` until
    SoC ≥ reserve + 2. Values below 20 % are accepted but warned about in the
    dashboard (BMS SoC resyncs by ~4 points around 22-18 %). The inverter
@@ -252,11 +262,16 @@ once working):
   `support_charge_freeze: true`, `support_discharge_freeze: true`,
   `charge_control_immediate: true`, `has_timed_pause: false`,
   reserve → the MQTT number.
-- Service templates with `repeat: true`: `charge_start` → `charge`
-  {power, target_soc}; `charge_freeze` → `freeze_charge`; `charge_stop` /
-  `discharge_stop` → `auto`; `discharge_start` → `export` {power,
-  target_soc}; `discharge_freeze` → `freeze_export`; each with
-  `expires_at` = now + 15 min.
+- Service templates with `repeat: true` call an HA script
+  (`script.goodwe_control`) that builds the JSON and publishes it (HA's
+  `mqtt.publish` no longer renders payload templates): `charge_start` →
+  `charge` {power, target_soc}; `charge_freeze` → `freeze_charge`;
+  `charge_stop` → `auto` with `stop: charge`; `discharge_start` → `export`
+  {power, target_soc}; `discharge_freeze` → `freeze_export`;
+  `discharge_stop` → `auto` with `stop: export`; each with `ttl_s: 900`.
+- Hold charging arrives as `charge_start` with `target_soc` below the current
+  SoC; the executor then goes to `freeze_charge` on the first sample (no
+  debounce for a target that is already met when the command arrives).
 
 ## Predbat battery model at the low and high end
 
