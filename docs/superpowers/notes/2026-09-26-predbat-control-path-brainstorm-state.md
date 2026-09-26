@@ -149,4 +149,4 @@ inverter + service templates, testing approach, rollout (read_only → live).
   47613=0; 47000=0 (General); 47533=1 (clearECOtime); 47609=1.
 - Disable: 47000=0; EMS 47511/47512 = 1/0; 47533=1; 47591=0x037F; 47609=0.
 - clearECOtime disabled the eco slots (on/off byte 0xFF -> 0x00). SolarGo "Eco" writes 47000=3, EMS 1/0 and re-enables none; the 47549 (slot 1) writes in the capture were the user re-enabling slot 1 by hand.
-- Draft #108 follow-up: /tmp/ems-spike/issue108-followup.md (post after user confirms).
+- #108 follow-up posted: https://github.com/marcelblijleven/goodwe/issues/108#issuecomment-5847187611
