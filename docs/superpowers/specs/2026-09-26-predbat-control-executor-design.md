@@ -195,6 +195,12 @@ entering one; currents last when leaving a freeze, first when entering one.
   DoD floor, `charge` charges to 100 % from grid if needed, freezes block
   charging or discharging. Mitigation outside this spec: an HA automation
   alerting when `bridge/status` is offline while `control/state.mode != auto`.
+- **External changes** (SolarGo): switching work mode in SolarGo writes
+  47511=1/47512=0 and `clearECOtime` (47533=1, which also switches eco slots
+  off). The executor sees the read-back differ and re-applies its desired
+  registers within ~10 s, so manual SolarGo changes during an active command
+  are overwritten; set a dashboard override to `auto` first. The executor
+  reports 47000 (work mode) and a changed value is a warning.
 - **Flash wear**: writes only on change; `writes_today` in the state and a
   warning in the log above `CONTROL_MAX_WRITES_PER_DAY` (default 300). A
   typical Predbat day is expected to need 20-60 writes.
