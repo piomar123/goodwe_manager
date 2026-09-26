@@ -13,8 +13,11 @@ Success criteria:
 
 - Every Predbat state (demand, charge, freeze charge, hold charge, export,
   freeze export) produces the measured inverter behaviour below.
-- Predbat can see within one cycle whether its command was applied
-  (read-back state, not "message sent").
+- Whether a command was applied is visible within ~10 s in HA and the
+  dashboard (read-back state, not "message sent"). Predbat itself does not
+  verify service calls: it re-sends them every cycle (`repeat: true`) and
+  re-plans from the measured SoC, so a missed command costs one cycle of
+  plan deviation, not a stuck plan.
 - No command outlives its sender: stale commands, crashes and restarts end in
   normal self-use (AUTO) with the user's own settings restored.
 - The executor has no optimizer-specific logic; Predbat specifics live in
@@ -230,6 +233,33 @@ once working):
   target_soc}; `discharge_freeze` → `freeze_export`; each with
   `expires_at` = now + 15 min.
 
+## Predbat battery model at the low and high end
+
+The BMS SoC is coulomb-counted but not linear at the ends (1-year analysis
+in the notes): around 22-18 % it resyncs and ~4 points vanish; 25 % → 10 %
+displayed delivers ~0.6 kWh instead of the nominal ~1.05 kWh; the 80-90 %
+band also passes ~10 % faster than the middle. Predbat assumes kWh is
+linear in SoC, so it would over-estimate what is left below ~25 %.
+
+Changes in `apps.yaml` / Predbat settings (the HA repo, not this code):
+
+- **Keep plans out of the non-linear band**: `best_soc_min` (hard minimum the
+  planner may target) = 25 % of `soc_max`, and `best_soc_keep` (soft floor,
+  the user's "low only right before the next charge") starting at 30 %,
+  tuned from experience. Predbat then only plans down to where its linear
+  model is still right.
+- **Reserve** driven by Predbat into the executor's software reserve, never
+  below 22 % (executor warns below 25 %); the inverter DoD stays the hard
+  floor underneath.
+- **Usable capacity**: leave `soc_max` at the nominal 7.1 kWh (the linear
+  middle is what Predbat plans with) and do not model the bottom band at all
+  - the ~0.45 kWh it lacks is inside the reserve and never planned against.
+- **Severe weather**: Predbat `alerts:` (Meteoalarm) with `keep` raises the
+  floor dynamically, as decided in the brainstorm.
+- Revisit after a month of executor data: compare Predbat's predicted SoC at
+  the end of discharge windows with the measured one and adjust `best_soc_keep`
+  or `battery_loss_discharge` if the error is systematic.
+
 ## Testing
 
 - **Unit (`tests/test_control.py`)**: command validation and clamping;
@@ -249,8 +279,15 @@ once working):
 ## Rollout
 
 1. Merge with `CONTROL_MODE=off` (no behaviour change).
-2. `shadow` for a day with Predbat in its normal (read-only) mode: compare
-   published desired modes against Predbat's plan.
+2. `shadow` with Predbat control enabled (Predbat must not be read-only, or
+   it sends nothing) until each mode has been commanded at least once -
+   typically a few hours around a planned charge or export window, not a
+   full day. Nothing is written, so Predbat simply sees the battery not
+   following its plan and re-plans from the measured SoC each cycle; the
+   check is that the published `effective_mode`/registers match what
+   Predbat asked for, including expiry refreshes and target-reached
+   switches. If the day's plan contains no such windows, skip straight to
+   step 3.
 3. Disable the eco slots, run the live acceptance test, then `on` with
    Predbat control enabled.
 4. After a week of stable running: set the inverter DoD lower and let the
