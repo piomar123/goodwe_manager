@@ -142,3 +142,11 @@ read-back/state publisher, SoC-target enforcement + debounce, software reserve,
 watchdog + startup reconciliation, eco-slot coexistence, power clamp to live BMS
 limits), dashboard panel + config, HA MQTT entities, Predbat apps.yaml custom
 inverter + service templates, testing approach, rollout (read_only → live).
+
+## Delayed Charging capture (2026-09-26 15:29-15:42, two pcaps)
+
+- Enable: group 8 47589..47594 = 00:00, 23:59, 0xFA7F (0xFA = smart charge enabled, days 0x7F), 1000 (100 %), 0, 0x0FFF;
+  47613=0; 47000=0 (General); 47533=1 (clearECOtime); 47609=1.
+- Disable: 47000=0; EMS 47511/47512 = 1/0; 47533=1; 47591=0x037F; 47609=0.
+- clearECOtime disabled eco slots 2-4 (on/off byte 0xFF -> 0x00). SolarGo "Eco" writes 47000=3, EMS 1/0 and re-enables only slot 1.
+- Draft #108 follow-up: /tmp/ems-spike/issue108-followup.md (post after user confirms).
