@@ -38,17 +38,21 @@ Non-goals:
 Register names are the goodwe library's setting ids (`ems_mode`,
 `ems_power_limit` = EMS power setpoint, `battery_charge_current`,
 `battery_discharge_current`, `soc_upper_limit`, `work_mode`,
-`battery_discharge_depth`); addresses are in the notes.
+`battery_discharge_depth` = on-grid minimum SoC in %, shown inverted as DoD
+in SolarGo); addresses are in the notes.
 
 | Executor mode | Settings | Behaviour measured |
 |---|---|---|
 | `auto` | `ems_mode`=AUTO | Normal self-use (eco slots still apply) |
 | `charge` P | `ems_mode`=CHARGE_BATTERY, `ems_power_limit`=P | Battery charges at exactly P (±7 W) whatever PV/load does; PV above P covers load, then exports; shortfall from grid |
 | `export` P | `ems_mode`=DISCHARGE_PV, `ems_power_limit`=P | Battery discharges at exactly P; PV not curtailed; everything not used by the house is exported |
-| `freeze_charge` | `ems_mode`=AUTO, `battery_discharge_current`=0 | No discharge; surplus PV charges the battery; deficit from grid |
+| `freeze_charge` | `ems_mode`=AUTO, `battery_discharge_depth`=SoC | No discharge (Standby); surplus PV charges the battery; deficit from grid. Off-grid the inverter uses its separate off-grid minimum SoC, so the backup side keeps full battery power (grid-breaker tests 2026-09-26) |
 | `freeze_export` | `ems_mode`=AUTO, `battery_charge_current`=0 | No charging; surplus exported; battery covers deficit |
 
-Not used: CHARGE_PV - its setpoint is the max grid power for charging and it
+Not used: `battery_discharge_current` = 0 for freeze charge - it works
+on-grid, but the inverter honours it off-grid too: in the grid-breaker test
+the backup output collapsed and the inverter went to Fault within ~15 s.
+CHARGE_PV - its setpoint is the max grid power for charging and it
 sends all PV to the battery with the whole load from the grid;
 `soc_upper_limit` = SoC works for freeze export too but depends on the SoC
 reading, so `freeze_export` uses `battery_charge_current`.
@@ -157,7 +161,8 @@ restart picks it up.
  "source": "predbat", "expires_at": "...", "applied": true, "since": "...",
  "override": null, "reserve_soc": 25, "reason": "target_soc reached",
  "registers": {"ems_mode": 1, "ems_power_limit": 0, "battery_charge_current": 19.0,
-               "battery_discharge_current": 0, "soc_upper_limit": 100, "work_mode": 3},
+               "battery_discharge_current": 19.0, "battery_discharge_depth": 81,
+               "soc_upper_limit": 100, "work_mode": 3},
  "last_error": null, "warnings": [], "writes_today": 14}
 ```
 
@@ -170,7 +175,7 @@ executor substitutes a mode (SoC target reached, reserve, override).
 Order of precedence each tick:
 
 1. **Disabled** (`CONTROL_MODE=off`): no writes, no subscriptions.
-1a. **Off-grid** (see below) → `auto` with user currents, above everything
+1a. **Off-grid** (see below) → `auto` with user currents and floor, above everything
    else including the override.
 2. **Override** active (dashboard) → its mode; MQTT commands are recorded but
    not applied (`state.override` shows mode and end time).
@@ -187,37 +192,50 @@ Order of precedence each tick:
      once.
 5. **Software reserve**: in `auto`, if SoC ≤ reserve → `freeze_charge` until
    SoC ≥ reserve + 2. Values below 20 % are accepted but warned about in the
-   dashboard (BMS SoC resyncs by ~4 points around 22-18 %). The inverter
-   depth of discharge (`battery_discharge_depth`) stays the hard floor.
+   dashboard (BMS SoC resyncs by ~4 points around 22-18 %). `CONTROL_MIN_SOC`
+   stays the floor in every other mode.
 6. Otherwise the commanded mode.
+
+**Freeze floor**: entering `freeze_charge` sets `battery_discharge_depth` to
+the current SoC (integer %, never below `CONTROL_MIN_SOC`). While frozen the
+floor follows a rising SoC in steps of 3 points (surplus PV charging must not
+be discharged again later) and never goes down. Without any SoC sample yet
+(startup, read failures) `freeze_charge` is not applied - `auto` with reason
+`waiting for SoC` - because a floor above the real SoC could make the
+inverter's DoD Holding charge from the grid. Leaving the freeze writes
+`CONTROL_MIN_SOC` back. The inverter only allows discharge again once SoC is
+5 points above the floor; if SoC is within 5 points of `CONTROL_MIN_SOC`
+when a freeze ends, discharge stays blocked until the battery charges - the
+state carries a warning then.
 
 Every mode fully specifies all control registers, so switching never leaves a
 stale value behind:
 
-| Mode | `ems_mode` | `ems_power_limit` | `battery_charge_current` | `battery_discharge_current` |
-|---|---|---|---|---|
-| `auto` | AUTO | 0 | user | user |
-| `charge` P | CHARGE_BATTERY | P | user | user |
-| `export` P | DISCHARGE_PV | P | user | user |
-| `freeze_charge` | AUTO | 0 | user | 0 |
-| `freeze_export` | AUTO | 0 | 0 | user |
+| Mode | `ems_mode` | `ems_power_limit` | `battery_charge_current` | `battery_discharge_current` | `battery_discharge_depth` |
+|---|---|---|---|---|---|
+| `auto` | AUTO | 0 | user | user | min |
+| `charge` P | CHARGE_BATTERY | P | user | user | min |
+| `export` P | DISCHARGE_PV | P | user | user | min |
+| `freeze_charge` | AUTO | 0 | user | user | freeze floor |
+| `freeze_export` | AUTO | 0 | 0 | user | min |
 
-`user` = `CONTROL_CHARGE_CURRENT_A` / `CONTROL_DISCHARGE_CURRENT_A` from
-config (not captured from the inverter, so a crash that left 0 there can
-never become the new "normal"). `soc_upper_limit` is only read and reported (must be 100;
+`user` = `CONTROL_CHARGE_CURRENT_A` / `CONTROL_DISCHARGE_CURRENT_A`, `min` =
+`CONTROL_MIN_SOC`, all from config (not captured from the inverter, so a crash
+that left 0 A or a high floor there can never become the new "normal"). `soc_upper_limit` is only read and reported (must be 100;
 a different value is shown as a warning, not changed).
 
-Write order: EMS mode first when leaving a forced mode, setpoint first when
-entering one; currents last when leaving a freeze, first when entering one.
+Write order: restricting limits first (a current going to 0, the floor going
+up), then EMS (setpoint first when entering a forced mode, mode first when
+going back to AUTO), then relaxing limits (currents restored, floor lowered).
 
 ## Off-grid (grid outage)
 
 The 1-year history has off-grid samples on 21 days - many are
 seconds-long blips, but several outages lasted hours (13 h on 22-23 Apr
-2026, 3-4 h on 8 Apr, 4 May and 20 Aug). A freeze during an outage is dangerous:
-`freeze_charge` (discharge current 0) could leave the backup circuits
-without battery power, `freeze_export` (charge current 0) blocks PV from
-charging the battery that the house now depends on.
+2026, 3-4 h on 8 Apr, 4 May and 20 Aug). `freeze_charge` via the on-grid
+floor is safe by itself off-grid (measured), but `freeze_export` (charge
+current 0) would block PV from charging the battery the house now depends
+on, and forced EMS modes have no meaning without the grid.
 
 - Detection from the runtime sample: `grid_mode` ≠ 1 (0 Not connected,
   2 Fault) or runtime `work_mode` = 2 (Normal Off-Grid). Seen in the
@@ -232,20 +250,21 @@ charging the battery that the house now depends on.
   restore is written on the next tick even after earlier write failures.
 - Off-grid, the battery may go below the software reserve - that is what
   the reserve is for; `battery_discharge_depth_offline` stays the hard floor.
-- **Open risk, to be tested live before `on`:** whether the inverter
-  honours `battery_discharge_current` = 0 in off-grid mode at all. If it
-  does and the Pi or the Wi-Fi dongle is not powered from the backup
-  circuit, a grid failure during `freeze_charge` at night could black out
-  the backup side before the executor can react. The live acceptance
-  includes a supervised grid-breaker test; if the backup side drops, freeze
-  charge must move to another mechanism before going `on`.
+- Grid-breaker tests (2026-09-26, no PV, SoC 70-76 %): with
+  `battery_discharge_current` = 0 the backup output collapsed and the
+  inverter went to Fault in ~15 s (did not recover off-grid) - hence the
+  floor-based `freeze_charge`. With the on-grid floor at the current SoC the
+  inverter stayed in Normal off-grid and the battery supplied a 460 W house
+  load on backup; on grid return it spends ~80 s in Check mode with the
+  load bypassed to the grid, then reconnects. The Wi-Fi AP stayed up in both
+  tests (the Pi has a UPS), so the executor keeps control during outages.
 - Predbat has no notion of off-grid: it keeps planning and sending commands
   (if HA is still up). The executor's off-grid rule overrides them; the
   only Predbat-side outage feature is the Meteoalarm `keep` pre-charge.
 
 ## Fail-safe
 
-- **Expiry** → `auto` with user currents (above).
+- **Expiry** → `auto` with user currents and floor (above).
 - **MQTT disconnect** does not change anything by itself; expiry handles it.
 - **Startup reconciliation**: before polling starts, read the control
   registers. No valid command after a restart (commands are not persisted) →
@@ -276,6 +295,7 @@ charging the battery that the house now depends on.
 | `CONTROL_MODE` | `off` | `off`, `shadow` (compute + publish state with `"shadow": true`, no writes), `on` |
 | `CONTROL_CHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_charge_current`, e.g. 19.0 |
 | `CONTROL_DISCHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_discharge_current` |
+| `CONTROL_MIN_SOC` | - (required when not `off`) | normal on-grid minimum SoC % (`battery_discharge_depth`), e.g. 14 |
 | `CONTROL_MAX_BATTERY_W` | 3400 | power clamp |
 | `CONTROL_MAX_WRITES_PER_DAY` | 300 | warning threshold |
 
@@ -352,7 +372,7 @@ Changes in `apps.yaml` / Predbat settings (the HA repo, not this code):
   and error reporting, failed reads skipped.
 - **MQTT**: subscribe on reconnect, malformed payloads, retained reserve.
 - **Startup**: registers left in `freeze_export`/`charge` by a "crash" are
-  reverted to `auto` + user currents.
+  reverted to `auto` + user currents and floor.
 - **Live acceptance** (short, supervised, reusing the spike's per-mode
   checks with 60 s windows): each mode via MQTT, expiry revert, restart
   revert, override precedence.

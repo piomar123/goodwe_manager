@@ -160,3 +160,40 @@ Check (5) while off-grid, no recovery; grid back 19:24:25 -> Wait/Check; restore
 Wi-Fi AP stayed up throughout (Pi on UPS kept polling). Hot test skipped.
 Next candidate: freeze_charge = on-grid min SoC (battery_discharge_depth, 45356 BattSOCUnderMin, value = min SoC %)
 set to current SoC; off-grid uses battery_discharge_depth_offline (45358) separately.
+
+## Off-grid spike 2 (2026-09-26 19:41-19:49, log ~/ems-spike/ems-test-20260926_194904.json) - PASS
+
+freeze_charge = EMS AUTO, set 0, currents 19 A, **battery_discharge_depth (on-grid min SoC) = current SoC (70)**.
+On-grid: battery Standby, grid supplies load (freeze works). Cold test: Normal off-grid, no fault, backup supplied.
+Hot test (house on backup, 460 W): battery supplied 445 W, lights on. Grid return: ~80 s Check mode, load bypassed
+to grid, then on-grid + Standby again. Off-grid min SoC (45358) = 6 %, DoD Holding (47602) = 1, no grid charging seen.
+User facts: register value = min SoC % (SolarGo shows inverted DoD); after SoC reaches the min, discharge resumes only
+at min+5 -> when leaving a freeze the floor must drop > 5 points below SoC. Inverter reconnect = relays, no sync.
+
+## STATUS / NEXT (for after compaction)
+
+- Spec UPDATED for floor-based freeze_charge (5th control setting battery_discharge_depth, CONTROL_MIN_SOC,
+  freeze floor follows rising SoC in 3-pt steps, 'waiting for SoC', hysteresis warning, write order
+  restricting-first/relaxing-last, off-grid section rewritten). Spec + notes committed on branch predbat-control-spec.
+- PLAN NOT YET UPDATED (docs/superpowers/plans/2026-09-26-predbat-control-executor.md). Required edits:
+  * control.py: MODE_SETTINGS += 'battery_discharge_depth'; ControlConfig(mode, charge_current_a, discharge_current_a,
+    min_soc, max_battery_w=3400, max_writes_per_day=300); config_from_env requires CONTROL_MIN_SOC (int 0-100).
+  * Executor: _last_soc, _floor; FREEZE_CHARGE -> floor=max(min_soc,int(last_soc)) on entry, raise when soc>=floor+3,
+    never lower; no SoC yet -> AUTO reason 'waiting for SoC'; _settings: freeze_charge = (1,0,c,d,floor), others depth=min_soc;
+    snapshot + 'freeze_floor'; property last_soc.
+  * compute_warnings(..., soc, min_soc, frozen): warn if not frozen and readback depth==min_soc and soc < min_soc+5.
+  * control_io.write_order: limits (charge_i, discharge_i, depth): restrict = current->0 or depth up; relax = rest; order
+    restrict + ems + relax. Fakes: add depth 14 to AUTO/CHARGE_2K/FREEZE_EXPORT, add FREEZE_CHARGE_60.
+  * Update every test that detected freeze via battery_discharge_current==0 -> battery_discharge_depth==floor; CFG/ControlConfig
+    calls get min_soc 14; AUTO_SETTINGS gets depth 14; add tests: floor follows rising soc, waits for soc, never below min,
+    leaving restores min, write orders for FREEZE_CHARGE_60.
+  * Runtime: pass executor.last_soc/config.min_soc/frozen to compute_warnings; override test expects depth 55 write.
+  * Docs: .env.example CONTROL_MIN_SOC=14; MQTT_TOPICS registers example + depth; README.
+  * Task 9: acceptance freeze_charge check = floor; breaker test becomes regression check via executor.
+  * Global Constraints + Review Focus #1 (off-grid) rewording.
+  * Re-verify by extracting plan code into scratch (git archive HEAD | tar -x -C /tmp/plancheck), apply Task 4/6 edits,
+    run full suite with ~/Dev/goodwe_manager/venv/bin/python -m unittest discover -s tests (was 444 OK before).
+- Then ask user: review plan + execution method (recommend Native).
+- Other pending: PR 2 inverter-time-sync (docstring note tz-aware written as-is, then show description);
+  cleanup Pi: arp-probe.timer, ~/ems-spike; restart `claude remote-control` via claude-piomar alias (GH_CONFIG_DIR);
+  use GH_CONFIG_DIR=~/.config/gh-piomar for all gh calls. Eco slot 1 was disabled by user for the spike (their action).
