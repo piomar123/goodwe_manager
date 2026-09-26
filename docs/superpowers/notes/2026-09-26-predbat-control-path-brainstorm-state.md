@@ -150,3 +150,13 @@ inverter + service templates, testing approach, rollout (read_only → live).
 - Disable: 47000=0; EMS 47511/47512 = 1/0; 47533=1; 47591=0x037F; 47609=0.
 - clearECOtime disabled the eco slots (on/off byte 0xFF -> 0x00). SolarGo "Eco" writes 47000=3, EMS 1/0 and re-enables none; the 47549 (slot 1) writes in the capture were the user re-enabling slot 1 by hand.
 - #108 follow-up posted: https://github.com/marcelblijleven/goodwe/issues/108#issuecomment-5847187611
+
+## Off-grid spike 1 (2026-09-26 19:20-19:25, log ~/ems-spike/ems-test-20260926_192507.json)
+
+freeze_charge as specced (EMS AUTO, set 0, charge 19 A, **discharge 0 A**), no PV, grid breaker off:
+off-grid (work_mode 2) at 19:20:46, battery stayed at 0 A, backup output 18 -> 5 -> 0 W, **Fault (3) at 19:20:59**,
+Check (5) while off-grid, no recovery; grid back 19:24:25 -> Wait/Check; restored 19:25:11, on-grid ~1 min later.
+**The inverter honours battery_discharge_current = 0 off-grid -> freeze_charge via 0 A blacks out the backup side.**
+Wi-Fi AP stayed up throughout (Pi on UPS kept polling). Hot test skipped.
+Next candidate: freeze_charge = on-grid min SoC (battery_discharge_depth, 45356 BattSOCUnderMin, value = min SoC %)
+set to current SoC; off-grid uses battery_discharge_depth_offline (45358) separately.
