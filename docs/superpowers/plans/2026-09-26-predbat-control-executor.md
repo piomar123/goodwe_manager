@@ -4,7 +4,7 @@
 
 **Goal:** Let Predbat (or any optimizer) drive the GoodWe GW8KN-ET through goodwe_manager via MQTT commands, with read-back acknowledgement, fail-safe expiry, a timed dashboard override and a software reserve.
 
-**Architecture:** A pure `control.Executor` turns commands + runtime samples into desired values for four inverter settings; `control_io.ControlWriter` writes only the differences through the existing single goodwe connection and verifies them by read-back; `control_runtime.ControlRuntime` glues both to MQTT and the 1 Hz poll loop in `main.py`. Everything runs on the existing asyncio loop thread; Flask routes reach it via `run_coroutine_threadsafe`.
+**Architecture:** A pure `control.Executor` turns commands + runtime samples into desired values for five inverter settings; `control_io.ControlWriter` writes only the differences through the existing single goodwe connection and verifies them by read-back; `control_runtime.ControlRuntime` glues both to MQTT and the 1 Hz poll loop in `main.py`. Everything runs on the existing asyncio loop thread; Flask routes reach it via `run_coroutine_threadsafe`.
 
 **Tech Stack:** Python 3.12, goodwe 0.4.10, aiomqtt 2.5.1, Flask, `unittest` (`python -m unittest discover -s tests`).
 
@@ -12,18 +12,20 @@
 
 ## Global Constraints
 
-- Settings are addressed by goodwe library ids only: `ems_mode`, `ems_power_limit`, `battery_charge_current`, `battery_discharge_current`, `soc_upper_limit`, `work_mode`, `eco_mode_1..4`. No raw register addresses in code.
+- Settings are addressed by goodwe library ids only: `ems_mode`, `ems_power_limit`, `battery_charge_current`, `battery_discharge_current`, `battery_discharge_depth` (on-grid minimum SoC in %, the raw register value - not the library's inverted DoD helpers), `soc_upper_limit`, `work_mode`, `eco_mode_1..4`. No raw register addresses in code.
 - EMS mode values: AUTO = 1, DISCHARGE_PV = 3, CHARGE_BATTERY = 11.
-- Mode table (every mode sets all four): `auto` = (1, 0, user, user); `charge` P = (11, P, user, user); `export` P = (3, P, user, user); `freeze_charge` = (1, 0, user, 0); `freeze_export` = (1, 0, 0, user). Order of values: `ems_mode`, `ems_power_limit`, `battery_charge_current`, `battery_discharge_current`.
-- "user" currents come from `CONTROL_CHARGE_CURRENT_A` / `CONTROL_DISCHARGE_CURRENT_A` (float A, 0 < x ≤ 25), never captured from the inverter.
+- Mode table (every mode sets all five): `auto` = (1, 0, user, user, min); `charge` P = (11, P, user, user, min); `export` P = (3, P, user, user, min); `freeze_charge` = (1, 0, user, user, floor); `freeze_export` = (1, 0, 0, user, min). Order of values: `ems_mode`, `ems_power_limit`, `battery_charge_current`, `battery_discharge_current`, `battery_discharge_depth`. `battery_discharge_current` = 0 is never used (the inverter honours it off-grid and faults).
+- Freeze floor: on entering `freeze_charge` = max(`CONTROL_MIN_SOC`, int(last SoC)); raised to int(SoC) whenever SoC ≥ floor + 3; never lowered while frozen. No SoC sample seen yet → `auto` with reason `waiting for SoC`. Leaving the freeze writes `CONTROL_MIN_SOC` back; if SoC < min + 5 then, the state warns (inverter only resumes discharge 5 points above its minimum).
+- "user" currents come from `CONTROL_CHARGE_CURRENT_A` / `CONTROL_DISCHARGE_CURRENT_A` (float A, 0 < x ≤ 25) and "min" from `CONTROL_MIN_SOC` (int %, 0-100), all required unless `CONTROL_MODE=off`, never captured from the inverter.
 - `CONTROL_MODE` = `off` (default; no subscriptions, no writes, no behaviour change) | `shadow` (compute + publish state with `"shadow": true`, never write) | `on`.
 - `CONTROL_MAX_BATTERY_W` default 3400; `CONTROL_MAX_WRITES_PER_DAY` default 300 (log warning only).
 - Commands: topic `<prefix>/control/set`, QoS 1, not retained; `expires_at` (ISO 8601 with offset) or `ttl_s`, max 60 min ahead, required unless `mode` is `auto`; power clamped to `[100, min(CONTROL_MAX_BATTERY_W, BMS limit A × battery V)]`.
 - Scoped stop: `{"mode":"auto","stop":"charge"|"export"}` only clears a command in that domain.
 - SoC targets: 30 s debounce, except on the first SoC sample after a new command; charge target reached → `freeze_charge`, back to `charge` below target − 3; export target reached → `auto`.
-- Off-grid (runtime `grid_mode` ≠ 1 or runtime `work_mode` = 2): immediately `auto` + user currents, above override/targets/reserve; back to normal after 60 s of on-grid samples. Any change of desired values resets the writer's retries/back-off/verify wait.
+- Off-grid (runtime `grid_mode` ≠ 1 or runtime `work_mode` = 2): immediately `auto` + user currents + min SoC, above override/targets/reserve; back to normal after 60 s of on-grid samples. Any change of desired values resets the writer's retries/back-off/verify wait.
 - Software reserve: topic `<prefix>/control/reserve/set` (retained, integer %); in effective `auto`, SoC ≤ reserve (30 s) → `freeze_charge` until SoC ≥ reserve + 2; warn below 20 %.
-- Writer: read the six reported settings every 10 s and 3 s after writes; up to 3 attempts per setting, then `last_error` and 60 s back-off; failed reads are skipped, never raised.
+- Write order: restricting limits first (a current going to 0, `battery_discharge_depth` going up), then EMS, then relaxing limits.
+- Writer: read the seven reported settings every 10 s and 3 s after writes; up to 3 attempts per setting, then `last_error` and 60 s back-off; failed reads are skipped, never raised.
 - State topic `<prefix>/control/state` retained, published on change and at least every 10 s.
 - Override from the dashboard: 15 min - 12 h, memory only.
 - MQTT or control failures must never stop inverter polling (same rule as the existing bridge: catch, log, continue).
@@ -31,12 +33,13 @@
 
 ## Review Focus
 
-1. Grid outage while a freeze is active: the next tick must restore `auto` + user currents, even if earlier writes had failed and the writer is backing off. Pinned in Task 2 (`test_off_grid_restores_auto_over_everything`) and Task 3 (`test_new_desired_bypasses_backoff`). The inverter-side half (does discharge current 0 even apply off-grid?) is the supervised breaker test in Task 9.
+1. Grid outage while a freeze is active: the next tick must restore `auto` + user currents + min SoC (a `freeze_export` charge current of 0 would stop PV charging the battery the house now runs on), even if earlier writes had failed and the writer is backing off. Pinned in Task 2 (`test_off_grid_restores_auto_over_everything`) and Task 3 (`test_new_desired_bypasses_backoff`). The floor-based `freeze_charge` itself passed the grid-breaker spike; Task 9 repeats that breaker test through the executor as a regression check.
 2. Predbat sends `discharge_stop` + `charge_start` (or `charge_stop` + `discharge_start`) every cycle - the executor must not bounce through `auto` or write anything when the resulting command is unchanged. Pinned in Task 2 (`test_opposite_scoped_stop_is_ignored`) and Task 5 (`test_paired_stop_start_each_cycle_causes_no_writes`).
 3. A single garbage SoC sample (e.g. 0 or 100 for one poll) must not trip a target or the reserve. Pinned in Task 2 (`test_single_garbage_soc_sample_does_not_latch`).
 4. The MQTT broker drops and comes back: control topics must be re-subscribed and the retained reserve re-delivered. Pinned in Task 4 (`test_resubscribes_after_reconnect`).
 5. The dongle stops answering for ~20 s mid-cycle: the writer must neither raise into the poll loop nor spam writes. Pinned in Task 3 (`test_failed_reads_are_skipped_and_no_write_without_readback_change`).
-6. The manager restarts while the inverter was left in a freeze (a current at 0) or forced mode: the first steps must restore `auto` + user currents in the safe order. Pinned in Task 3 (`test_startup_reverts_leftover_freeze_export`).
+6. The manager restarts while the inverter was left in a freeze (a current at 0, or a raised minimum SoC) or forced mode: the first steps must restore `auto` + user currents + min SoC in the safe order. Pinned in Task 3 (`test_startup_reverts_leftover_freeze_export`, `test_startup_reverts_leftover_freeze_charge_floor`).
+7. The manager starts (or the dongle fails) and a freeze charge arrives before any SoC sample: no floor may be guessed - a floor above the real SoC would make DoD Holding charge from the grid. Pinned in Task 2 (`test_freeze_charge_waits_for_soc`).
 
 ---
 
@@ -69,7 +72,7 @@
   - `@dataclass(frozen=True) class Command(mode: Mode, power_w: int|None=None, target_soc: int|None=None, source: str='unknown', expires_at: datetime|None=None, stop: str|None=None, id: str|None=None)` with `same_request(other) -> bool`
   - `parse_command(payload: bytes|str, now: datetime) -> Command` (raises `CommandError`)
   - `make_override(mode: str, power_w: str|int|None, target_soc: str|int|None, duration_min: str|int, now: datetime) -> Command` (raises `CommandError`)
-  - `@dataclass(frozen=True) class ControlConfig(mode: str, charge_current_a: float, discharge_current_a: float, max_battery_w: int=3400, max_writes_per_day: int=300)`
+  - `@dataclass(frozen=True) class ControlConfig(mode: str, charge_current_a: float, discharge_current_a: float, min_soc: int, max_battery_w: int=3400, max_writes_per_day: int=300)`
   - `config_from_env(env: Mapping[str, str]) -> ControlConfig | None` (raises `ValueError`)
   - `@dataclass(frozen=True) class Sample(soc, battery_v, bms_charge_limit_a, bms_discharge_limit_a, off_grid=False)` (first four `float|None`, `off_grid: bool`) with `Sample.from_runtime(data: dict) -> Sample`
 
@@ -177,22 +180,27 @@ class ConfigFromEnvTest(unittest.TestCase):
 
     def test_on_with_currents(self):
         cfg = control.config_from_env({'CONTROL_MODE': 'on', 'CONTROL_CHARGE_CURRENT_A': '19',
-                                       'CONTROL_DISCHARGE_CURRENT_A': '18.5'})
-        self.assertEqual(cfg, control.ControlConfig('on', 19.0, 18.5, 3400, 300))
+                                       'CONTROL_DISCHARGE_CURRENT_A': '18.5', 'CONTROL_MIN_SOC': '14'})
+        self.assertEqual(cfg, control.ControlConfig('on', 19.0, 18.5, 14, 3400, 300))
 
     def test_overrides(self):
         cfg = control.config_from_env({'CONTROL_MODE': 'shadow', 'CONTROL_CHARGE_CURRENT_A': '19',
-                                       'CONTROL_DISCHARGE_CURRENT_A': '19', 'CONTROL_MAX_BATTERY_W': '3000',
-                                       'CONTROL_MAX_WRITES_PER_DAY': '100'})
-        self.assertEqual((cfg.max_battery_w, cfg.max_writes_per_day), (3000, 100))
+                                       'CONTROL_DISCHARGE_CURRENT_A': '19', 'CONTROL_MIN_SOC': '10',
+                                       'CONTROL_MAX_BATTERY_W': '3000', 'CONTROL_MAX_WRITES_PER_DAY': '100'})
+        self.assertEqual((cfg.min_soc, cfg.max_battery_w, cfg.max_writes_per_day), (10, 3000, 100))
 
     def test_invalid(self):
+        ok = {'CONTROL_MODE': 'on', 'CONTROL_CHARGE_CURRENT_A': '19', 'CONTROL_DISCHARGE_CURRENT_A': '19',
+              'CONTROL_MIN_SOC': '14'}
         cases = [
             {'CONTROL_MODE': 'maybe'},
             {'CONTROL_MODE': 'on'},
             {'CONTROL_MODE': 'on', 'CONTROL_CHARGE_CURRENT_A': '19'},
-            {'CONTROL_MODE': 'on', 'CONTROL_CHARGE_CURRENT_A': '0', 'CONTROL_DISCHARGE_CURRENT_A': '19'},
-            {'CONTROL_MODE': 'on', 'CONTROL_CHARGE_CURRENT_A': '26', 'CONTROL_DISCHARGE_CURRENT_A': '19'},
+            {**ok, 'CONTROL_CHARGE_CURRENT_A': '0'},
+            {**ok, 'CONTROL_CHARGE_CURRENT_A': '26'},
+            {k: v for k, v in ok.items() if k != 'CONTROL_MIN_SOC'},
+            {**ok, 'CONTROL_MIN_SOC': '101'},
+            {**ok, 'CONTROL_MIN_SOC': '14.5'},
         ]
         for env in cases:
             with self.subTest(env), self.assertRaises(ValueError):
@@ -259,8 +267,11 @@ EMS_AUTO = 1
 EMS_DISCHARGE_PV = 3
 EMS_CHARGE_BATTERY = 11
 
-# The four settings every mode fully specifies, and the ones only reported.
-MODE_SETTINGS = ('ems_mode', 'ems_power_limit', 'battery_charge_current', 'battery_discharge_current')
+# The five settings every mode fully specifies, and the ones only reported.
+# battery_discharge_depth is the raw on-grid minimum SoC % (SolarGo shows it
+# inverted as DoD); off-grid the inverter uses its separate offline minimum.
+MODE_SETTINGS = ('ems_mode', 'ems_power_limit', 'battery_charge_current', 'battery_discharge_current',
+                 'battery_discharge_depth')
 REPORTED_SETTINGS = MODE_SETTINGS + ('soc_upper_limit', 'work_mode')
 
 POWERED_MODES = (Mode.CHARGE, Mode.EXPORT)
@@ -373,6 +384,7 @@ class ControlConfig:
     mode: str  # 'shadow' or 'on' ('off' means no ControlConfig at all)
     charge_current_a: float
     discharge_current_a: float
+    min_soc: int  # normal battery_discharge_depth, restored whenever not frozen
     max_battery_w: int = 3400
     max_writes_per_day: int = 300
 
@@ -393,7 +405,14 @@ def config_from_env(env: Mapping[str, str]) -> Optional[ControlConfig]:
             raise ValueError(f'{key} must be > 0 and <= {MAX_INVERTER_CURRENT_A} A')
         return value
 
-    return ControlConfig(mode, current('CONTROL_CHARGE_CURRENT_A'), current('CONTROL_DISCHARGE_CURRENT_A'),
+    raw_min = env.get('CONTROL_MIN_SOC')
+    if not raw_min:
+        raise ValueError(f'CONTROL_MIN_SOC is required when CONTROL_MODE={mode}')
+    min_soc = int(raw_min)
+    if not 0 <= min_soc <= 100:
+        raise ValueError('CONTROL_MIN_SOC must be 0-100')
+
+    return ControlConfig(mode, current('CONTROL_CHARGE_CURRENT_A'), current('CONTROL_DISCHARGE_CURRENT_A'), min_soc,
                          int(env.get('CONTROL_MAX_BATTERY_W') or 3400),
                          int(env.get('CONTROL_MAX_WRITES_PER_DAY') or 300))
 
@@ -458,14 +477,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
     - `reject(error: str) -> None`
     - `set_override(cmd: Command) -> None`, `clear_override() -> None`
     - `set_reserve(soc: int|None) -> None`, property `reserve -> int|None`
+    - properties `last_soc -> float|None` (last valid SoC sample) and `min_soc_hold -> bool` (a freeze ended with SoC < min + 5 and SoC hasn't reached min + 5 since)
     - `tick(sample: Sample, now: datetime) -> dict[str, int|float]` (keys = `MODE_SETTINGS`)
-    - `snapshot(now: datetime) -> dict` (keys: `mode`, `effective_mode`, `power_w`, `power_applied_w`, `power_clamped`, `target_soc`, `source`, `expires_at`, `since`, `override`, `reserve_soc`, `reason`, `command_error`, `shadow`, `off_grid`)
-  - `compute_warnings(readback: dict, eco_slots_enabled: list[bool]|None, reserve: int|None, initial_work_mode: int|None) -> list[str]`
+    - `snapshot(now: datetime) -> dict` (keys: `mode`, `effective_mode`, `power_w`, `power_applied_w`, `power_clamped`, `target_soc`, `source`, `expires_at`, `since`, `override`, `reserve_soc`, `reason`, `command_error`, `shadow`, `off_grid`, `freeze_floor`)
+  - `compute_warnings(readback: dict, eco_slots_enabled: list[bool]|None, reserve: int|None, initial_work_mode: int|None, min_soc_hold: int|None = None) -> list[str]` (`min_soc_hold` = the min SoC when `Executor.min_soc_hold` is true, else `None`)
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/test_control.py`, above the `if __name__` block)
 
 ```python
-CFG = control.ControlConfig('on', 19.0, 18.5, 3400, 300)
+CFG = control.ControlConfig('on', 19.0, 18.5, 14, 3400, 300)
 S = control.Sample
 
 
@@ -480,16 +500,16 @@ def charge(power=3000, target=None, minutes=15, source='predbat') -> Command:
 class ExecutorModesTest(unittest.TestCase):
     def test_no_command_is_auto_with_user_currents(self):
         ex = control.Executor(CFG)
-        self.assertEqual(ex.tick(S(50), NOW), {'ems_mode': 1, 'ems_power_limit': 0,
-                                                'battery_charge_current': 19.0, 'battery_discharge_current': 18.5})
+        self.assertEqual(ex.tick(S(50), NOW), {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 19.0,
+                                                'battery_discharge_current': 18.5, 'battery_discharge_depth': 14})
         self.assertEqual(ex.snapshot(NOW)['reason'], 'no command')
 
     def test_mode_table(self):
         cases = [
-            (charge(2000), (11, 2000, 19.0, 18.5)),
-            (Command(Mode.EXPORT, 1500, None, 'p', at(600)), (3, 1500, 19.0, 18.5)),
-            (Command(Mode.FREEZE_CHARGE, expires_at=at(600)), (1, 0, 19.0, 0)),
-            (Command(Mode.FREEZE_EXPORT, expires_at=at(600)), (1, 0, 0, 18.5)),
+            (charge(2000), (11, 2000, 19.0, 18.5, 14)),
+            (Command(Mode.EXPORT, 1500, None, 'p', at(600)), (3, 1500, 19.0, 18.5, 14)),
+            (Command(Mode.FREEZE_CHARGE, expires_at=at(600)), (1, 0, 19.0, 18.5, 50)),
+            (Command(Mode.FREEZE_EXPORT, expires_at=at(600)), (1, 0, 0, 18.5, 14)),
         ]
         for cmd, expected in cases:
             with self.subTest(cmd.mode):
@@ -521,7 +541,7 @@ class ExecutorModesTest(unittest.TestCase):
         ex = control.Executor(CFG)
         ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(600)))
         ex.submit(Command(Mode.AUTO, stop='charge'))
-        self.assertEqual(ex.tick(S(50), NOW)['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(50), NOW)['battery_discharge_depth'], 14)
 
     def test_opposite_scoped_stop_is_ignored(self):
         ex = control.Executor(CFG)
@@ -558,7 +578,7 @@ class ExecutorTargetsTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(80), at(5))['ems_mode'], 11)
         self.assertEqual(ex.tick(S(80), at(34))['ems_mode'], 11)
         desired = ex.tick(S(80), at(35))
-        self.assertEqual((desired['ems_mode'], desired['battery_discharge_current']), (1, 0))
+        self.assertEqual((desired['ems_mode'], desired['battery_discharge_depth']), (1, 80))
         self.assertEqual(ex.snapshot(at(35))['effective_mode'], 'freeze_charge')
         self.assertEqual(ex.snapshot(at(35))['reason'], 'target_soc reached')
 
@@ -566,13 +586,14 @@ class ExecutorTargetsTest(unittest.TestCase):
         ex = control.Executor(CFG)
         ex.submit(charge(target=50))
         ex.tick(S(60), NOW)  # already met on first sample -> freeze at once
-        self.assertEqual(ex.tick(S(48), at(10))['battery_discharge_current'], 0)
-        self.assertEqual(ex.tick(S(46), at(20))['ems_mode'], 11)
+        self.assertEqual(ex.tick(S(48), at(10))['battery_discharge_depth'], 60)  # floor never goes down
+        desired = ex.tick(S(46), at(20))
+        self.assertEqual((desired['ems_mode'], desired['battery_discharge_depth']), (11, 14))
 
     def test_hold_charge_target_below_soc_applies_immediately(self):
         ex = control.Executor(CFG)
         ex.submit(charge(target=40))
-        self.assertEqual(ex.tick(S(55), NOW)['battery_discharge_current'], 0)
+        self.assertEqual(ex.tick(S(55), NOW)['battery_discharge_depth'], 55)
 
     def test_export_target_reached_goes_auto_and_stays(self):
         ex = control.Executor(CFG)
@@ -593,7 +614,7 @@ class ExecutorTargetsTest(unittest.TestCase):
         ex.submit(Command(Mode.AUTO))
         ex.tick(S(60), at(50))
         ex.tick(S(0), at(55))
-        self.assertEqual(ex.tick(S(60), at(90))['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(60), at(90))['battery_discharge_depth'], 14)
 
     def test_none_soc_keeps_debounce_running(self):
         ex = control.Executor(CFG)
@@ -601,7 +622,7 @@ class ExecutorTargetsTest(unittest.TestCase):
         ex.tick(S(70), at(0))
         ex.tick(S(80), at(1))
         ex.tick(S(None), at(20))
-        self.assertEqual(ex.tick(S(80), at(31))['battery_discharge_current'], 0)
+        self.assertEqual(ex.tick(S(80), at(31))['battery_discharge_depth'], 80)
 
     def test_new_command_resets_latch(self):
         ex = control.Executor(CFG)
@@ -617,10 +638,10 @@ class ExecutorReserveTest(unittest.TestCase):
         ex.set_reserve(25)
         ex.tick(S(26), at(0))
         ex.tick(S(25), at(1))
-        self.assertEqual(ex.tick(S(25), at(31))['battery_discharge_current'], 0)
+        self.assertEqual(ex.tick(S(25), at(31))['battery_discharge_depth'], 25)
         self.assertEqual(ex.snapshot(at(31))['reason'], 'reserve')
-        self.assertEqual(ex.tick(S(26), at(40))['battery_discharge_current'], 0)
-        self.assertEqual(ex.tick(S(27), at(50))['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(26), at(40))['battery_discharge_depth'], 25)
+        self.assertEqual(ex.tick(S(27), at(50))['battery_discharge_depth'], 14)
 
     def test_reserve_does_not_touch_forced_modes(self):
         ex = control.Executor(CFG)
@@ -634,7 +655,7 @@ class ExecutorReserveTest(unittest.TestCase):
         ex.set_reserve(25)
         ex.set_reserve(None)
         ex.tick(S(10), at(0))
-        self.assertEqual(ex.tick(S(10), at(60))['battery_discharge_current'], 18.5)
+        self.assertEqual(ex.tick(S(10), at(60))['battery_discharge_depth'], 14)
 
 
 class ExecutorOverrideTest(unittest.TestCase):
@@ -642,7 +663,7 @@ class ExecutorOverrideTest(unittest.TestCase):
         ex = control.Executor(CFG)
         ex.submit(Command(Mode.EXPORT, 2000, None, 'predbat', at(3000)))
         ex.set_override(Command(Mode.FREEZE_CHARGE, source='dashboard', expires_at=at(900)))
-        self.assertEqual(ex.tick(S(50), at(0))['battery_discharge_current'], 0)
+        self.assertEqual(ex.tick(S(50), at(0))['battery_discharge_depth'], 50)
         snap = ex.snapshot(at(0))
         self.assertEqual((snap['mode'], snap['effective_mode']), ('export', 'freeze_charge'))
         self.assertEqual(snap['override']['mode'], 'freeze_charge')
@@ -656,7 +677,8 @@ class ExecutorOverrideTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(50), at(0))['battery_charge_current'], 19.0)
 
 
-AUTO_SETTINGS = {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 19.0, 'battery_discharge_current': 18.5}
+AUTO_SETTINGS = {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 19.0, 'battery_discharge_current': 18.5,
+                 'battery_discharge_depth': 14}
 
 
 class ExecutorOffGridTest(unittest.TestCase):
@@ -682,11 +704,11 @@ class ExecutorOffGridTest(unittest.TestCase):
         ex = control.Executor(CFG)
         ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(900)))
         ex.tick(S(50, off_grid=True), at(0))
-        self.assertEqual(ex.tick(S(50), at(30))['battery_discharge_current'], 18.5)
-        self.assertEqual(ex.tick(S(50, off_grid=True), at(40))['battery_discharge_current'], 18.5)
-        self.assertEqual(ex.tick(S(50), at(50))['battery_discharge_current'], 18.5)  # timer restarts here
-        self.assertEqual(ex.tick(S(50), at(109))['battery_discharge_current'], 18.5)
-        self.assertEqual(ex.tick(S(50), at(110))['battery_discharge_current'], 0)
+        self.assertEqual(ex.tick(S(50), at(30))['battery_discharge_depth'], 14)
+        self.assertEqual(ex.tick(S(50, off_grid=True), at(40))['battery_discharge_depth'], 14)
+        self.assertEqual(ex.tick(S(50), at(50))['battery_discharge_depth'], 14)  # timer restarts here
+        self.assertEqual(ex.tick(S(50), at(109))['battery_discharge_depth'], 14)
+        self.assertEqual(ex.tick(S(48), at(110))['battery_discharge_depth'], 48)  # floor from the SoC now
         self.assertFalse(ex.snapshot(at(110))['off_grid'])
 
     def test_command_still_expires_while_off_grid(self):
@@ -699,9 +721,74 @@ class ExecutorOffGridTest(unittest.TestCase):
         self.assertEqual(ex.snapshot(at(100))['reason'], 'command expired')
 
 
+class ExecutorFreezeFloorTest(unittest.TestCase):
+    def frozen(self):
+        ex = control.Executor(CFG)
+        ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
+        return ex
+
+    def test_floor_is_current_soc_rounded_down(self):
+        ex = self.frozen()
+        self.assertEqual(ex.tick(S(55.7), NOW)['battery_discharge_depth'], 55)
+        self.assertEqual(ex.snapshot(NOW)['freeze_floor'], 55)
+
+    def test_floor_follows_rising_soc_in_3_point_steps_and_never_drops(self):
+        ex = self.frozen()
+        ex.tick(S(55), at(0))
+        self.assertEqual(ex.tick(S(57.9), at(10))['battery_discharge_depth'], 55)
+        self.assertEqual(ex.tick(S(58.2), at(20))['battery_discharge_depth'], 58)
+        self.assertEqual(ex.tick(S(56), at(30))['battery_discharge_depth'], 58)
+        self.assertEqual(ex.tick(S(None), at(40))['battery_discharge_depth'], 58)
+
+    def test_floor_never_below_min_soc(self):
+        ex = self.frozen()
+        self.assertEqual(ex.tick(S(9), NOW)['battery_discharge_depth'], 14)
+
+    def test_freeze_charge_waits_for_soc(self):
+        ex = self.frozen()
+        self.assertEqual(ex.tick(S(None), at(0)), AUTO_SETTINGS)
+        snap = ex.snapshot(at(0))
+        self.assertEqual((snap['effective_mode'], snap['reason'], snap['freeze_floor']), ('auto', 'waiting for SoC', None))
+        self.assertEqual(ex.tick(S(40), at(1))['battery_discharge_depth'], 40)
+
+    def test_last_known_soc_is_used_after_a_failed_read(self):
+        ex = control.Executor(CFG)
+        ex.tick(S(62), at(0))
+        ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
+        self.assertEqual(ex.tick(S(None), at(1))['battery_discharge_depth'], 62)
+        self.assertEqual(ex.last_soc, 62)
+
+    def test_leaving_restores_min_and_reentry_takes_the_new_soc(self):
+        ex = self.frozen()
+        ex.tick(S(70), at(0))
+        ex.submit(Command(Mode.AUTO, stop='charge'))
+        self.assertEqual(ex.tick(S(65), at(10))['battery_discharge_depth'], 14)
+        self.assertIsNone(ex.snapshot(at(10))['freeze_floor'])
+        ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
+        self.assertEqual(ex.tick(S(65), at(20))['battery_discharge_depth'], 65)
+
+    def test_min_soc_hold_after_a_freeze_near_min(self):
+        ex = control.Executor(CFG)
+        ex.set_reserve(16)
+        ex.tick(S(16), at(0))
+        self.assertEqual(ex.tick(S(16), at(30))['battery_discharge_depth'], 16)
+        self.assertFalse(ex.min_soc_hold)
+        self.assertEqual(ex.tick(S(18), at(40))['battery_discharge_depth'], 14)  # reserve released at 16 + 2
+        self.assertTrue(ex.min_soc_hold)
+        ex.tick(S(19), at(50))
+        self.assertFalse(ex.min_soc_hold)
+
+    def test_no_min_soc_hold_when_freeze_ends_higher(self):
+        ex = self.frozen()
+        ex.tick(S(40), at(0))
+        ex.submit(Command(Mode.AUTO))
+        ex.tick(S(40), at(1))
+        self.assertFalse(ex.min_soc_hold)
+
+
 class ExecutorSnapshotTest(unittest.TestCase):
     def test_snapshot_fields(self):
-        ex = control.Executor(control.ControlConfig('shadow', 19.0, 18.5))
+        ex = control.Executor(control.ControlConfig('shadow', 19.0, 18.5, 14))
         ex.submit(charge(3000, 80))
         ex.tick(S(50), NOW)
         ex.reject('invalid JSON: x')
@@ -715,6 +802,7 @@ class ExecutorSnapshotTest(unittest.TestCase):
         self.assertEqual(snap['since'], NOW.isoformat())
         self.assertEqual(snap['command_error'], 'invalid JSON: x')
         self.assertTrue(snap['shadow'])
+        self.assertIsNone(snap['freeze_floor'])
 
     def test_accepted_command_clears_command_error(self):
         ex = control.Executor(CFG)
@@ -733,6 +821,11 @@ class ComputeWarningsTest(unittest.TestCase):
     def test_no_warnings(self):
         self.assertEqual(control.compute_warnings({'soc_upper_limit': 100, 'work_mode': 3}, [False] * 4, 25, 3), [])
         self.assertEqual(control.compute_warnings({}, None, None, None), [])
+
+    def test_min_soc_hold_warning(self):
+        self.assertEqual(control.compute_warnings({}, None, None, None, min_soc_hold=14),
+                         ['discharge may stay blocked until SoC reaches 19% (the inverter resumes 5 points '
+                          'above its minimum SoC after a freeze)'])
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -748,6 +841,8 @@ CHARGE_TARGET_HYSTERESIS = 3
 RESERVE_HYSTERESIS = 2
 RESERVE_WARN_BELOW = 20
 OFF_GRID_RELEASE = timedelta(seconds=60)
+FLOOR_STEP = 3  # freeze floor follows a rising SoC in steps of this many points
+INVERTER_RESUME_MARGIN = 5  # inverter discharges again only this far above its minimum SoC
 
 
 class _Debounce:
@@ -791,6 +886,9 @@ class Executor:
         self._reserve_deb = _Debounce()
         self._off_grid = False
         self._on_grid_since: Optional[datetime] = None
+        self._last_soc: Optional[float] = None
+        self._floor: Optional[int] = None
+        self._min_soc_hold = False
 
     # --- inputs ---------------------------------------------------------
     def submit(self, cmd: Command) -> None:
@@ -825,8 +923,18 @@ class Executor:
     def reserve(self) -> Optional[int]:
         return self._reserve
 
+    @property
+    def last_soc(self) -> Optional[float]:
+        return self._last_soc
+
+    @property
+    def min_soc_hold(self) -> bool:
+        return self._min_soc_hold
+
     # --- decision -------------------------------------------------------
     def tick(self, sample: Sample, now: datetime) -> dict:
+        if sample.soc is not None:
+            self._last_soc = sample.soc
         active, reason = self._active(now)  # always: keeps expiry running off-grid too
         if self._update_off_grid(sample.off_grid, now):
             # Backup side depends on the battery: never keep a current at 0.
@@ -834,11 +942,32 @@ class Executor:
         else:
             mode, reason = self._targets(active, sample, now, reason)
             mode, reason = self._apply_reserve(mode, sample, now, reason)
+        if mode is Mode.FREEZE_CHARGE and self._last_soc is None:
+            # A guessed floor above the real SoC would make the inverter's DoD
+            # Holding charge from the grid.
+            mode, reason = Mode.AUTO, 'waiting for SoC'
+        self._update_floor(mode)
         power = self._clamp(active.power_w if active is not None and mode in POWERED_MODES else None, mode, sample)
         if mode is not self._effective or self._since is None:
             self._since = now
         self._effective, self._reason, self._power_applied = mode, reason, power
         return self._settings(mode, power)
+
+    def _update_floor(self, mode: Mode) -> None:
+        min_soc, soc = self._config.min_soc, self._last_soc
+        if mode is Mode.FREEZE_CHARGE:
+            whole = int(soc)
+            if self._floor is None:
+                self._floor = max(min_soc, whole)
+            elif whole >= self._floor + FLOOR_STEP:
+                self._floor = whole  # keep surplus PV charge; never lowered
+            self._min_soc_hold = False
+            return
+        if self._floor is not None and soc is not None and soc < min_soc + INVERTER_RESUME_MARGIN:
+            self._min_soc_hold = True
+        elif soc is not None and soc >= min_soc + INVERTER_RESUME_MARGIN:
+            self._min_soc_hold = False
+        self._floor = None
 
     def _update_off_grid(self, off_grid: bool, now: datetime) -> bool:
         if off_grid:
@@ -933,14 +1062,16 @@ class Executor:
         return clamped
 
     def _settings(self, mode: Mode, power: Optional[int]) -> dict:
-        c, d = self._config.charge_current_a, self._config.discharge_current_a
-        return {
-            Mode.AUTO: {'ems_mode': EMS_AUTO, 'ems_power_limit': 0, 'battery_charge_current': c, 'battery_discharge_current': d},
-            Mode.CHARGE: {'ems_mode': EMS_CHARGE_BATTERY, 'ems_power_limit': power, 'battery_charge_current': c, 'battery_discharge_current': d},
-            Mode.EXPORT: {'ems_mode': EMS_DISCHARGE_PV, 'ems_power_limit': power, 'battery_charge_current': c, 'battery_discharge_current': d},
-            Mode.FREEZE_CHARGE: {'ems_mode': EMS_AUTO, 'ems_power_limit': 0, 'battery_charge_current': c, 'battery_discharge_current': 0},
-            Mode.FREEZE_EXPORT: {'ems_mode': EMS_AUTO, 'ems_power_limit': 0, 'battery_charge_current': 0, 'battery_discharge_current': d},
+        c, d, m = self._config.charge_current_a, self._config.discharge_current_a, self._config.min_soc
+        ems, limit, charge_a, depth = {
+            Mode.AUTO: (EMS_AUTO, 0, c, m),
+            Mode.CHARGE: (EMS_CHARGE_BATTERY, power, c, m),
+            Mode.EXPORT: (EMS_DISCHARGE_PV, power, c, m),
+            Mode.FREEZE_CHARGE: (EMS_AUTO, 0, c, self._floor),
+            Mode.FREEZE_EXPORT: (EMS_AUTO, 0, 0, m),
         }[mode]
+        return {'ems_mode': ems, 'ems_power_limit': limit, 'battery_charge_current': charge_a,
+                'battery_discharge_current': d, 'battery_discharge_depth': depth}
 
     # --- reporting ------------------------------------------------------
     def snapshot(self, now: datetime) -> dict:
@@ -964,11 +1095,12 @@ class Executor:
             'command_error': self._command_error,
             'shadow': self._config.mode == 'shadow',
             'off_grid': self._off_grid,
+            'freeze_floor': self._floor,
         }
 
 
 def compute_warnings(readback: dict, eco_slots_enabled: Optional[list], reserve: Optional[int],
-                     initial_work_mode: Optional[int]) -> list:
+                     initial_work_mode: Optional[int], min_soc_hold: Optional[int] = None) -> list:
     warnings = []
     upper = readback.get('soc_upper_limit')
     if upper is not None and upper != 100:
@@ -981,6 +1113,9 @@ def compute_warnings(readback: dict, eco_slots_enabled: Optional[list], reserve:
             warnings.append(f'eco slot {i} is enabled')
     if reserve is not None and reserve < RESERVE_WARN_BELOW:
         warnings.append(f'reserve {reserve}% is below {RESERVE_WARN_BELOW}% (BMS SoC is unreliable there)')
+    if min_soc_hold is not None:
+        warnings.append(f'discharge may stay blocked until SoC reaches {min_soc_hold + INVERTER_RESUME_MARGIN}% '
+                        f'(the inverter resumes {INVERTER_RESUME_MARGIN} points above its minimum SoC after a freeze)')
     return warnings
 ```
 
@@ -993,7 +1128,7 @@ Expected: all PASS. If `test_single_garbage_soc_sample_does_not_latch` fails, ch
 
 ```bash
 git add control.py tests/test_control.py
-git commit -m "Add control executor: precedence, scoped stops, SoC targets, reserve, clamp
+git commit -m "Add control executor: precedence, scoped stops, SoC targets, freeze floor, reserve, clamp
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1030,9 +1165,10 @@ since the repo root is on sys.path in both).
 """
 import asyncio
 
-USER = {'battery_charge_current': 19.0, 'battery_discharge_current': 18.5}
+USER = {'battery_charge_current': 19.0, 'battery_discharge_current': 18.5, 'battery_discharge_depth': 14}
 AUTO = {'ems_mode': 1, 'ems_power_limit': 0, **USER}
-FREEZE_EXPORT = {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 0, 'battery_discharge_current': 18.5}
+FREEZE_EXPORT = {**AUTO, 'battery_charge_current': 0}
+FREEZE_CHARGE_60 = {**AUTO, 'battery_discharge_depth': 60}
 CHARGE_2K = {'ems_mode': 11, 'ems_power_limit': 2000, **USER}
 
 
@@ -1100,7 +1236,8 @@ import unittest
 from datetime import date
 
 import control_io
-from tests.control_fakes import AUTO, CHARGE_2K, FREEZE_EXPORT, Clock, FakeInverter, base_values, run_steps
+from tests.control_fakes import (AUTO, CHARGE_2K, FREEZE_CHARGE_60, FREEZE_EXPORT, Clock, FakeInverter, base_values,
+                                 run_steps)
 
 
 class WriteOrderTest(unittest.TestCase):
@@ -1115,6 +1252,18 @@ class WriteOrderTest(unittest.TestCase):
                          ['battery_charge_current', 'ems_mode', 'ems_power_limit'])
         self.assertEqual(control_io.write_order(CHARGE_2K, FREEZE_EXPORT),
                          ['ems_power_limit', 'ems_mode', 'battery_charge_current'])
+
+    def test_floor_raised_first_and_lowered_last(self):
+        self.assertEqual(control_io.write_order(FREEZE_CHARGE_60, CHARGE_2K),
+                         ['battery_discharge_depth', 'ems_mode', 'ems_power_limit'])
+        self.assertEqual(control_io.write_order(CHARGE_2K, FREEZE_CHARGE_60),
+                         ['ems_power_limit', 'ems_mode', 'battery_discharge_depth'])
+        self.assertEqual(control_io.write_order(FREEZE_EXPORT, FREEZE_CHARGE_60),
+                         ['battery_charge_current', 'battery_discharge_depth'])
+
+    def test_unknown_floor_readback_counts_as_restricting(self):
+        self.assertEqual(control_io.write_order(AUTO, {**AUTO, 'battery_discharge_depth': None}),
+                         ['battery_discharge_depth'])
 
     def test_current_tolerance(self):
         self.assertEqual(control_io.write_order(AUTO, {**AUTO, 'battery_charge_current': 19.02}), [])
@@ -1163,10 +1312,8 @@ class ControlWriterTest(unittest.TestCase):
         run_steps(w, clock, FREEZE_EXPORT, 12)  # error at t=9, back-off until t=69
         self.assertIsNotNone(w.last_error)
         writes_before = len(inv.writes)
-        freeze_charge = {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 19.0,
-                         'battery_discharge_current': 0}
-        run_steps(w, clock, freeze_charge, 0)  # one step
-        self.assertEqual(inv.writes[writes_before:], [('battery_discharge_current', 0)])
+        run_steps(w, clock, FREEZE_CHARGE_60, 0)  # one step
+        self.assertEqual(inv.writes[writes_before:], [('battery_discharge_depth', 60)])
 
     def test_failed_reads_are_skipped_and_no_write_without_readback_change(self):
         clock, inv, w = self.make(base_values())
@@ -1180,6 +1327,12 @@ class ControlWriterTest(unittest.TestCase):
         clock, inv, w = self.make(base_values(battery_charge_current=0.0, ems_mode=3, ems_power_limit=1000))
         run_steps(w, clock, AUTO, 10)
         self.assertEqual(inv.writes, [('ems_mode', 1), ('ems_power_limit', 0), ('battery_charge_current', 19.0)])
+        self.assertTrue(w.applied(AUTO))
+
+    def test_startup_reverts_leftover_freeze_charge_floor(self):
+        clock, inv, w = self.make(base_values(battery_discharge_depth=60))
+        run_steps(w, clock, AUTO, 10)
+        self.assertEqual(inv.writes, [('battery_discharge_depth', 14)])
         self.assertTrue(w.applied(AUTO))
 
     def test_shadow_never_writes(self):
@@ -1237,6 +1390,7 @@ from control import EMS_AUTO, MODE_SETTINGS, REPORTED_SETTINGS
 logger = logging.getLogger(__name__)
 
 _CURRENTS = ('battery_charge_current', 'battery_discharge_current')
+_LIMITS = _CURRENTS + ('battery_discharge_depth',)
 _TOLERANCE = {name: 0.05 for name in _CURRENTS}
 
 
@@ -1246,17 +1400,25 @@ def _matches(name: str, want, have) -> bool:
     return abs(float(want) - float(have)) <= _TOLERANCE.get(name, 0)
 
 
+def _restricts(name: str, want, have) -> bool:
+    if name == 'battery_discharge_depth':
+        return have is None or float(want) > float(have)  # floor going up
+    return want == 0  # current going to 0
+
+
 def write_order(desired: dict, readback: dict) -> list:
-    """Differing settings in safe order: currents going to 0 first (enter a
-    freeze), then EMS (setpoint before mode when entering a forced mode, mode
-    before setpoint when going back to AUTO), then currents being restored."""
+    """Differing settings in safe order: restricting limits first (a current
+    going to 0, the minimum SoC going up - entering a freeze), then EMS
+    (setpoint before mode when entering a forced mode, mode before setpoint
+    when going back to AUTO), then relaxing limits (currents restored, the
+    minimum SoC lowered)."""
     differing = [n for n in MODE_SETTINGS if not _matches(n, desired[n], readback.get(n))]
-    to_zero = [n for n in _CURRENTS if n in differing and desired[n] == 0]
-    restore = [n for n in _CURRENTS if n in differing and desired[n] != 0]
+    restrict = [n for n in _LIMITS if n in differing and _restricts(n, desired[n], readback.get(n))]
+    relax = [n for n in _LIMITS if n in differing and n not in restrict]
     ems = [n for n in ('ems_mode', 'ems_power_limit') if n in differing]
     first = 'ems_mode' if desired['ems_mode'] == EMS_AUTO else 'ems_power_limit'
     ems.sort(key=lambda n: 0 if n == first else 1)
-    return to_zero + ems + restore
+    return restrict + ems + relax
 
 
 class ControlWriter:
@@ -1644,7 +1806,7 @@ import control_runtime
 from tests.control_fakes import Clock, FakeInverter, base_values
 
 T0 = datetime(2026, 9, 26, 14, 0, tzinfo=timezone(timedelta(hours=2)))
-CFG = control.ControlConfig('on', 19.0, 18.5)
+CFG = control.ControlConfig('on', 19.0, 18.5, 14)
 RUNTIME = {'battery_soc': 55, 'vbattery1': 195, 'battery_charge_limit': 18, 'battery_discharge_limit': 18}
 
 
@@ -1739,10 +1901,19 @@ class ControlRuntimeTest(unittest.TestCase):
         rt.set_override(control.make_override('freeze_charge', '', '', '30', T0))
         run(rt, clock, 5)
         self.assertEqual(mqtt.states[-1]['override']['mode'], 'freeze_charge')
-        self.assertIn(('battery_discharge_current', 0), inv.writes)
+        self.assertIn(('battery_discharge_depth', 55), inv.writes)
         rt.clear_override()
         run(rt, clock, 10)
         self.assertIsNone(mqtt.states[-1]['override'])
+
+    def test_min_soc_hold_warning_after_freeze_near_min(self):
+        clock, inv, mqtt, rt = make()
+        low = {**RUNTIME, 'battery_soc': 16}
+        rt.set_override(control.make_override('freeze_charge', '', '', '30', T0))
+        run(rt, clock, 2, data=low)
+        rt.clear_override()
+        run(rt, clock, 1, data=low)
+        self.assertIn('discharge may stay blocked until SoC reaches 19%', ' '.join(mqtt.states[-1]['warnings']))
 
     def test_step_never_raises(self):
         clock, inv, mqtt, rt = make()
@@ -1890,7 +2061,8 @@ class ControlRuntime:
             'applied': writer.applied(desired) if writer is not None else False,
             'registers': readback,
             'last_error': (writer.last_error if writer is not None else None) or snap['command_error'],
-            'warnings': compute_warnings(readback, self._eco_enabled, self.executor.reserve, self._initial_work_mode),
+            'warnings': compute_warnings(readback, self._eco_enabled, self.executor.reserve, self._initial_work_mode,
+                                         self._config.min_soc if self.executor.min_soc_hold else None),
             'writes_today': writer.writes_today if writer is not None else 0,
         })
         return state
@@ -2130,7 +2302,7 @@ Expected: all PASS (existing tests unaffected with `CONTROL_MODE` unset).
 
 - [ ] **Step 5: Manual dry-run check**
 
-Run: `CONTROL_MODE=shadow CONTROL_CHARGE_CURRENT_A=19 CONTROL_DISCHARGE_CURRENT_A=19 python main.py --dry-run` and open the LAN URL (e.g. http://192.168.1.x:5000/control/state).
+Run: `CONTROL_MODE=shadow CONTROL_CHARGE_CURRENT_A=19 CONTROL_DISCHARGE_CURRENT_A=19 CONTROL_MIN_SOC=14 python main.py --dry-run` and open the LAN URL (e.g. http://192.168.1.x:5000/control/state).
 Expected: `{}` (no inverter loop in dry-run), log line `Battery control enabled in shadow mode`. Then `CONTROL_MODE=bogus python main.py --dry-run` must exit with `ValueError: CONTROL_MODE must be off, shadow or on`.
 
 - [ ] **Step 6: Commit**
@@ -2269,15 +2441,17 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 # Battery control from Predbat/other optimizers via MQTT (see MQTT_TOPICS.md).
 # off (default) | shadow (publish decisions, never write) | on
 CONTROL_MODE=off
-# Your normal inverter battery current limits (A), restored after every freeze.
-# Required when CONTROL_MODE is not off.
+# Your normal inverter battery current limits (A) and on-grid minimum SoC (%,
+# the "battery_discharge_depth" setting; SolarGo shows it as DoD = 100 - this),
+# restored after every freeze. Required when CONTROL_MODE is not off.
 CONTROL_CHARGE_CURRENT_A=
 CONTROL_DISCHARGE_CURRENT_A=
+CONTROL_MIN_SOC=
 CONTROL_MAX_BATTERY_W=3400
 CONTROL_MAX_WRITES_PER_DAY=300
 ```
 
-- [ ] **Step 2: `README.MD`** - add a "Battery control" section after the MQTT bridge section: what `CONTROL_MODE` does, the five modes with a one-line behaviour each (copy the spec's measured-behaviour table), the fail-safe rules (expiry → auto, restart → auto, no inverter watchdog so a dead Pi leaves the last mode), "disable eco slots before `on`", "use the dashboard override to `auto` before changing settings in SolarGo", and a link to `MQTT_TOPICS.md`.
+- [ ] **Step 2: `README.MD`** - add a "Battery control" section after the MQTT bridge section: what `CONTROL_MODE` does, the five modes with a one-line behaviour each (copy the spec's measured-behaviour table), the fail-safe rules (expiry → auto, restart → auto, off-grid → auto, no inverter watchdog so a dead Pi leaves the last mode), that `CONTROL_MIN_SOC` replaces setting the on-grid DoD in SolarGo while control is on (the executor rewrites it), "disable eco slots before `on`", "use the dashboard override to `auto` before changing settings in SolarGo", and a link to `MQTT_TOPICS.md`.
 
 - [ ] **Step 3: `MQTT_TOPICS.md`** - add sections:
 
@@ -2293,6 +2467,8 @@ CONTROL_MAX_WRITES_PER_DAY=300
 | `mode` | `auto`, `charge`, `export`, `freeze_charge`, `freeze_export` |
 | `power_w` | required for `charge`/`export`; clamped to 100 W … min(`CONTROL_MAX_BATTERY_W`, live BMS limit) |
 | `target_soc` | optional for `charge`/`export`: charge → `freeze_charge` once reached; export → `auto` once reached |
+
+`freeze_charge` raises the on-grid minimum SoC (`battery_discharge_depth`) to the current SoC (never below `CONTROL_MIN_SOC`) and follows a rising SoC in 3-point steps; before the first SoC reading it stays `auto` (`reason: waiting for SoC`). The inverter only discharges again 5 points above its minimum, so a freeze ending near `CONTROL_MIN_SOC` shows a warning.
 | `ttl_s` / `expires_at` | one required unless `mode` is `auto`; max 3600 s / 60 min ahead. Re-send before it runs out (Predbat: `repeat: true`) |
 | `stop` | with `mode: auto` only: `charge` or `export` - clears the current command only if it is in that domain |
 | `source`, `id` | free text, echoed in the state |
@@ -2309,12 +2485,14 @@ Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or be
 {"mode": "charge", "effective_mode": "freeze_charge", "power_w": 3000, "power_applied_w": 3000,
  "power_clamped": false, "target_soc": 80, "source": "predbat", "expires_at": "2026-09-26T15:10:00+02:00",
  "since": "2026-09-26T14:58:12+02:00", "override": null, "reserve_soc": 25, "reason": "target_soc reached",
- "shadow": false, "applied": true, "last_error": null, "warnings": [], "writes_today": 14,
+ "shadow": false, "off_grid": false, "freeze_floor": 80, "applied": true, "last_error": null, "warnings": [],
+ "writes_today": 14,
  "registers": {"ems_mode": 1, "ems_power_limit": 0, "battery_charge_current": 19.0,
-               "battery_discharge_current": 0, "soc_upper_limit": 100, "work_mode": 3}}
+               "battery_discharge_current": 19.0, "battery_discharge_depth": 80, "soc_upper_limit": 100,
+               "work_mode": 3}}
 ```
 
-`applied` is true only when the last read-back of all four mode settings matches what `effective_mode` needs.
+`applied` is true only when the last read-back of all five mode settings matches what `effective_mode` needs. `off_grid` is true during a grid outage (and 60 s after it), when everything is held at `auto`.
 
 ## Home Assistant + Predbat example
 
@@ -2408,7 +2586,7 @@ Predbat `apps.yaml` (custom inverter section):
 Battery model settings from the spec: `best_soc_min` 20 % and `best_soc_keep` 25 % of `soc_max`, `set_charge_low_power` / `set_export_low_power` on.
 ````
 
-- [ ] **Step 4: `CHANGELOG.md`** - add an "Unreleased" entry: "Battery control executor (off by default): MQTT `control/set`/`control/reserve/set`/`control/state`, dashboard override, `CONTROL_*` env keys. No behaviour change unless `CONTROL_MODE` is set."
+- [ ] **Step 4: `CHANGELOG.md`** - add an "Unreleased" entry: "Battery control executor (off by default): MQTT `control/set`/`control/reserve/set`/`control/state`, dashboard override, `CONTROL_*` env keys (`CONTROL_MIN_SOC` new: the executor owns the on-grid minimum SoC). No behaviour change unless `CONTROL_MODE` is set."
 
 - [ ] **Step 5: Commit**
 
@@ -2427,21 +2605,21 @@ No code. Each step needs the user present; stop and ask before any step that wri
 
 - [ ] **Step 1: Deploy with control off.** Merge the PR, `git pull` on `raspberry4.local` in `/home/piomar/goodwe_manager/` (check `git status` first - the checkout has local changes), `systemctl --user restart goodwe_manager`. Expected: dashboard unchanged, no `control/state` topic.
 
-- [ ] **Step 2: Shadow.** Set in `.env`: `CONTROL_MODE=shadow`, `CONTROL_CHARGE_CURRENT_A=19`, `CONTROL_DISCHARGE_CURRENT_A=19`; restart. Deploy the HA MQTT entities and `script.goodwe_control` from `MQTT_TOPICS.md` in the `home-assistant-raspberry4` repo; point Predbat's `apps.yaml` at the service templates and set Predbat to control mode (not read-only). Use Predbat's manual plan overrides to force, one after another: charge, freeze charge, export, freeze export, demand. Expected for each: `control/state.effective_mode` and `registers` show the matching desired values, `applied` stays `false` (shadow never writes), `writes_today` stays 0, Predbat's paired stop/start calls don't change `effective_mode` between cycles. About an hour.
+- [ ] **Step 2: Shadow.** Set in `.env`: `CONTROL_MODE=shadow`, `CONTROL_CHARGE_CURRENT_A=19`, `CONTROL_DISCHARGE_CURRENT_A=19`, `CONTROL_MIN_SOC=14` (the value currently set on the inverter); restart. Deploy the HA MQTT entities and `script.goodwe_control` from `MQTT_TOPICS.md` in the `home-assistant-raspberry4` repo; point Predbat's `apps.yaml` at the service templates and set Predbat to control mode (not read-only). Use Predbat's manual plan overrides to force, one after another: charge, freeze charge, export, freeze export, demand. Expected for each: `control/state.effective_mode` and `registers` show the matching desired values, `applied` stays `false` (shadow never writes), `writes_today` stays 0, Predbat's paired stop/start calls don't change `effective_mode` between cycles. About an hour.
 
 - [ ] **Step 3: Disable eco slots** on the `/eco` page (user action); check `control/state.warnings` has no eco-slot entries.
 
 - [ ] **Step 4: Live acceptance** (user present, PV surplus preferred). Set `CONTROL_MODE=on`, restart, and with Predbat paused (read-only) publish by hand from the Pi (`mosquitto_pub -h <broker> -t goodwe/control/set -q 1 -m '<json>'`), 60 s per check:
   1. `{"mode":"charge","power_w":1000,"ttl_s":300,"source":"test"}` → battery ≈ −1000 W, `applied` true within ~10 s.
   2. `{"mode":"export","power_w":1000,"ttl_s":300,"source":"test"}` → battery ≈ +1000 W.
-  3. `{"mode":"freeze_charge","ttl_s":300,"source":"test"}` → no discharge.
+  3. `{"mode":"freeze_charge","ttl_s":300,"source":"test"}` → no discharge; `registers.battery_discharge_depth` = `freeze_floor` = SoC (whole %), currents stay 19 A. After it, `battery_discharge_depth` back to 14.
   4. `{"mode":"freeze_export","ttl_s":300,"source":"test"}` → no charging, surplus exported.
-  5. `{"mode":"charge","power_w":1000,"ttl_s":60,"source":"test"}` then wait 70 s → back to `auto`, currents at 19 A.
+  5. `{"mode":"charge","power_w":1000,"ttl_s":60,"source":"test"}` then wait 70 s → back to `auto`, currents at 19 A, `battery_discharge_depth` 14.
   6. `{"mode":"freeze_export","ttl_s":600,"source":"test"}` then `systemctl --user restart goodwe_manager` → within ~10 s of restart `auto` + user currents.
   7. Dashboard override `freeze_charge` 15 min while sending `export` commands → override wins, state shows both.
-  8. **Grid-breaker test** (user at the breaker, evening or load > PV, SoC well above DoD): first confirm the Pi and the Wi-Fi dongle are powered from the backup circuit. Set `freeze_charge` (`ttl_s` 600), then switch the inverter's grid breaker off. Watch the backup loads and the log: `control/state.off_grid` true within a few seconds, currents back to 19 A, battery supplying the backup side. Note whether the backup side stayed powered *before* the restore landed - if it dropped, the inverter honours the 0 A limit off-grid and freeze charge must use another mechanism before going `on`. Switch the breaker back on; after the inverter reconnects and 60 s pass, `off_grid` false and `freeze_charge` back.
+  8. **Grid-breaker regression test** (user at the breaker, evening or load > PV, SoC well above 14 %; same procedure as the 2026-09-26 spike: grid restored first, house switched to the backup output, then the grid breaker dropped). Set `freeze_charge` (`ttl_s` 600), check `battery_discharge_depth` = floor, then drop the breaker. Expected: backup side stays powered throughout (the floor-based freeze is safe off-grid by itself), `control/state.off_grid` true within a few seconds, `battery_discharge_depth` back to 14 and `reason` `off-grid`, battery supplying the house. Switch the breaker back on; after ~80 s Check mode, the reconnect and 60 s more, `off_grid` false and `freeze_charge` back with a floor from the SoC at that moment.
   Record results in the notes file.
 
 - [ ] **Step 5: Enable Predbat control** (Predbat out of read-only) and watch the first charge/export window; check `writes_today` at the end of the day (expected 20-60).
 
-- [ ] **Step 6: Later (after a week stable):** lower the inverter DoD (`battery_discharge_depth`) and let the Predbat-driven reserve manage the floor; add the HA alert "`bridge/status` offline while `control/state.effective_mode != auto`".
+- [ ] **Step 6: Later (after a week stable):** lower `CONTROL_MIN_SOC` (the executor owns `battery_discharge_depth`; SolarGo changes to it are reverted) and let the Predbat-driven reserve manage the floor; add the HA alert "`bridge/status` offline while `control/state.effective_mode != auto`".

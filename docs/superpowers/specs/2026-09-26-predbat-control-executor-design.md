@@ -107,7 +107,7 @@ there is only ever one UDP client.
    read-back, writes only differing registers in a fixed order, schedules a
    verification read 3 s later, retries up to 3 times per register, then
    reports an error. Reads the control registers every 10 s (and after
-   writes) - six single-register reads (the four mode settings plus
+   writes) - seven single-register reads (the five mode settings plus
    `soc_upper_limit` and `work_mode`), interleaved with polling.
 3. **`mqtt_bridge.py`** (extended). Subscribes to `control/set` and
    `control/reserve/set` on (re)connect; a reader task parses JSON and hands
