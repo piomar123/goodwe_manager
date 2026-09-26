@@ -156,6 +156,19 @@
       <a href="/eco" class="btn btn-success">Eco Config</a>
     </div>
   </div>
+  {% if control_state %}
+  <h2 class="mt-4">Battery control (read-only)</h2>
+  <table class="table table-sm w-auto">
+    <tr><th>Effective mode</th><td>{{ control_state['effective_mode'] }}</td></tr>
+    <tr><th>Applied</th><td>{{ 'yes' if control_state['applied'] else 'no' }}</td></tr>
+    {% for name, value in control_state['registers'].items() %}
+    <tr><th><code>{{ name }}</code></th><td>{{ value }}</td></tr>
+    {% endfor %}
+    {% for w in control_state['warnings'] %}
+    <tr><th>Warning</th><td class="text-warning">{{ w }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
 </div>
 
 <script>
