@@ -118,6 +118,7 @@ class ControlWriter:
             except Exception as e:
                 self.last_error = f'{name}: write failed: {e}'
                 logger.warning(f'Control write {name} failed: {e}')
+                break  # the rest of the order may rely on this one - retry it all after verification
         self._verify_at = self._next_read = now + self._verify_delay
 
     async def _read_all(self, now: float) -> None:

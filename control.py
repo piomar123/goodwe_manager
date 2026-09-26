@@ -7,6 +7,7 @@ docs/superpowers/notes/2026-09-26-predbat-control-path-brainstorm-state.md
 for the measured inverter behaviour every rule here is based on.
 """
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -212,6 +213,7 @@ RESERVE_WARN_BELOW = 20
 OFF_GRID_RELEASE = timedelta(seconds=60)
 FLOOR_STEP = 3  # freeze floor follows a rising SoC in steps of this many points
 INVERTER_RESUME_MARGIN = 5  # inverter discharges again only this far above its minimum SoC
+CLAMP_STEP_W = 100  # BMS clamp granularity - voltage jitter must not rewrite the setpoint
 
 
 class _Debounce:
@@ -253,9 +255,11 @@ class Executor:
         self._reset_latches()
         self._reserve_latched = False
         self._reserve_deb = _Debounce()
+        self._reserve_release_deb = _Debounce()
         self._off_grid = False
         self._on_grid_since: Optional[datetime] = None
         self._last_soc: Optional[float] = None
+        self._soc_window: deque = deque()  # (time, soc) of the last TARGET_DEBOUNCE
         self._floor: Optional[int] = None
         self._min_soc_hold = False
 
@@ -287,6 +291,7 @@ class Executor:
         self._reserve = soc
         self._reserve_latched = False
         self._reserve_deb.reset()
+        self._reserve_release_deb.reset()
 
     @property
     def reserve(self) -> Optional[int]:
@@ -304,6 +309,9 @@ class Executor:
     def tick(self, sample: Sample, now: datetime) -> dict:
         if sample.soc is not None:
             self._last_soc = sample.soc
+            self._soc_window.append((now, sample.soc))
+        while self._soc_window and now - self._soc_window[0][0] > TARGET_DEBOUNCE:
+            self._soc_window.popleft()
         active, reason = self._active(now)  # always: keeps expiry running off-grid too
         if self._update_off_grid(sample.off_grid, now):
             # Backup side depends on the battery: never keep a current at 0.
@@ -322,10 +330,17 @@ class Executor:
         self._effective, self._reason, self._power_applied = mode, reason, power
         return self._settings(mode, power)
 
+    def _steady_soc(self) -> float:
+        """Lowest SoC of the last TARGET_DEBOUNCE (last known if none): a
+        single garbage high sample must never set a floor above the real SoC
+        (DoD Holding would then charge from the grid); a garbage low one only
+        makes the floor more permissive."""
+        return min(soc for _, soc in self._soc_window) if self._soc_window else self._last_soc
+
     def _update_floor(self, mode: Mode) -> None:
         min_soc, soc = self._config.min_soc, self._last_soc
         if mode is Mode.FREEZE_CHARGE:
-            whole = int(soc)
+            whole = int(self._steady_soc())
             if self._floor is None:
                 self._floor = max(min_soc, whole)
             elif whole >= self._floor + FLOOR_STEP:
@@ -358,6 +373,7 @@ class Executor:
     def _reset_latches(self) -> None:
         self._charge_latched = self._export_latched = False
         self._charge_deb, self._export_deb = _Debounce(), _Debounce()
+        self._charge_release_deb = _Debounce()
         self._fresh = True  # first SoC sample of a new command skips the debounce
 
     def _active(self, now: datetime):
@@ -385,9 +401,10 @@ class Executor:
             return active.mode, reason
         if active.mode is Mode.CHARGE:
             if self._charge_latched:
-                if soc is not None and soc < target - CHARGE_TARGET_HYSTERESIS:
+                if soc is not None and self._charge_release_deb.update(soc < target - CHARGE_TARGET_HYSTERESIS, now):
                     self._charge_latched = False
                     self._charge_deb.reset()
+                    self._charge_release_deb.reset()
                     return Mode.CHARGE, reason
                 return Mode.FREEZE_CHARGE, 'target_soc reached'
             if (fresh and soc >= target) or self._charge_deb.update(soc >= target, now):
@@ -405,12 +422,14 @@ class Executor:
         if mode is not Mode.AUTO or self._reserve is None:
             self._reserve_latched = False
             self._reserve_deb.reset()
+            self._reserve_release_deb.reset()
             return mode, reason
         soc = sample.soc
         if self._reserve_latched:
-            if soc is not None and soc >= self._reserve + RESERVE_HYSTERESIS:
+            if soc is not None and self._reserve_release_deb.update(soc >= self._reserve + RESERVE_HYSTERESIS, now):
                 self._reserve_latched = False
                 self._reserve_deb.reset()
+                self._reserve_release_deb.reset()
                 return mode, reason
             return Mode.FREEZE_CHARGE, 'reserve'
         if soc is not None and self._reserve_deb.update(soc <= self._reserve, now):
@@ -425,8 +444,12 @@ class Executor:
         limit = self._config.max_battery_w
         amps = sample.bms_charge_limit_a if mode is Mode.CHARGE else sample.bms_discharge_limit_a
         if amps and sample.battery_v and amps > 0 and sample.battery_v > 0:
-            limit = min(limit, int(amps * sample.battery_v))
+            limit = min(limit, int(amps * sample.battery_v) // CLAMP_STEP_W * CLAMP_STEP_W)
         clamped = max(MIN_POWER_W, min(power, limit))
+        prev = self._power_applied
+        if (clamped != power and prev is not None and prev <= power and mode is self._effective
+                and abs(clamped - prev) <= CLAMP_STEP_W):
+            clamped = prev  # a limit hovering at a step boundary must not flip the setpoint
         self._clamped = clamped != power
         return clamped
 

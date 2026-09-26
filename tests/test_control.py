@@ -226,6 +226,19 @@ class ExecutorPowerTest(unittest.TestCase):
         ex.submit(Command(Mode.EXPORT, 3400, None, 'p', at(600)))
         self.assertEqual(ex.tick(S(50, 190.0, 18.0, 10.0), NOW)['ems_power_limit'], 1900)
 
+    def test_voltage_jitter_does_not_change_the_clamped_power(self):
+        ex = control.Executor(CFG)
+        ex.submit(charge(3000))
+        powers = {ex.tick(S(50, v, 10.0, 10.0), at(i))['ems_power_limit']
+                  for i, v in enumerate([190.0, 190.1, 189.9, 190.2, 189.95, 190.0])}
+        self.assertEqual(powers, {1900})
+
+    def test_clamp_follows_a_real_bms_drop(self):
+        ex = control.Executor(CFG)
+        ex.submit(charge(3000))
+        ex.tick(S(50, 190.0, 10.0, 10.0), at(0))
+        self.assertEqual(ex.tick(S(50, 190.0, 9.0, 10.0), at(1))['ems_power_limit'], 1700)
+
     def test_raised_to_minimum(self):
         ex = control.Executor(CFG)
         ex.submit(charge(20))
@@ -249,8 +262,17 @@ class ExecutorTargetsTest(unittest.TestCase):
         ex.submit(charge(target=50))
         ex.tick(S(60), NOW)  # already met on first sample -> freeze at once
         self.assertEqual(ex.tick(S(48), at(10))['battery_discharge_depth'], 60)  # floor never goes down
-        desired = ex.tick(S(46), at(20))
+        self.assertEqual(ex.tick(S(46), at(20))['ems_mode'], 1)  # release is debounced too
+        desired = ex.tick(S(46), at(50))
         self.assertEqual((desired['ems_mode'], desired['battery_discharge_depth']), (11, 14))
+
+    def test_single_low_sample_does_not_release_the_charge_hold(self):
+        ex = control.Executor(CFG)
+        ex.submit(charge(target=80))
+        ex.tick(S(80), at(0))
+        self.assertEqual(ex.tick(S(0), at(5))['ems_mode'], 1)
+        self.assertEqual(ex.tick(S(80), at(10))['battery_discharge_depth'], 80)
+        self.assertEqual(ex.tick(S(80), at(60))['battery_discharge_depth'], 80)
 
     def test_hold_charge_target_below_soc_applies_immediately(self):
         ex = control.Executor(CFG)
@@ -303,7 +325,17 @@ class ExecutorReserveTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(25), at(31))['battery_discharge_depth'], 25)
         self.assertEqual(ex.snapshot(at(31))['reason'], 'reserve')
         self.assertEqual(ex.tick(S(26), at(40))['battery_discharge_depth'], 25)
-        self.assertEqual(ex.tick(S(27), at(50))['battery_discharge_depth'], 14)
+        self.assertEqual(ex.tick(S(27), at(50))['battery_discharge_depth'], 25)  # release is debounced too
+        self.assertEqual(ex.tick(S(27), at(80))['battery_discharge_depth'], 14)
+
+    def test_single_high_sample_does_not_release_the_reserve(self):
+        ex = control.Executor(CFG)
+        ex.set_reserve(25)
+        ex.tick(S(25), at(0))
+        ex.tick(S(25), at(30))
+        self.assertEqual(ex.tick(S(100), at(35))['battery_discharge_depth'], 25)
+        self.assertEqual(ex.tick(S(25), at(40))['battery_discharge_depth'], 25)
+        self.assertEqual(ex.tick(S(25), at(70))['battery_discharge_depth'], 25)
 
     def test_reserve_does_not_touch_forced_modes(self):
         ex = control.Executor(CFG)
@@ -398,9 +430,24 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
         ex = self.frozen()
         ex.tick(S(55), at(0))
         self.assertEqual(ex.tick(S(57.9), at(10))['battery_discharge_depth'], 55)
-        self.assertEqual(ex.tick(S(58.2), at(20))['battery_discharge_depth'], 58)
-        self.assertEqual(ex.tick(S(56), at(30))['battery_discharge_depth'], 58)
-        self.assertEqual(ex.tick(S(None), at(40))['battery_discharge_depth'], 58)
+        self.assertEqual(ex.tick(S(58.2), at(20))['battery_discharge_depth'], 55)  # 55 still in the last 30 s
+        self.assertEqual(ex.tick(S(58.5), at(41))['battery_discharge_depth'], 58)
+        self.assertEqual(ex.tick(S(56), at(50))['battery_discharge_depth'], 58)
+        self.assertEqual(ex.tick(S(None), at(60))['battery_discharge_depth'], 58)
+
+    def test_single_high_sample_does_not_raise_the_floor(self):
+        ex = control.Executor(CFG)
+        ex.submit(charge(target=80))
+        ex.tick(S(81), at(0))
+        ex.tick(S(100), at(5))
+        self.assertEqual(ex.tick(S(81), at(10))['battery_discharge_depth'], 81)
+        self.assertEqual(ex.tick(S(81), at(60))['battery_discharge_depth'], 81)
+
+    def test_floor_entry_ignores_a_single_high_sample(self):
+        ex = control.Executor(CFG)
+        ex.tick(S(60), at(0))
+        ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
+        self.assertEqual(ex.tick(S(100), at(5))['battery_discharge_depth'], 60)
 
     def test_floor_never_below_min_soc(self):
         ex = self.frozen()
@@ -435,9 +482,10 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
         ex.tick(S(16), at(0))
         self.assertEqual(ex.tick(S(16), at(30))['battery_discharge_depth'], 16)
         self.assertFalse(ex.min_soc_hold)
-        self.assertEqual(ex.tick(S(18), at(40))['battery_discharge_depth'], 14)  # reserve released at 16 + 2
+        ex.tick(S(18), at(40))
+        self.assertEqual(ex.tick(S(18), at(70))['battery_discharge_depth'], 14)  # reserve released at 16 + 2
         self.assertTrue(ex.min_soc_hold)
-        ex.tick(S(19), at(50))
+        ex.tick(S(19), at(80))
         self.assertFalse(ex.min_soc_hold)
 
     def test_no_min_soc_hold_when_freeze_ends_higher(self):

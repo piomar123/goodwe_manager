@@ -33,6 +33,7 @@ class FakeInverter:
         self.delay = delay
         self.writes = []
         self.failing = set()
+        self.failing_writes = set()
 
     async def read_setting(self, name):
         if name in self.failing:
@@ -46,6 +47,8 @@ class FakeInverter:
 
     async def write_setting(self, name, value):
         self.writes.append((name, value))
+        if name in self.failing_writes:
+            raise TimeoutError('no response')
         self.pending.append((self.clock.t + self.delay, name, value))
 
 

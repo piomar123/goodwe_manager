@@ -86,6 +86,13 @@ class ControlWriterTest(unittest.TestCase):
         run_steps(w, clock, FREEZE_CHARGE_60, 0)  # one step
         self.assertEqual(inv.writes[writes_before:], [('battery_discharge_depth', 60)])
 
+    def test_failed_write_stops_the_rest_of_the_order(self):
+        clock, inv, w = self.make(base_values())
+        inv.failing_writes = {'ems_power_limit'}
+        run_steps(w, clock, CHARGE_2K, 0)  # one step
+        self.assertEqual(inv.writes, [('ems_power_limit', 2000)])  # never ems_mode 11 on a stale setpoint
+        self.assertIn('ems_power_limit', w.last_error)
+
     def test_failed_reads_are_skipped_and_no_write_without_readback_change(self):
         clock, inv, w = self.make(base_values())
         run_steps(w, clock, AUTO, 2)
