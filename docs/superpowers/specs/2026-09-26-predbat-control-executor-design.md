@@ -170,6 +170,8 @@ executor substitutes a mode (SoC target reached, reserve, override).
 Order of precedence each tick:
 
 1. **Disabled** (`CONTROL_MODE=off`): no writes, no subscriptions.
+1a. **Off-grid** (see below) → `auto` with user currents, above everything
+   else including the override.
 2. **Override** active (dashboard) → its mode; MQTT commands are recorded but
    not applied (`state.override` shows mode and end time).
 3. **Command expired** (or none) → `auto`.
@@ -207,6 +209,38 @@ a different value is shown as a warning, not changed).
 
 Write order: EMS mode first when leaving a forced mode, setpoint first when
 entering one; currents last when leaving a freeze, first when entering one.
+
+## Off-grid (grid outage)
+
+The 1-year history has 18 outage days, several of them hours long
+(13 h on 22-23 Apr 2026). A freeze during an outage is dangerous:
+`freeze_charge` (discharge current 0) could leave the backup circuits
+without battery power, `freeze_export` (charge current 0) blocks PV from
+charging the battery that the house now depends on.
+
+- Detection from the runtime sample: `grid_mode` ≠ 1 (0 Not connected,
+  2 Fault) or runtime `work_mode` = 2 (Normal Off-Grid). Seen in the
+  history as `grid_mode` 2 with `work_mode` 2.
+- Entering is immediate (no debounce): desired becomes `auto` with user
+  currents, reason `off-grid`, state `off_grid: true`. Commands keep being
+  recorded and expiring; the override and reserve are suspended.
+- Leaving needs 60 s of on-grid samples in a row (the inverter itself
+  waits before reconnecting; avoids flapping), then normal rules resume.
+- The writer treats any change of desired values as a fresh start (clears
+  retry counters, back-off and pending verification), so an off-grid
+  restore is written on the next tick even after earlier write failures.
+- Off-grid, the battery may go below the software reserve - that is what
+  the reserve is for; `battery_discharge_depth_offline` stays the hard floor.
+- **Open risk, to be tested live before `on`:** whether the inverter
+  honours `battery_discharge_current` = 0 in off-grid mode at all. If it
+  does and the Pi or the Wi-Fi dongle is not powered from the backup
+  circuit, a grid failure during `freeze_charge` at night could black out
+  the backup side before the executor can react. The live acceptance
+  includes a supervised grid-breaker test; if the backup side drops, freeze
+  charge must move to another mechanism before going `on`.
+- Predbat has no notion of off-grid: it keeps planning and sending commands
+  (if HA is still up). The executor's off-grid rule overrides them; the
+  only Predbat-side outage feature is the Meteoalarm `keep` pre-charge.
 
 ## Fail-safe
 
