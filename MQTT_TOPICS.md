@@ -1,7 +1,7 @@
 # MQTT topics published by the optional bridge
 
-Reference for the topics/payloads `mqtt_bridge.py` publishes when
-`MQTT_HOST` is set (see README.MD's "MQTT bridge" section for setup).
+Reference for the topics/payloads `mqtt_bridge.py` publishes (and, for
+battery control, subscribes to) when `MQTT_HOST` is set (see README.MD's "MQTT bridge" section for setup).
 Every topic is prefixed with `MQTT_TOPIC_PREFIX` (default `goodwe`) -
 paths below omit the prefix for brevity, e.g. `telemetry` is really
 published to `goodwe/telemetry`.
@@ -195,6 +195,135 @@ mqtt:
       payload_off: "offline"
       device_class: connectivity
 ```
+
+## `control/set` (subscribed, QoS 1, not retained) - only when `CONTROL_MODE` is `shadow` or `on`
+
+```json
+{"mode": "charge", "power_w": 3000, "target_soc": 80, "source": "predbat", "ttl_s": 900}
+```
+
+| Field | Meaning |
+|---|---|
+| `mode` | `auto`, `charge`, `export`, `freeze_charge`, `freeze_export` |
+| `power_w` | required for `charge`/`export`; clamped to 100 W … min(`CONTROL_MAX_BATTERY_W`, live BMS limit) |
+| `target_soc` | optional for `charge`/`export`: charge → `freeze_charge` once reached; export → `auto` once reached |
+
+`freeze_charge` raises the on-grid minimum SoC (`battery_discharge_depth`) to the current SoC (never below `CONTROL_MIN_SOC`) and follows a rising SoC in 3-point steps; before the first SoC reading it stays `auto` (`reason: waiting for SoC`). The inverter only discharges again 5 points above its minimum, so a freeze ending near `CONTROL_MIN_SOC` shows a warning.
+| `ttl_s` / `expires_at` | one required unless `mode` is `auto`; max 3600 s / 60 min ahead. Re-send before it runs out (Predbat: `repeat: true`) |
+| `stop` | with `mode: auto` only: `charge` or `export` - clears the current command only if it is in that domain |
+| `source`, `id` | free text, echoed in the state |
+
+Invalid commands are rejected (the current one stays) and reported in `control/state.last_error`.
+
+## `control/reserve/set` (subscribed, retained)
+
+Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or below it (for 30 s) switches to `freeze_charge` until SoC is 2 points above.
+
+## `control/state` (retained, on change and every 10 s)
+
+```json
+{"mode": "charge", "effective_mode": "freeze_charge", "power_w": 3000, "power_applied_w": 3000,
+ "power_clamped": false, "target_soc": 80, "source": "predbat", "expires_at": "2026-09-26T15:10:00+02:00",
+ "since": "2026-09-26T14:58:12+02:00", "override": null, "reserve_soc": 25, "reason": "target_soc reached",
+ "shadow": false, "off_grid": false, "freeze_floor": 80, "applied": true, "last_error": null, "warnings": [],
+ "writes_today": 14,
+ "registers": {"ems_mode": 1, "ems_power_limit": 0, "battery_charge_current": 19.0,
+               "battery_discharge_current": 19.0, "battery_discharge_depth": 80, "soc_upper_limit": 100,
+               "work_mode": 3}}
+```
+
+`applied` is true only when the last read-back of all five mode settings matches what `effective_mode` needs. `off_grid` is true during a grid outage (and 60 s after it), when everything is held at `auto`.
+
+## Home Assistant + Predbat example
+
+```yaml
+mqtt:
+  sensor:
+    - name: "Goodwe Control Mode"
+      unique_id: goodwe_control_mode
+      state_topic: "goodwe/control/state"
+      value_template: "{{ value_json.effective_mode }}"
+      json_attributes_topic: "goodwe/control/state"
+  binary_sensor:
+    - name: "Goodwe Control Applied"
+      unique_id: goodwe_control_applied
+      state_topic: "goodwe/control/state"
+      value_template: "{{ 'ON' if value_json.applied else 'OFF' }}"
+  number:
+    - name: "Goodwe Reserve"
+      unique_id: goodwe_reserve
+      command_topic: "goodwe/control/reserve/set"
+      state_topic: "goodwe/control/state"
+      value_template: "{{ value_json.reserve_soc | int(0) }}"
+      min: 0
+      max: 100
+      unit_of_measurement: "%"
+      retain: true
+
+script:
+  goodwe_control:
+    alias: "GoodWe control command"
+    fields:
+      mode: {}
+      power: {}
+      target_soc: {}
+      stop: {}
+    sequence:
+      - action: mqtt.publish
+        data:
+          topic: "goodwe/control/set"
+          qos: 1
+          payload: >-
+            {{ {'mode': mode, 'source': 'predbat', 'ttl_s': 900}
+               | combine({'power_w': power | int} if power is defined and power not in ('', None) else {})
+               | combine({'target_soc': target_soc | int} if target_soc is defined and target_soc not in ('', None) else {})
+               | combine({'stop': stop} if stop is defined and stop else {})
+               | to_json }}
+```
+
+Predbat `apps.yaml` (custom inverter section):
+
+```yaml
+  inverter:
+    has_target_soc: true
+    support_charge_freeze: true
+    support_discharge_freeze: true
+    charge_control_immediate: true
+    has_timed_pause: false
+  reserve: number.goodwe_reserve
+  charge_start_service:
+    service: script.goodwe_control
+    mode: charge
+    power: "{power}"
+    target_soc: "{target_soc}"
+    repeat: true
+  charge_freeze_service:
+    service: script.goodwe_control
+    mode: freeze_charge
+    repeat: true
+  charge_stop_service:
+    service: script.goodwe_control
+    mode: auto
+    stop: charge
+    repeat: true
+  discharge_start_service:
+    service: script.goodwe_control
+    mode: export
+    power: "{power}"
+    target_soc: "{target_soc}"
+    repeat: true
+  discharge_freeze_service:
+    service: script.goodwe_control
+    mode: freeze_export
+    repeat: true
+  discharge_stop_service:
+    service: script.goodwe_control
+    mode: auto
+    stop: export
+    repeat: true
+```
+
+Battery model settings from the spec: `best_soc_min` 20 % and `best_soc_keep` 25 % of `soc_max`, `set_charge_low_power` / `set_export_low_power` on.
 
 ## Failure behavior
 

@@ -3,8 +3,8 @@ control.py
 Optimizer-neutral battery control executor - pure logic, no I/O. Turns
 commands (MQTT or dashboard) plus runtime samples into desired values for
 the inverter's control settings. See
-docs/superpowers/specs/2026-09-26-predbat-control-executor-design.md for
-the measured inverter behaviour every rule here is based on.
+docs/superpowers/notes/2026-09-26-predbat-control-path-brainstorm-state.md
+for the measured inverter behaviour every rule here is based on.
 """
 import json
 from dataclasses import dataclass
