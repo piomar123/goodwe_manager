@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-26-predbat-control-executor-design.md` (read it first; measured inverter behaviour and the reasons behind every rule are there and in `docs/superpowers/notes/2026-09-26-predbat-control-path-brainstorm-state.md`).
 
-**Executed 2026-09-26/27.** Changes made after the review are in the code and spec, not in this plan's code blocks: the freeze floor uses the lowest SoC of the last 30 s; charge-hold and reserve releases are debounced for 30 s; the power clamp is `CONTROL_MAX_BATTERY_W` only (the live BMS limit is reported, not applied); a failed write stops the rest of the write order; going off-grid clears the writer's back-off; the daily write counter survives reconnects.
+**Executed 2026-09-26/27.** Changes made after the review are in the code and spec, not in this plan's code blocks: the freeze floor uses the lowest SoC of the last 30 s; charge-hold and reserve releases are debounced for 30 s; the power clamp is `CONTROL_MAX_BATTERY_W` only (the live BMS limit is reported, not applied); a failed write stops the rest of the write order; going off-grid clears the writer's back-off; the writer's counters, retries and back-off survive reconnects and the back-off doubles up to 1 h; freeze_charge needs 3 SoC samples and the SoC window always keeps the last 3; a power_w-only change or an MQTT command during an override keeps the hold latches; `CONTROL_MAX_BATTERY_W` defaults to 3600.
 
 ## Global Constraints
 

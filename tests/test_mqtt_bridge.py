@@ -394,6 +394,21 @@ class MqttBridgeControlTest(unittest.TestCase):
             self.assertIsNone(bridge._client)
         asyncio.run(go())
 
+    def test_cancelled_subscribe_drops_the_client(self):
+        async def go():
+            client = FakeMqttClient()
+
+            async def slow(*a, **kw):
+                await asyncio.sleep(10)
+            client.subscribe = slow
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            bridge.set_control_handler(lambda s, p: None)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(bridge.connect(), timeout=0.01)
+            self.assertIsNone(bridge._client)  # next publish reconnects and re-subscribes
+            self.assertTrue(client.disconnected)
+        asyncio.run(go())
+
     def test_publish_control_state_is_retained(self):
         async def go():
             client = FakeMqttClient()

@@ -48,7 +48,7 @@ class ControlRuntime:
         self._writer = ControlWriter(inverter, shadow=self._config.mode == 'shadow',
                                      max_writes_per_day=self._config.max_writes_per_day, now_fn=self._mono)
         if old is not None:
-            self._writer.carry_counters_from(old)
+            self._writer.carry_state_from(old)
         self._next_eco = 0.0
 
     def on_mqtt_message(self, topic_suffix: str, payload: bytes) -> None:

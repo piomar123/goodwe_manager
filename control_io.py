@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _CURRENTS = ('battery_charge_current', 'battery_discharge_current')
 _LIMITS = _CURRENTS + ('battery_discharge_depth',)
 _TOLERANCE = {name: 0.05 for name in _CURRENTS}
+MAX_BACKOFF_S = 3600.0  # a register that acks but never takes the value: ~3 writes an hour, not a minute
 
 
 def _matches(name: str, want, have) -> bool:
@@ -61,6 +62,7 @@ class ControlWriter:
         self._verify_delay = verify_delay_s
         self._max_attempts = max_attempts
         self._error_backoff = error_backoff_s
+        self._backoff_s = error_backoff_s  # doubles per failed round, up to MAX_BACKOFF_S
         self.readback: dict = {}
         self.last_error: Optional[str] = None
         self.writes_today = 0
@@ -78,11 +80,15 @@ class ControlWriter:
         values didn't change."""
         self._attempts.clear()
         self._backoff_until = None
+        self._backoff_s = self._error_backoff
         self._verify_at = None
 
-    def carry_counters_from(self, other: 'ControlWriter') -> None:
-        """Keep the daily write count across inverter reconnects."""
+    def carry_state_from(self, other: 'ControlWriter') -> None:
+        """Keep the daily write count, retries and back-off across inverter
+        reconnects - a flaky link must not buy a stuck register fresh writes."""
         self._today, self.writes_today, self._warned_writes = other._today, other.writes_today, other._warned_writes
+        self._attempts, self._backoff_until, self._backoff_s = dict(other._attempts), other._backoff_until, other._backoff_s
+        self._last_desired, self.last_error = other._last_desired, other.last_error
 
     def applied(self, desired: Optional[dict]) -> bool:
         return desired is not None and all(_matches(n, desired[n], self.readback.get(n)) for n in MODE_SETTINGS)
@@ -98,12 +104,11 @@ class ControlWriter:
             # New target (e.g. off-grid restore): start fresh - don't let a
             # back-off or pending verification from the old target delay it.
             self._last_desired = dict(desired)
-            self._attempts.clear()
-            self._backoff_until = None
-            self._verify_at = None
+            self.restart()
         if self.applied(desired):
             self._attempts.clear()
             self._backoff_until = None
+            self._backoff_s = self._error_backoff
             self.last_error = None
             return
         if self._shadow:
@@ -119,7 +124,8 @@ class ControlWriter:
                 self.last_error = (f'{name}: not applied after {attempts} attempts '
                                    f'(wanted {desired[name]}, read {self.readback.get(name)})')
                 logger.warning(f'Control write failed: {self.last_error}')
-                self._backoff_until = now + self._error_backoff
+                self._backoff_until = now + self._backoff_s
+                self._backoff_s = min(self._backoff_s * 2, MAX_BACKOFF_S)
                 self._attempts.clear()
                 return
             self._attempts[name] = attempts + 1

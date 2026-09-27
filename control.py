@@ -148,7 +148,7 @@ class ControlConfig:
     charge_current_a: float
     discharge_current_a: float
     min_soc: int  # normal battery_discharge_depth, restored whenever not frozen
-    max_battery_w: int = 3400
+    max_battery_w: int = 3600
     max_writes_per_day: int = 300
 
 
@@ -176,7 +176,7 @@ def config_from_env(env: Mapping[str, str]) -> Optional[ControlConfig]:
         raise ValueError('CONTROL_MIN_SOC must be 0-100')
 
     return ControlConfig(mode, current('CONTROL_CHARGE_CURRENT_A'), current('CONTROL_DISCHARGE_CURRENT_A'), min_soc,
-                         int(env.get('CONTROL_MAX_BATTERY_W') or 3400),
+                         int(env.get('CONTROL_MAX_BATTERY_W') or 3600),
                          int(env.get('CONTROL_MAX_WRITES_PER_DAY') or 300))
 
 
@@ -216,6 +216,7 @@ RESERVE_HYSTERESIS = 2
 RESERVE_WARN_BELOW = 20
 OFF_GRID_RELEASE = timedelta(seconds=60)
 FLOOR_STEP = 3  # freeze floor follows a rising SoC in steps of this many points
+MIN_FLOOR_SAMPLES = 3  # freeze floor needs this many SoC samples (startup, after reconnect gaps)
 INVERTER_RESUME_MARGIN = 5  # inverter discharges again only this far above its minimum SoC
 
 
@@ -274,11 +275,12 @@ class Executor:
             if self._command is not None and self._command.mode in STOP_DOMAINS[cmd.stop]:
                 self._clear_command('stopped by ' + cmd.source)
             return
-        if cmd.same_request(self._command):
-            self._command = cmd  # refresh expiry/id, keep latches
-            return
+        old = self._command
         self._command = cmd
-        self._reset_latches()
+        if old is not None and (cmd.mode, cmd.target_soc, cmd.source) == (old.mode, old.target_soc, old.source):
+            return  # a re-send (or only power_w changed, e.g. low-power rates): keep the hold
+        if self._override is None:  # while overridden, the latches belong to the override
+            self._reset_latches()
 
     def reject(self, error: str) -> None:
         self._command_error = error
@@ -314,7 +316,9 @@ class Executor:
         if sample.soc is not None:
             self._last_soc = sample.soc
             self._soc_window.append((now, sample.soc))
-        while self._soc_window and now - self._soc_window[0][0] > TARGET_DEBOUNCE:
+        # By age, but always keep the last few: after a reading gap the first
+        # (possibly garbage) sample must not be the only one the floor sees.
+        while len(self._soc_window) > MIN_FLOOR_SAMPLES and now - self._soc_window[0][0] > TARGET_DEBOUNCE:
             self._soc_window.popleft()
         active, reason = self._active(now)  # always: keeps expiry running off-grid too
         if self._update_off_grid(sample.off_grid, now):
@@ -323,7 +327,7 @@ class Executor:
         else:
             mode, reason = self._targets(active, sample, now, reason)
             mode, reason = self._apply_reserve(mode, sample, now, reason)
-        if mode is Mode.FREEZE_CHARGE and self._last_soc is None:
+        if mode is Mode.FREEZE_CHARGE and self._floor is None and len(self._soc_window) < MIN_FLOOR_SAMPLES:
             # A guessed floor above the real SoC would make the inverter's DoD
             # Holding charge from the grid.
             mode, reason = Mode.AUTO, 'waiting for SoC'
@@ -342,7 +346,7 @@ class Executor:
         single garbage high sample must never set a floor above the real SoC
         (DoD Holding would then charge from the grid); a garbage low one only
         makes the floor more permissive."""
-        return min(soc for _, soc in self._soc_window) if self._soc_window else self._last_soc
+        return min(soc for _, soc in self._soc_window)
 
     def _update_floor(self, mode: Mode) -> None:
         min_soc, soc = self._config.min_soc, self._last_soc
@@ -375,7 +379,8 @@ class Executor:
     def _clear_command(self, reason: str) -> None:
         self._command = None
         self._idle_reason = reason
-        self._reset_latches()
+        if self._override is None:
+            self._reset_latches()
 
     def _reset_latches(self) -> None:
         self._charge_latched = self._export_latched = False

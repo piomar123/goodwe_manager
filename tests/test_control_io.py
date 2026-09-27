@@ -78,6 +78,20 @@ class ControlWriterTest(unittest.TestCase):
         run_steps(w, clock, FREEZE_EXPORT, 20)  # t=62..82
         self.assertGreater(len(inv.writes), writes_before)  # retried after 60 s
 
+    def test_register_that_never_reads_back_is_written_rarely(self):
+        clock, inv, w = self.make(base_values(), delay=10**9)
+        run_steps(w, clock, FREEZE_EXPORT, 6 * 3600, tick=5.0)
+        self.assertLess(len(inv.writes), 40)  # back-off doubles up to an hour, not 3 writes a minute
+
+    def test_state_carried_to_a_new_writer_keeps_the_backoff(self):
+        clock, inv, w = self.make(base_values(), delay=10**9)
+        run_steps(w, clock, FREEZE_EXPORT, 12)  # error, back-off
+        w2 = control_io.ControlWriter(inv, now_fn=clock, shadow=False)
+        w2.carry_state_from(w)
+        writes_before = len(inv.writes)
+        run_steps(w2, clock, FREEZE_EXPORT, 20)
+        self.assertEqual(len(inv.writes), writes_before)
+
     def test_new_desired_bypasses_backoff(self):
         clock, inv, w = self.make(base_values(), delay=10_000)
         run_steps(w, clock, FREEZE_EXPORT, 12)  # error at t=9, back-off until t=69

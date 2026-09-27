@@ -114,13 +114,18 @@ class MqttBridge:
         if self._control_handler is not None and self._client is client:
             try:
                 await self._subscribe_control(client)
-            except Exception as e:
-                logger.warning(f'Could not subscribe to control topics: {e}')
+            except BaseException as e:
+                # Also on cancellation (callers wrap publishes in wait_for):
+                # a connected client without the control subscription would
+                # never re-subscribe, since later publishes succeed.
+                logger.warning(f'Could not subscribe to control topics: {e!r}')
                 self._client = None
                 try:
                     await client.__aexit__(None, None, None)
                 except Exception as close_error:
                     logger.debug(f'Error closing MQTT client after failed subscribe: {close_error}')
+                if not isinstance(e, Exception):
+                    raise
 
     async def publish_offline_and_disconnect(self) -> None:
         """Explicit offline publish before a clean disconnect - the MQTT

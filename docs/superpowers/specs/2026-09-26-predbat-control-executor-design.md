@@ -301,7 +301,7 @@ on, and forced EMS modes have no meaning without the grid.
 | `CONTROL_CHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_charge_current`, e.g. 19.0 |
 | `CONTROL_DISCHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_discharge_current` |
 | `CONTROL_MIN_SOC` | - (required when not `off`) | normal on-grid minimum SoC % (`battery_discharge_depth`), e.g. 14 |
-| `CONTROL_MAX_BATTERY_W` | 3400 | power clamp |
+| `CONTROL_MAX_BATTERY_W` | 3600 | power clamp (the inverter enforces the live BMS limit itself) |
 | `CONTROL_MAX_WRITES_PER_DAY` | 300 | warning threshold |
 
 ## Dashboard override

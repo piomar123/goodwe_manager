@@ -108,7 +108,7 @@ class ConfigFromEnvTest(unittest.TestCase):
     def test_on_with_currents(self):
         cfg = control.config_from_env({'CONTROL_MODE': 'on', 'CONTROL_CHARGE_CURRENT_A': '19',
                                        'CONTROL_DISCHARGE_CURRENT_A': '18.5', 'CONTROL_MIN_SOC': '14'})
-        self.assertEqual(cfg, control.ControlConfig('on', 19.0, 18.5, 14, 3400, 300))
+        self.assertEqual(cfg, control.ControlConfig('on', 19.0, 18.5, 14, 3600, 300))
 
     def test_overrides(self):
         cfg = control.config_from_env({'CONTROL_MODE': 'shadow', 'CONTROL_CHARGE_CURRENT_A': '19',
@@ -163,6 +163,13 @@ def at(seconds: float) -> datetime:
     return NOW + timedelta(seconds=seconds)
 
 
+def warm(ex, soc):
+    """A few earlier SoC samples - freeze_charge waits for them before
+    setting a floor."""
+    for t in (-3, -2, -1):
+        ex.tick(S(soc), at(t))
+
+
 def charge(power=3000, target=None, minutes=15, source='predbat') -> Command:
     return Command(Mode.CHARGE, power, target, source, NOW + timedelta(minutes=minutes))
 
@@ -184,6 +191,7 @@ class ExecutorModesTest(unittest.TestCase):
         for cmd, expected in cases:
             with self.subTest(cmd.mode):
                 ex = control.Executor(CFG)
+                warm(ex, 50)
                 ex.submit(cmd)
                 self.assertEqual(tuple(ex.tick(S(50), NOW).values()), expected)
 
@@ -264,6 +272,7 @@ class ExecutorTargetsTest(unittest.TestCase):
 
     def test_charge_hold_hysteresis(self):
         ex = control.Executor(CFG)
+        warm(ex, 60)
         ex.submit(charge(target=50))
         ex.tick(S(60), NOW)  # already met on first sample -> freeze at once
         self.assertEqual(ex.tick(S(48), at(10))['battery_discharge_depth'], 60)  # floor never goes down
@@ -273,6 +282,7 @@ class ExecutorTargetsTest(unittest.TestCase):
 
     def test_single_low_sample_does_not_release_the_charge_hold(self):
         ex = control.Executor(CFG)
+        warm(ex, 80)
         ex.submit(charge(target=80))
         ex.tick(S(80), at(0))
         self.assertEqual(ex.tick(S(0), at(5))['ems_mode'], 1)
@@ -281,6 +291,7 @@ class ExecutorTargetsTest(unittest.TestCase):
 
     def test_hold_charge_target_below_soc_applies_immediately(self):
         ex = control.Executor(CFG)
+        warm(ex, 55)
         ex.submit(charge(target=40))
         self.assertEqual(ex.tick(S(55), NOW)['battery_discharge_depth'], 55)
 
@@ -311,7 +322,8 @@ class ExecutorTargetsTest(unittest.TestCase):
         ex.tick(S(70), at(0))
         ex.tick(S(80), at(1))
         ex.tick(S(None), at(20))
-        self.assertEqual(ex.tick(S(80), at(31))['battery_discharge_depth'], 80)
+        ex.tick(S(80), at(31))
+        self.assertEqual(ex.snapshot(at(31))['effective_mode'], 'freeze_charge')
 
     def test_new_command_resets_latch(self):
         ex = control.Executor(CFG)
@@ -357,9 +369,28 @@ class ExecutorReserveTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(10), at(60))['battery_discharge_depth'], 14)
 
 
+class ExecutorLatchKeepingTest(unittest.TestCase):
+    def test_power_change_keeps_the_charge_hold(self):
+        ex = control.Executor(CFG)
+        ex.submit(charge(3000, 80))
+        warm(ex, 80)
+        ex.tick(S(80), at(0))
+        ex.submit(charge(1500, 80))  # Predbat low-power rate changed
+        self.assertEqual(ex.tick(S(78), at(10))['ems_mode'], 1)
+
+    def test_mqtt_command_does_not_reset_the_override_hold(self):
+        ex = control.Executor(CFG)
+        ex.set_override(Command(Mode.CHARGE, 2000, 80, 'dashboard', at(900)))
+        warm(ex, 80)
+        ex.tick(S(80), at(0))
+        ex.submit(Command(Mode.EXPORT, 2000, None, 'predbat', at(900)))
+        self.assertEqual(ex.tick(S(78), at(10))['ems_mode'], 1)
+
+
 class ExecutorOverrideTest(unittest.TestCase):
     def test_override_wins_then_expires_back_to_command(self):
         ex = control.Executor(CFG)
+        warm(ex, 50)
         ex.submit(Command(Mode.EXPORT, 2000, None, 'predbat', at(3000)))
         ex.set_override(Command(Mode.FREEZE_CHARGE, source='dashboard', expires_at=at(900)))
         self.assertEqual(ex.tick(S(50), at(0))['battery_discharge_depth'], 50)
@@ -421,21 +452,24 @@ class ExecutorOffGridTest(unittest.TestCase):
 
 
 class ExecutorFreezeFloorTest(unittest.TestCase):
-    def frozen(self):
+    def frozen(self, soc=None):
         ex = control.Executor(CFG)
+        if soc is not None:
+            warm(ex, soc)
         ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
         return ex
 
     def test_floor_is_current_soc_rounded_down(self):
-        ex = self.frozen()
+        ex = self.frozen(55.7)
         self.assertEqual(ex.tick(S(55.7), NOW)['battery_discharge_depth'], 55)
         self.assertEqual(ex.snapshot(NOW)['freeze_floor'], 55)
 
     def test_floor_follows_rising_soc_in_3_point_steps_and_never_drops(self):
-        ex = self.frozen()
+        ex = self.frozen(55)
         ex.tick(S(55), at(0))
         self.assertEqual(ex.tick(S(57.9), at(10))['battery_discharge_depth'], 55)
         self.assertEqual(ex.tick(S(58.2), at(20))['battery_discharge_depth'], 55)  # 55 still in the last 30 s
+        ex.tick(S(58.3), at(30))
         self.assertEqual(ex.tick(S(58.5), at(41))['battery_discharge_depth'], 58)
         self.assertEqual(ex.tick(S(56), at(50))['battery_discharge_depth'], 58)
         self.assertEqual(ex.tick(S(None), at(60))['battery_discharge_depth'], 58)
@@ -448,9 +482,23 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(81), at(10))['battery_discharge_depth'], 81)
         self.assertEqual(ex.tick(S(81), at(60))['battery_discharge_depth'], 81)
 
+    def test_floor_after_a_reading_gap_ignores_a_single_high_sample(self):
+        ex = self.frozen()
+        for t in range(0, 10, 2):
+            ex.tick(S(50), at(t))
+        ex.tick(S(100), at(60))  # first sample after a reconnect gap
+        self.assertEqual(ex.tick(S(50), at(62))['battery_discharge_depth'], 50)
+
+    def test_first_sample_ever_high_does_not_set_the_floor(self):
+        ex = self.frozen()
+        self.assertEqual(ex.tick(S(100), at(0)), AUTO_SETTINGS)  # needs a few samples first
+        self.assertEqual(ex.snapshot(at(0))['reason'], 'waiting for SoC')
+        ex.tick(S(50), at(1))
+        self.assertEqual(ex.tick(S(50), at(2))['battery_discharge_depth'], 50)
+
     def test_floor_entry_ignores_a_single_high_sample(self):
         ex = control.Executor(CFG)
-        ex.tick(S(60), at(0))
+        warm(ex, 60)
         ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
         self.assertEqual(ex.tick(S(100), at(5))['battery_discharge_depth'], 60)
 
@@ -463,11 +511,13 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(None), at(0)), AUTO_SETTINGS)
         snap = ex.snapshot(at(0))
         self.assertEqual((snap['effective_mode'], snap['reason'], snap['freeze_floor']), ('auto', 'waiting for SoC', None))
-        self.assertEqual(ex.tick(S(40), at(1))['battery_discharge_depth'], 40)
+        ex.tick(S(40), at(1))
+        ex.tick(S(40), at(2))
+        self.assertEqual(ex.tick(S(40), at(3))['battery_discharge_depth'], 40)
 
     def test_last_known_soc_is_used_after_a_failed_read(self):
         ex = control.Executor(CFG)
-        ex.tick(S(62), at(0))
+        warm(ex, 62)
         ex.submit(Command(Mode.FREEZE_CHARGE, expires_at=at(3600)))
         self.assertEqual(ex.tick(S(None), at(1))['battery_discharge_depth'], 62)
         self.assertEqual(ex.last_soc, 62)
@@ -483,6 +533,7 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
 
     def test_min_soc_hold_after_a_freeze_near_min(self):
         ex = control.Executor(CFG)
+        warm(ex, 16)
         ex.set_reserve(16)
         ex.tick(S(16), at(0))
         self.assertEqual(ex.tick(S(16), at(30))['battery_discharge_depth'], 16)
