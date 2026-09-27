@@ -63,6 +63,18 @@ class ControlRoutesEnabledTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.runtime.set_override.assert_not_called()
 
+    def test_override_timeout_is_504_and_says_it_may_still_apply(self):
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def never_done(coro):
+            coro.close()
+            return future
+        with mock.patch.object(main.asyncio_thread, 'run_coroutine_threadsafe', side_effect=never_done), \
+                mock.patch.object(main, 'CONTROL_CALL_TIMEOUT_S', 0.01):
+            response = self.client.post('/control/override', data={'mode': 'auto', 'duration_min': '30'})
+        self.assertEqual(response.status_code, 504)
+        self.assertIn('may still apply', response.get_data(as_text=True))
+
     def test_clear(self):
         response = self.client.post('/control/override/clear')
         self.assertEqual(response.status_code, 302)

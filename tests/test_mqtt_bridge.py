@@ -367,6 +367,33 @@ class MqttBridgeControlTest(unittest.TestCase):
             await bridge.publish_offline_and_disconnect()
         asyncio.run(go())
 
+    def test_no_subscription_when_status_publish_fails(self):
+        async def go():
+            client = FakeMqttClient()
+
+            async def broken(*a, **kw):
+                raise ConnectionError('gone')
+            client.publish = broken
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            bridge.set_control_handler(lambda s, p: None)
+            await bridge.connect()
+            self.assertEqual(client.subscribed, [])
+        asyncio.run(go())
+
+    def test_failed_subscribe_closes_the_client(self):
+        async def go():
+            client = FakeMqttClient()
+
+            async def broken(*a, **kw):
+                raise ConnectionError('gone')
+            client.subscribe = broken
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            bridge.set_control_handler(lambda s, p: None)
+            await bridge.connect()
+            self.assertTrue(client.disconnected)
+            self.assertIsNone(bridge._client)
+        asyncio.run(go())
+
     def test_publish_control_state_is_retained(self):
         async def go():
             client = FakeMqttClient()

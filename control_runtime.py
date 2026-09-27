@@ -44,8 +44,11 @@ class ControlRuntime:
         """Called after every inverter (re)connect - the goodwe object is new
         each time, the executor (commands, override, reserve) is kept."""
         self._inverter = inverter
+        old = self._writer
         self._writer = ControlWriter(inverter, shadow=self._config.mode == 'shadow',
                                      max_writes_per_day=self._config.max_writes_per_day, now_fn=self._mono)
+        if old is not None:
+            self._writer.carry_counters_from(old)
         self._next_eco = 0.0
 
     def on_mqtt_message(self, topic_suffix: str, payload: bytes) -> None:
@@ -80,8 +83,11 @@ class ControlRuntime:
         now = self._now()
         desired = None
         try:
+            was_off_grid = self.executor.snapshot(now)['off_grid']
             desired = self.executor.tick(Sample.from_runtime(runtime_data), now)
             if self._writer is not None:
+                if self.executor.snapshot(now)['off_grid'] and not was_off_grid:
+                    self._writer.restart()  # the backup side can't wait out a back-off
                 await self._writer.step(desired)
                 if self._initial_work_mode is None:
                     self._initial_work_mode = self._writer.readback.get('work_mode')

@@ -124,6 +124,25 @@ class ControlRuntimeTest(unittest.TestCase):
         run(rt, clock, 1, data=low)
         self.assertIn('discharge may stay blocked until SoC reaches 19%', ' '.join(mqtt.states[-1]['warnings']))
 
+    def test_off_grid_onset_retries_a_backed_off_restore_at_once(self):
+        clock = Clock()
+        inv = FakeInverter(clock, base_values(battery_charge_current=0.0), delay=10_000)
+        rt = control_runtime.ControlRuntime(CFG, FakeMqtt(), now_fn=lambda: T0 + timedelta(seconds=clock.t),
+                                            mono_fn=clock)
+        rt.attach(inv)
+        run(rt, clock, 12)  # auto restore of the charge current fails, writer backs off
+        writes_before = len(inv.writes)
+        run(rt, clock, 0, data={**RUNTIME, 'grid_mode': 2, 'work_mode': 2})
+        self.assertEqual(inv.writes[writes_before:], [('battery_charge_current', 19.0)])
+
+    def test_write_counter_survives_an_inverter_reconnect(self):
+        clock, inv, mqtt, rt = make()
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 10)
+        rt.attach(inv)
+        run(rt, clock, 1)
+        self.assertEqual(mqtt.states[-1]['writes_today'], 2)
+
     def test_step_never_raises(self):
         clock, inv, mqtt, rt = make()
 

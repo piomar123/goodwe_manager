@@ -700,8 +700,21 @@ def update_config(setting: str):
     return flask.redirect('/config')
 
 
+CONTROL_CALL_TIMEOUT_S = 10
+
+
 async def _control_call(fn, *args):
     return fn(*args)
+
+
+def _run_control_call(fn, *args):
+    """Run fn on the asyncio loop; a timeout doesn't cancel it - the call
+    may still land once the loop catches up."""
+    try:
+        asyncio_thread.run_coroutine_threadsafe(_control_call(fn, *args)).result(timeout=CONTROL_CALL_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        return flask.Response('Control loop busy - the change may still apply in a moment', status=504)
+    return flask.redirect('/')
 
 
 def _require_control():
@@ -725,16 +738,14 @@ def set_control_override():
     except (control.CommandError, ValueError) as e:
         return flask.Response(f'Invalid override: {e}', status=400)
     logger.info(f'Dashboard override: {cmd}')
-    asyncio_thread.run_coroutine_threadsafe(_control_call(control_runtime_instance.set_override, cmd)).result(timeout=10)
-    return flask.redirect('/')
+    return _run_control_call(control_runtime_instance.set_override, cmd)
 
 
 @app.post('/control/override/clear')
 def clear_control_override():
     _require_control()
     logger.info('Dashboard override cleared')
-    asyncio_thread.run_coroutine_threadsafe(_control_call(control_runtime_instance.clear_override)).result(timeout=10)
-    return flask.redirect('/')
+    return _run_control_call(control_runtime_instance.clear_override)
 
 
 @app.get('/prices')

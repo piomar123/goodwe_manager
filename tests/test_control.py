@@ -31,6 +31,11 @@ class ParseCommandTest(unittest.TestCase):
         cmd = control.parse_command(cmd_json(mode='freeze_export', expires_at=utc), NOW)
         self.assertEqual(cmd.expires_at, NOW + timedelta(minutes=10))
 
+    def test_expires_at_with_z_suffix(self):
+        z = (NOW + timedelta(minutes=10)).astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        cmd = control.parse_command(cmd_json(mode='freeze_export', expires_at=z), NOW)
+        self.assertEqual(cmd.expires_at, NOW + timedelta(minutes=10))
+
     def test_auto_needs_no_expiry(self):
         cmd = control.parse_command(cmd_json(mode='auto', source='predbat', stop='charge'), NOW)
         self.assertEqual((cmd.mode, cmd.expires_at, cmd.stop), (Mode.AUTO, None, 'charge'))
@@ -55,6 +60,9 @@ class ParseCommandTest(unittest.TestCase):
             'negative ttl': cmd_json(mode='freeze_charge', ttl_s=-5),
             'bad stop': cmd_json(mode='auto', stop='everything'),
             'stop on non-auto': cmd_json(mode='charge', power_w=1000, ttl_s=60, stop='charge'),
+            'NaN power': '{"mode": "export", "power_w": NaN, "ttl_s": 60}',
+            'infinite target': '{"mode": "charge", "power_w": 1000, "target_soc": Infinity, "ttl_s": 60}',
+            'infinite ttl': '{"mode": "freeze_charge", "ttl_s": Infinity}',
         }
         for name, payload in cases.items():
             with self.subTest(name):
@@ -221,23 +229,20 @@ class ExecutorPowerTest(unittest.TestCase):
         self.assertEqual(ex.tick(S(50), NOW)['ems_power_limit'], 3400)
         self.assertTrue(ex.snapshot(NOW)['power_clamped'])
 
-    def test_clamped_to_live_bms_limit_per_direction(self):
+    def test_bms_limit_is_reported_not_applied(self):
+        # The inverter enforces the BMS limit itself; re-capping from the
+        # live limit only made the setpoint follow voltage jitter.
         ex = control.Executor(CFG)
-        ex.submit(Command(Mode.EXPORT, 3400, None, 'p', at(600)))
-        self.assertEqual(ex.tick(S(50, 190.0, 18.0, 10.0), NOW)['ems_power_limit'], 1900)
+        ex.submit(Command(Mode.EXPORT, 3000, None, 'p', at(600)))
+        self.assertEqual(ex.tick(S(50, 190.0, 18.0, 10.0), NOW)['ems_power_limit'], 3000)
+        snap = ex.snapshot(NOW)
+        self.assertFalse(snap['power_clamped'])
+        self.assertEqual((snap['bms_charge_limit_w'], snap['bms_discharge_limit_w']), (3420, 1900))
 
-    def test_voltage_jitter_does_not_change_the_clamped_power(self):
+    def test_bms_limit_unknown(self):
         ex = control.Executor(CFG)
-        ex.submit(charge(3000))
-        powers = {ex.tick(S(50, v, 10.0, 10.0), at(i))['ems_power_limit']
-                  for i, v in enumerate([190.0, 190.1, 189.9, 190.2, 189.95, 190.0])}
-        self.assertEqual(powers, {1900})
-
-    def test_clamp_follows_a_real_bms_drop(self):
-        ex = control.Executor(CFG)
-        ex.submit(charge(3000))
-        ex.tick(S(50, 190.0, 10.0, 10.0), at(0))
-        self.assertEqual(ex.tick(S(50, 190.0, 9.0, 10.0), at(1))['ems_power_limit'], 1700)
+        ex.tick(S(50), NOW)
+        self.assertEqual((ex.snapshot(NOW)['bms_charge_limit_w'], ex.snapshot(NOW)['bms_discharge_limit_w']), (None, None))
 
     def test_raised_to_minimum(self):
         ex = control.Executor(CFG)

@@ -7,6 +7,7 @@ docs/superpowers/notes/2026-09-26-predbat-control-path-brainstorm-state.md
 for the measured inverter behaviour every rule here is based on.
 """
 import json
+import math
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -64,8 +65,8 @@ class Command:
 
 
 def _number(value: Any, what: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise CommandError(f'{what} must be a number')
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise CommandError(f'{what} must be a finite number')
     return value
 
 
@@ -101,7 +102,10 @@ def parse_command(payload, now: datetime) -> Command:
     expires = None
     if data.get('expires_at') is not None:
         try:
-            expires = datetime.fromisoformat(data['expires_at'])
+            raw = data['expires_at']
+            if isinstance(raw, str) and raw.endswith('Z'):
+                raw = raw[:-1] + '+00:00'  # Python < 3.11 fromisoformat doesn't take 'Z'
+            expires = datetime.fromisoformat(raw)
         except (TypeError, ValueError):
             raise CommandError(f"invalid expires_at: {data['expires_at']!r}") from None
         if expires.tzinfo is None:
@@ -213,7 +217,6 @@ RESERVE_WARN_BELOW = 20
 OFF_GRID_RELEASE = timedelta(seconds=60)
 FLOOR_STEP = 3  # freeze floor follows a rising SoC in steps of this many points
 INVERTER_RESUME_MARGIN = 5  # inverter discharges again only this far above its minimum SoC
-CLAMP_STEP_W = 100  # BMS clamp granularity - voltage jitter must not rewrite the setpoint
 
 
 class _Debounce:
@@ -258,6 +261,7 @@ class Executor:
         self._reserve_release_deb = _Debounce()
         self._off_grid = False
         self._on_grid_since: Optional[datetime] = None
+        self._bms_limits_w: tuple = (None, None)  # informational only, never applied
         self._last_soc: Optional[float] = None
         self._soc_window: deque = deque()  # (time, soc) of the last TARGET_DEBOUNCE
         self._floor: Optional[int] = None
@@ -325,6 +329,9 @@ class Executor:
             mode, reason = Mode.AUTO, 'waiting for SoC'
         self._update_floor(mode)
         power = self._clamp(active.power_w if active is not None and mode in POWERED_MODES else None, mode, sample)
+        self._bms_limits_w = tuple(None if not (a and sample.battery_v and a > 0 and sample.battery_v > 0)
+                                   else int(a * sample.battery_v)
+                                   for a in (sample.bms_charge_limit_a, sample.bms_discharge_limit_a))
         if mode is not self._effective or self._since is None:
             self._since = now
         self._effective, self._reason, self._power_applied = mode, reason, power
@@ -441,15 +448,10 @@ class Executor:
         if power is None:
             self._clamped = False
             return None
-        limit = self._config.max_battery_w
-        amps = sample.bms_charge_limit_a if mode is Mode.CHARGE else sample.bms_discharge_limit_a
-        if amps and sample.battery_v and amps > 0 and sample.battery_v > 0:
-            limit = min(limit, int(amps * sample.battery_v) // CLAMP_STEP_W * CLAMP_STEP_W)
-        clamped = max(MIN_POWER_W, min(power, limit))
-        prev = self._power_applied
-        if (clamped != power and prev is not None and prev <= power and mode is self._effective
-                and abs(clamped - prev) <= CLAMP_STEP_W):
-            clamped = prev  # a limit hovering at a step boundary must not flip the setpoint
+        # Only the fixed config maximum: the inverter enforces the live BMS
+        # limit itself, and following it made the setpoint track voltage
+        # jitter (a write every second while the BMS tapers).
+        clamped = max(MIN_POWER_W, min(power, self._config.max_battery_w))
         self._clamped = clamped != power
         return clamped
 
@@ -487,6 +489,8 @@ class Executor:
             'command_error': self._command_error,
             'shadow': self._config.mode == 'shadow',
             'off_grid': self._off_grid,
+            'bms_charge_limit_w': self._bms_limits_w[0],
+            'bms_discharge_limit_w': self._bms_limits_w[1],
             'freeze_floor': self._floor,
         }
 

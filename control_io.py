@@ -72,6 +72,18 @@ class ControlWriter:
         self._warned_writes = False
         self._last_desired: Optional[dict] = None
 
+    def restart(self) -> None:
+        """Forget retries, back-off and pending verification - for events
+        (going off-grid) that must be written now even when the desired
+        values didn't change."""
+        self._attempts.clear()
+        self._backoff_until = None
+        self._verify_at = None
+
+    def carry_counters_from(self, other: 'ControlWriter') -> None:
+        """Keep the daily write count across inverter reconnects."""
+        self._today, self.writes_today, self._warned_writes = other._today, other.writes_today, other._warned_writes
+
     def applied(self, desired: Optional[dict]) -> bool:
         return desired is not None and all(_matches(n, desired[n], self.readback.get(n)) for n in MODE_SETTINGS)
 

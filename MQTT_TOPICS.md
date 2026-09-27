@@ -205,7 +205,7 @@ mqtt:
 | Field | Meaning |
 |---|---|
 | `mode` | `auto`, `charge`, `export`, `freeze_charge`, `freeze_export` |
-| `power_w` | required for `charge`/`export`; clamped to 100 W … min(`CONTROL_MAX_BATTERY_W`, live BMS limit) |
+| `power_w` | required for `charge`/`export`; clamped to 100 W … `CONTROL_MAX_BATTERY_W` (the inverter enforces the live BMS limit itself; `bms_charge_limit_w`/`bms_discharge_limit_w` in the state show it) |
 | `target_soc` | optional for `charge`/`export`: charge → `freeze_charge` once reached; export → `auto` once reached |
 
 `freeze_charge` raises the on-grid minimum SoC (`battery_discharge_depth`) to the current SoC (never below `CONTROL_MIN_SOC`) and follows a rising SoC in 3-point steps; before the first SoC reading it stays `auto` (`reason: waiting for SoC`). The inverter only discharges again 5 points above its minimum, so a freeze ending near `CONTROL_MIN_SOC` shows a warning.
@@ -223,7 +223,7 @@ Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or be
 
 ```json
 {"mode": "charge", "effective_mode": "freeze_charge", "power_w": 3000, "power_applied_w": 3000,
- "power_clamped": false, "target_soc": 80, "source": "predbat", "expires_at": "2026-09-26T15:10:00+02:00",
+ "power_clamped": false, "bms_charge_limit_w": 3420, "bms_discharge_limit_w": 3420, "target_soc": 80, "source": "predbat", "expires_at": "2026-09-26T15:10:00+02:00",
  "since": "2026-09-26T14:58:12+02:00", "override": null, "reserve_soc": 25, "reason": "target_soc reached",
  "shadow": false, "off_grid": false, "freeze_floor": 80, "applied": true, "last_error": null, "warnings": [],
  "writes_today": 14,

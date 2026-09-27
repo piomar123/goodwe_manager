@@ -132,8 +132,11 @@ there is only ever one UDP client.
 
 - `mode`: `auto | charge | export | freeze_charge | freeze_export`.
 - `power_w`: required for `charge`/`export`; clamped to
-  `[100, min(CONTROL_MAX_BATTERY_W, BMS limit A × battery V)]` (the BMS part rounded down to 100 W, held within one step so voltage jitter causes no writes); clamping is
-  reported in the state.
+  `[100, CONTROL_MAX_BATTERY_W]`; clamping is reported in the state. The live
+  BMS limit (A × battery V) is only reported (`bms_charge_limit_w`,
+  `bms_discharge_limit_w`), not applied: the inverter enforces it itself (in
+  the spike, CHARGE_PV with grid headroom held the battery at the BMS max),
+  and following it made the setpoint track voltage jitter.
 - `target_soc`: optional for `charge`/`export` (see SoC targets).
 - `expires_at` (ISO 8601 with offset) or `ttl_s` (seconds): one of them is
   required unless `mode` is `auto`; max 60 min ahead (Predbat re-sends each

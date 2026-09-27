@@ -93,6 +93,15 @@ class ControlWriterTest(unittest.TestCase):
         self.assertEqual(inv.writes, [('ems_power_limit', 2000)])  # never ems_mode 11 on a stale setpoint
         self.assertIn('ems_power_limit', w.last_error)
 
+    def test_restart_bypasses_backoff_for_the_same_desired(self):
+        clock, inv, w = self.make(base_values(battery_charge_current=0.0), delay=10_000)
+        run_steps(w, clock, AUTO, 12)  # restore fails 3 times, back-off until t=69
+        self.assertIsNotNone(w.last_error)
+        writes_before = len(inv.writes)
+        w.restart()
+        run_steps(w, clock, AUTO, 0)
+        self.assertEqual(inv.writes[writes_before:], [('battery_charge_current', 19.0)])
+
     def test_failed_reads_are_skipped_and_no_write_without_readback_change(self):
         clock, inv, w = self.make(base_values())
         run_steps(w, clock, AUTO, 2)
