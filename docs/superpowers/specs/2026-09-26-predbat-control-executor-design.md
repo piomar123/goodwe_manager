@@ -320,7 +320,7 @@ once working):
   target_soc, reserve), and an MQTT number for the reserve.
 - apps.yaml custom inverter: `has_target_soc: true`,
   `support_charge_freeze: true`, `support_discharge_freeze: true`,
-  `charge_control_immediate: true`, `has_timed_pause: false`,
+  `charge_control_immediate: false` (it means amps-based timed current control, not service control), `has_timed_pause: false`,
   reserve → the MQTT number.
 - Service templates with `repeat: true` call an HA script
   (`script.goodwe_control`) that builds the JSON and publishes it (HA's
