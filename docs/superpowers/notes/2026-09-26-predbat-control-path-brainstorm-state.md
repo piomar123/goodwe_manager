@@ -230,3 +230,26 @@ Next (waiting for user):
 - Other pending: PR 2 goodwe `inverter-time-sync` (docstring note: tz-aware datetimes written as-is, then show PR
   description); Pi cleanup (arp-probe.timer, ~/ems-spike); eco slot 1 disabled by user for the spike; suggest restarting
   `claude remote-control` via claude-piomar alias. gh: GH_CONFIG_DIR=~/.config/gh-piomar. HA token: read server-side only.
+
+## Live rollout (2026-09-28)
+
+- Pi runs branch `predbat-control-executor` (checkout of origin, `.env` backup `.env.bak-20260928`).
+- Shadow 11:12-15:55: Predbat commands (freeze_export 11:55, freeze_charge 13:00-14:00 floor 100, scoped stops,
+  forced manual export -> `export` power 3400 target 66) all interpreted correctly, 0 writes.
+- HA/Predbat wiring deployed (+ fix: scheduled_*_enable via template switches, Predbat rejects input_boolean).
+  set_reserve_min 20 (first set got lost to an apps.yaml reload - re-set, persisted). set_status_notify off.
+- HA alerting deployed: healthchecks.io heartbeat (1 min / grace 10 min, /fail when telemetry stale 10 min),
+  email via ha-alerts@piomar.me (ovh; dovecot 2.4 password-scheme bug fixed on the way) + mobile push,
+  offline queue. expire_after 120 s on goodwe telemetry (2026-09-27 wifi outage froze load_power 17 h).
+- CONTROL_MODE=on 15:57, acceptance via dashboard override API + HA mqtt.publish, Predbat read-only:
+  1. export 1000 -> battery +997 W, grid export +1 kW, ems 3/1000, applied. Re-sending: no extra writes.
+  2. charge 1000 -> battery -994 W (PV surplus, no import), ems 11/1000.
+  3. freeze_charge -> depth 99 = floor = SoC, currents 19 A, ems 1 (PV still charges; no-discharge not observable).
+  4. freeze_export -> charge current 0 A, battery ~0, full surplus exported, depth 14.
+  5. clear -> auto 19 A; MQTT charge ttl 60 -> ran, then `command expired` -> auto.
+  6. restart during freeze_export -> auto + 19 A 19 s after `systemctl restart` (incl. app start).
+  7. override freeze_charge + MQTT export -> mode export / eff freeze_charge, no writes; clear -> export ran, expired.
+  Observations: `applied` false for one poll after an expiry restore (read-back lag, fine); writes_today resets on
+  restart (daily cap not persistent - minor).
+- 16:18 Predbat read-only off -> live Predbat control. Pending: grid-breaker test (step 4.8), watch DoD Holding in a
+  freeze at floor 100, writes_today at day end (expect 20-60), first `charge` with power (22:00 window).
