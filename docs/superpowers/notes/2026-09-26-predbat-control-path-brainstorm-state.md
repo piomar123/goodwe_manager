@@ -135,6 +135,12 @@ Question: can a fixed displayed-SoC -> energy curve linearise the BMS SoC for Pr
 - Conclusion: a fixed reprojection fixes Predbat's average bias but leaves roughly +-0.25 kWh (~+-4 displayed
   points) of irreducible uncertainty below ~25%. The extra usable energy from reserve 20% -> 10% is ~0.46 kWh
   median (0.19-0.60), about 6% of the battery.
+- Recommendation given: skip reprojection; keep reserve 20% for rollout, maybe 15% later. User's concern: fewer BMS
+  calibration points without going to <=10%. Reply: the main correction jumps are at ~21% and ~15-16% (a 15% floor
+  still passes both), and a 100% top anchor happens almost daily. Open idea: periodic calibration discharge (e.g.
+  weekly/monthly one night at 10%) instead of a permanent 10% floor - needs a runtime way to lower CONTROL_MIN_SOC
+  temporarily in the executor (today .env only) plus a temporary Predbat reserve drop (Predbat also has
+  manual_soc_max, a ceiling meant for emptying the battery for BMS calibration). Not decided.
 
 ## Side threads
 
