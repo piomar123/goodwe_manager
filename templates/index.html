@@ -111,7 +111,14 @@
         <div>Reserve: <span id="control-reserve"></span></div>
         <div id="control-warnings" class="text-warning"></div>
         <div class="text-muted small">Settings: <span id="control-registers"></span> · writes today <span id="control-writes"></span></div>
-        <div id="control-override" class="mt-1"></div>
+        <div class="mt-1">
+          <span id="control-override"></span>
+          <form id="control-override-clear" method="post" action="/control/override/clear" style="display: none">
+            <button class="btn btn-sm btn-outline-secondary" type="submit">Clear override</button>
+          </form>
+        </div>
+        <details class="mt-1">
+          <summary class="text-muted small">Manual override</summary>
         <form class="row row-cols-lg-auto g-2 align-items-center mt-1" method="post" action="/control/override">
           <div class="col-12">
             <select class="form-select form-select-sm" name="mode">
@@ -127,9 +134,7 @@
           <div class="col-12"><input class="form-control form-control-sm" name="duration_min" type="number" min="15" max="720" value="60" required> min</div>
           <div class="col-12"><button class="btn btn-sm btn-warning" type="submit">Override</button></div>
         </form>
-        <form method="post" action="/control/override/clear" class="mt-1">
-          <button class="btn btn-sm btn-outline-secondary" type="submit">Clear override</button>
-        </form>
+        </details>
       </div>
     </div>
     <div class="row">
@@ -180,6 +185,7 @@
       text('control-override', c.override
         ? `Override: ${c.override.mode}${c.override.power_w ? ' ' + c.override.power_w + ' W' : ''} until ${new Date(c.override.until).toLocaleTimeString()}`
         : '');
+      document.getElementById('control-override-clear').style.display = c.override ? 'inline' : 'none';
     }
 
     // Two independent lag sources, tracked separately:
