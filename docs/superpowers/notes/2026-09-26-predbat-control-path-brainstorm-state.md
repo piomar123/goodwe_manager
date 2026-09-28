@@ -170,30 +170,40 @@ to grid, then on-grid + Standby again. Off-grid min SoC (45358) = 6 %, DoD Holdi
 User facts: register value = min SoC % (SolarGo shows inverted DoD); after SoC reaches the min, discharge resumes only
 at min+5 -> when leaving a freeze the floor must drop > 5 points below SoC. Inverter reconnect = relays, no sync.
 
-## STATUS / NEXT (for after compaction)
+## STATUS / NEXT (2026-09-28, for after compaction)
 
-- Spec UPDATED for floor-based freeze_charge (5th control setting battery_discharge_depth, CONTROL_MIN_SOC,
-  freeze floor follows rising SoC in 3-pt steps, 'waiting for SoC', hysteresis warning, write order
-  restricting-first/relaxing-last, off-grid section rewritten). Spec + notes committed on branch predbat-control-spec.
-- PLAN NOT YET UPDATED (docs/superpowers/plans/2026-09-26-predbat-control-executor.md). Required edits:
-  * control.py: MODE_SETTINGS += 'battery_discharge_depth'; ControlConfig(mode, charge_current_a, discharge_current_a,
-    min_soc, max_battery_w=3400, max_writes_per_day=300); config_from_env requires CONTROL_MIN_SOC (int 0-100).
-  * Executor: _last_soc, _floor; FREEZE_CHARGE -> floor=max(min_soc,int(last_soc)) on entry, raise when soc>=floor+3,
-    never lower; no SoC yet -> AUTO reason 'waiting for SoC'; _settings: freeze_charge = (1,0,c,d,floor), others depth=min_soc;
-    snapshot + 'freeze_floor'; property last_soc.
-  * compute_warnings(..., soc, min_soc, frozen): warn if not frozen and readback depth==min_soc and soc < min_soc+5.
-  * control_io.write_order: limits (charge_i, discharge_i, depth): restrict = current->0 or depth up; relax = rest; order
-    restrict + ems + relax. Fakes: add depth 14 to AUTO/CHARGE_2K/FREEZE_EXPORT, add FREEZE_CHARGE_60.
-  * Update every test that detected freeze via battery_discharge_current==0 -> battery_discharge_depth==floor; CFG/ControlConfig
-    calls get min_soc 14; AUTO_SETTINGS gets depth 14; add tests: floor follows rising soc, waits for soc, never below min,
-    leaving restores min, write orders for FREEZE_CHARGE_60.
-  * Runtime: pass executor.last_soc/config.min_soc/frozen to compute_warnings; override test expects depth 55 write.
-  * Docs: .env.example CONTROL_MIN_SOC=14; MQTT_TOPICS registers example + depth; README.
-  * Task 9: acceptance freeze_charge check = floor; breaker test becomes regression check via executor.
-  * Global Constraints + Review Focus #1 (off-grid) rewording.
-  * Re-verify by extracting plan code into scratch (git archive HEAD | tar -x -C /tmp/plancheck), apply Task 4/6 edits,
-    run full suite with ~/Dev/goodwe_manager/venv/bin/python -m unittest discover -s tests (was 444 OK before).
-- Then ask user: review plan + execution method (recommend Native).
-- Other pending: PR 2 inverter-time-sync (docstring note tz-aware written as-is, then show description);
-  cleanup Pi: arp-probe.timer, ~/ems-spike; restart `claude remote-control` via claude-piomar alias (GH_CONFIG_DIR);
-  use GH_CONFIG_DIR=~/.config/gh-piomar for all gh calls. Eco slot 1 was disabled by user for the spike (their action).
+Done:
+- goodwe_manager branch `predbat-control-executor` (worktree .worktrees/predbat-control-spec, local branch renamed),
+  pushed to origin, NOT merged, no PR. Plan executed natively (Tasks 1-8); Task 9 (live rollout) pending.
+  Two fresh whole-branch reviews; all Critical/Important fixed with RED->GREEN tests; suite 483 OK (py3.9 venv).
+  Post-plan changes (in code + spec, noted atop the plan): floor = min SoC of last 30 s, needs 3 samples, window keeps
+  last 3; charge-hold/reserve releases debounced 30 s; clamp = CONTROL_MAX_BATTERY_W only (default 3600, BMS limit
+  reported as bms_charge_limit_w/bms_discharge_limit_w); failed write stops the order; off-grid onset -> writer.restart();
+  back-off doubles to 1 h; writer state carried across reconnects; power_w-only change / MQTT cmd during override keep
+  latches; NaN rejected; 'Z' expires_at; MQTT cancelled/failed subscribe closes client; override route 504.
+  Deferred minors: garbage first sample after new command can latch a target (fresh path); leaked old MQTT client not
+  closed; off-grid restores still back off if writes keep failing.
+- Predbat runtime (HA API, 2026-09-27): best_soc_min 1.4 kWh, best_soc_keep 1.8 kWh, set_charge_low_power +
+  set_export_low_power on. Still read-only. battery_rate_max stays 3400 (user decision: curve calibration).
+- Predbat weather alerts deployed (apps.yaml `alerts:`, MeteoAlarm Poland, Orange/Red wind/thunderstorm/snow/ice/rain/
+  flood/storm/low temperature, keep 60). Verified in predbat.log. Backup on Pi: apps.yaml.bak-20260927.
+- home-assistant-raspberry4 commit 8f1d00d: Predbat control wiring PREPARED, NOT DEPLOYED (custom inverter_type GWMGR,
+  6 service templates -> script.goodwe_control (queued, field control_mode, ttl_s 900, repeat), HA helpers for
+  charge/discharge rate, charge_limit, windows (input_datetime), scheduled enables (input_boolean); MQTT number
+  goodwe_reserve; sensors goodwe_control_mode/_reason/_warnings, binary applied/off_grid). check_config passed; payload
+  template rendered via HA and parsed by executor. charge_control_immediate must be False (amps control, not services).
+  Backlog in its README: PV-aware reserve idea (parked by user).
+
+Next (waiting for user):
+- Go-ahead to deploy: copy HA config + reload, copy apps.yaml, set_reserve_min 8 -> 20 (or per reserve decision below),
+  start goodwe_manager branch on the Pi in CONTROL_MODE=shadow (check Pi git status first; .env: CONTROL_CHARGE_CURRENT_A=19,
+  CONTROL_DISCHARGE_CURRENT_A=19, CONTROL_MIN_SOC=14), Predbat read-only off, force each mode via Predbat manual overrides.
+  Then Task 9 acceptance with CONTROL_MODE=on incl. long freeze_charge watching DoD Holding grid top-ups.
+- Reserve discussion: user proposed reserve_min + inverter on-grid min (CONTROL_MIN_SOC) at 10% with keep 25%. Answered:
+  reserve = hard floor usable any time; "dip only before charging" is best_soc_keep (soft, penalty x import rate, ignored/
+  ramped over first 4 h); pushback = SoC non-linear below ~20% (25->10% displayed ~0.6 kWh), predictions wrong, less
+  outage backup, +5 resume hysteresis, DoD Holding. Suggested stepwise 15% first + make executor's 20% reserve warning
+  configurable, then 10% after comparing predicted vs measured end-of-discharge SoC. Awaiting user decision.
+- Other pending: PR 2 goodwe `inverter-time-sync` (docstring note: tz-aware datetimes written as-is, then show PR
+  description); Pi cleanup (arp-probe.timer, ~/ems-spike); eco slot 1 disabled by user for the spike; suggest restarting
+  `claude remote-control` via claude-piomar alias. gh: GH_CONFIG_DIR=~/.config/gh-piomar. HA token: read server-side only.
