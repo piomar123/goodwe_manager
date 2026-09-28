@@ -191,3 +191,5 @@ cython_debug/
 .superpowers/
 /.worktrees/
 /NOTES.local.md
+/control_writes.json
+/control_writes.json.tmp

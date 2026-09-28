@@ -90,6 +90,17 @@ class ControlWriter:
         self._attempts, self._backoff_until, self._backoff_s = dict(other._attempts), other._backoff_until, other._backoff_s
         self._last_desired, self.last_error = other._last_desired, other.last_error
 
+    @property
+    def count_day(self) -> datetime.date:
+        return self._today
+
+    def restore_writes(self, day: datetime.date, count: int) -> None:
+        """Take over a count saved before a process restart - only if it's
+        from today, so the daily cap keeps counting across restarts."""
+        self._roll_day()
+        if day == self._today:
+            self.writes_today = max(self.writes_today, count)
+
     def applied(self, desired: Optional[dict]) -> bool:
         return desired is not None and all(_matches(n, desired[n], self.readback.get(n)) for n in MODE_SETTINGS)
 

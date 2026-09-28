@@ -5,9 +5,11 @@ Glue between control.Executor, control_io.ControlWriter, MQTT and main.py's
 raises, so a control problem can't stop inverter polling.
 """
 import asyncio
+import json
 import logging
+import os
 import time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable, Optional
 
 from control import Command, CommandError, ControlConfig, Executor, Sample, compute_warnings, parse_command
@@ -20,8 +22,12 @@ class ControlRuntime:
     def __init__(self, config: ControlConfig, mqtt, *,
                  now_fn: Callable[[], datetime] = lambda: datetime.now().astimezone(),
                  mono_fn: Callable[[], float] = time.monotonic,
-                 eco_check_interval_s: float = 300.0, state_interval_s: float = 10.0):
+                 eco_check_interval_s: float = 300.0, state_interval_s: float = 10.0,
+                 counter_path: Optional[str] = None):
         self._config = config
+        # writes_today is saved here so the daily cap survives restarts
+        self._counter_path = counter_path
+        self._saved_count: Optional[tuple] = None
         self._mqtt = mqtt
         self._now = now_fn
         self._mono = mono_fn
@@ -49,7 +55,35 @@ class ControlRuntime:
                                      max_writes_per_day=self._config.max_writes_per_day, now_fn=self._mono)
         if old is not None:
             self._writer.carry_state_from(old)
+        else:
+            self._load_count()
         self._next_eco = 0.0
+
+    def _load_count(self) -> None:
+        if not self._counter_path:
+            return
+        try:
+            with open(self._counter_path) as f:
+                saved = json.load(f)
+            self._writer.restore_writes(date.fromisoformat(saved['date']), int(saved['writes']))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f'Ignoring unreadable control write counter {self._counter_path}: {e}')
+        self._saved_count = (self._writer.count_day, self._writer.writes_today)
+
+    def _save_count(self) -> None:
+        current = (self._writer.count_day, self._writer.writes_today)
+        if not self._counter_path or current == self._saved_count:
+            return
+        self._saved_count = current  # also on failure: warn once per change, not per second
+        try:
+            tmp = self._counter_path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({'date': current[0].isoformat(), 'writes': current[1]}, f)
+            os.replace(tmp, self._counter_path)
+        except OSError as e:
+            logger.warning(f'Could not save control write counter {self._counter_path}: {e}')
 
     def on_mqtt_message(self, topic_suffix: str, payload: bytes) -> None:
         if topic_suffix == 'control/set':
@@ -89,6 +123,7 @@ class ControlRuntime:
                 if self.executor.snapshot(now)['off_grid'] and not was_off_grid:
                     self._writer.restart()  # the backup side can't wait out a back-off
                 await self._writer.step(desired)
+                self._save_count()
                 if self._initial_work_mode is None:
                     self._initial_work_mode = self._writer.readback.get('work_mode')
                 await self._maybe_read_eco()

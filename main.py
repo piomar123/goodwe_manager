@@ -62,6 +62,9 @@ RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero'
 # Invalid CONTROL_* values fail startup on purpose - better than silently
 # running without the control the user configured.
 CONTROL_CONFIG = control.config_from_env(os.environ)
+# Today's control write count (control_runtime), next to data.db, so the
+# CONTROL_MAX_WRITES_PER_DAY warning keeps counting across restarts.
+CONTROL_WRITES_PATH = 'control_writes.json'
 WARSAW_TZ = ZoneInfo('Europe/Warsaw')
 # manager.log rotation: normal DEBUG output is ~50KB/day, so this keeps
 # months of history while capping disk use at ~60MB even if something
@@ -448,7 +451,8 @@ mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USER
                               password=MQTT_PASSWORD, topic_prefix=MQTT_TOPIC_PREFIX)
 control_runtime_instance: Optional[control_runtime.ControlRuntime] = None
 if CONTROL_CONFIG is not None:
-    control_runtime_instance = control_runtime.ControlRuntime(CONTROL_CONFIG, mqtt)
+    control_runtime_instance = control_runtime.ControlRuntime(CONTROL_CONFIG, mqtt,
+                                                                counter_path=CONTROL_WRITES_PATH)
     mqtt.set_control_handler(control_runtime_instance.on_mqtt_message)
 
 

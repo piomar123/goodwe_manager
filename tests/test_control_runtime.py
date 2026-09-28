@@ -6,6 +6,8 @@ stop/start pattern.
 """
 import asyncio
 import json
+import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -27,13 +29,14 @@ class FakeMqtt:
         self.states.append(state)
 
 
-def make(eco_on=(False, False, False, False)):
+def make(eco_on=(False, False, False, False), counter_path=None):
     clock = Clock()
     inv = FakeInverter(clock, base_values())
     for i, on in enumerate(eco_on, start=1):
         inv.values[f'eco_mode_{i}'] = SimpleNamespace(on_off=-1 if on else 0)
     mqtt = FakeMqtt()
-    rt = control_runtime.ControlRuntime(CFG, mqtt, now_fn=lambda: T0 + timedelta(seconds=clock.t), mono_fn=clock)
+    rt = control_runtime.ControlRuntime(CFG, mqtt, now_fn=lambda: T0 + timedelta(seconds=clock.t), mono_fn=clock,
+                                        counter_path=counter_path)
     rt.attach(inv)
     return clock, inv, mqtt, rt
 
@@ -157,6 +160,48 @@ class ControlRuntimeTest(unittest.TestCase):
         rt = control_runtime.ControlRuntime(CFG, mqtt, now_fn=lambda: T0, mono_fn=lambda: 0.0)
         state = asyncio.run(rt.step(RUNTIME))
         self.assertFalse(state['applied'])
+
+
+class WriteCounterPersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, 'control_writes.json')
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_write_count_survives_a_process_restart(self):
+        clock, inv, mqtt, rt = make(counter_path=self.path)
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 10)
+        written = mqtt.states[-1]['writes_today']
+        self.assertGreater(written, 0)
+        _, _, mqtt2, rt2 = make(counter_path=self.path)  # a fresh process
+        run(rt2, Clock(), 0)
+        self.assertEqual(mqtt2.states[-1]['writes_today'], written)
+
+    def test_count_from_an_earlier_day_is_not_restored(self):
+        with open(self.path, 'w') as f:
+            json.dump({'date': '2000-01-01', 'writes': 250}, f)
+        clock, inv, mqtt, rt = make(counter_path=self.path)
+        run(rt, clock, 0)
+        self.assertEqual(mqtt.states[-1]['writes_today'], 0)
+
+    def test_corrupt_counter_file_starts_from_zero(self):
+        with open(self.path, 'w') as f:
+            f.write('{not json')
+        clock, inv, mqtt, rt = make(counter_path=self.path)
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 10)
+        self.assertGreater(mqtt.states[-1]['writes_today'], 0)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f)['writes'], mqtt.states[-1]['writes_today'])
+
+    def test_unwritable_counter_path_does_not_break_control(self):
+        clock, inv, mqtt, rt = make(counter_path=os.path.join(self.dir.name, 'missing', 'x.json'))
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 10)
+        self.assertIn(('ems_mode', 11), inv.writes)
 
 
 if __name__ == '__main__':
