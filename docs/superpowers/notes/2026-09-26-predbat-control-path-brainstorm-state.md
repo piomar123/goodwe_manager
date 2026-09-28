@@ -119,6 +119,23 @@ Optional: reboot persistence check of EMS mode.
   Predbat soft floor ~22-25% (`best_soc_min`/`best_soc_keep`).
 - Scripts: `/tmp/soc-analysis/{events,dwell,thresh,ahwh}.py`.
 
+## SoC reprojection spike (2026-09-28, throwaway scripts /tmp/soc-analysis/curve2.py, predict.py)
+
+Question: can a fixed displayed-SoC -> energy curve linearise the BMS SoC for Predbat?
+- 1-year sample, 124 clean deep discharges (no charging / SoC rise between 30% and the minimum; some episodes
+  duplicated by overlapping event windows), energy from inverter ibattery1 x vbattery1. Mid band 60-30%: 64.7 Wh
+  per displayed point (nominal 7.1 kWh/100 = 71).
+- Energy displayed L -> 10% (77 episodes reaching 10): 25->10 median 617 Wh (p10 398, p90 941) vs nominal 970;
+  20->10 median 458 (p10 194, p90 601) vs 647; 15->10 median 272 (p10 27, p90 367) vs 324.
+- So the median curve is stable (~0.65x nominal below 25%), but a single discharge varies ~2-3x in the low band:
+  the BMS correction jump (most often from 21% or 15-16%, typically 3 points, sometimes far more) has a random
+  size and position.
+- Not predictable from days since last 100% (r=+0.32; the battery reaches 100% almost daily), charge throughput since
+  full (+0.27), battery temperature (+0.17) or discharge power (+0.13).
+- Conclusion: a fixed reprojection fixes Predbat's average bias but leaves roughly +-0.25 kWh (~+-4 displayed
+  points) of irreducible uncertainty below ~25%. The extra usable energy from reserve 20% -> 10% is ~0.46 kWh
+  median (0.19-0.60), about 6% of the battery.
+
 ## Side threads
 
 - Home Wi-Fi: dongle stops answering **broadcast ARP** some time after reconnect
