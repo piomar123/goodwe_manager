@@ -1,6 +1,7 @@
 # Pylontech BMS poller - design
 
-Date: 2026-09-29. Status: approved in chat, spec under review.
+Date: 2026-09-29. Status: approved (design in chat, spec self-reviewed at the
+user's request).
 
 ## Goal
 
@@ -64,8 +65,9 @@ No import-time side effects, and no imports from `main.py` or storage.
   dataclass, plus the plausibility checks. No I/O.
 - **`BmsPoller`:** the async loop.
   - It owns the `PySolarmanV5Async` client, the timeouts and the backoff.
-  - It reports through two callbacks: `on_sample(sample)` and
-    `on_failure(reason)`.
+  - It reports each accepted sample through one callback,
+    `on_sample(sample)`. Failures are handled and logged inside the poller.
+    Nothing outside needs them yet.
   - The client factory and the clock are injectable, for tests.
 - **`pysolarmanv5` import:** only inside the client factory, so it's never
   imported when the module is disabled.
@@ -80,10 +82,12 @@ No import-time side effects, and no imports from `main.py` or storage.
   | `BMS_LOGGER_SERIAL` | — | required to enable |
   | `BMS_LOGGER_PORT` | 8899 | |
   | `BMS_SLAVE_ID` | 1 | |
-  | `BMS_POLL_SECONDS` | 60 | |
+  | `BMS_POLL_SECONDS` | 60 | minimum 10 (lower values are clamped, with a warning), to protect the logger |
 
 - **Disabled** (host or serial missing): no task and no `bms.db`. One INFO
   log line: "BMS poller disabled".
+- **Invalid config** (serial, port or slave ID not an integer): one ERROR log
+  line, and the module stays disabled. goodwe_manager itself still starts.
 - **Enabled:**
   - `AsyncioThread.run()` creates the poller task in live mode (not with
     `--dry-run`, same as the inverter poll).
@@ -91,9 +95,13 @@ No import-time side effects, and no imports from `main.py` or storage.
     client and the `bms.db` connection are closed.
 - **`on_sample`:**
   - inserts a row into `bms_history` through a dedicated `aiosqlite`
-    connection to `bms.db`;
+    connection to `bms.db`. The file sits next to `data.db` (constant
+    `BMS_DB_PATH = 'bms.db'`), uses `PRAGMA journal_mode = WAL` like the
+    other databases, and gets `.gitignore` entries for `bms.db`, `-wal` and
+    `-shm`;
   - calls `MqttBridge.publish_bms(payload)`.
-- **Dependency:** `pysolarmanv5` is added to `requirements.txt`.
+- **Dependency:** `pysolarmanv5==3.0.6` and its dependency `umodbus==1.0.4`
+  are added to `requirements.txt`, pinned like everything else there.
 
 ### Data flow
 
@@ -163,8 +171,8 @@ Not decoded yet (kept in `raw_1100`):
 | Column | Type | Notes |
 |---|---|---|
 | `id` | INTEGER PRIMARY KEY | |
-| `timestamp` | TEXT | local `YYYY-MM-DD HH:MM:SS`, like `inverter_history` |
-| `timestamp_epoch` | REAL | indexed |
+| `timestamp` | TEXT | local `YYYY-MM-DD HH:MM:SS` at poll start, like `inverter_history` |
+| `timestamp_epoch` | INTEGER | indexed, like `inverter_history` |
 | `pack_voltage`, `bms_temperature`, `soc`, `soh` | REAL | |
 | `cell_voltage_max`, `cell_voltage_min` | REAL | |
 | `cell_voltage_max_id`, `cell_voltage_min_id` | INTEGER | |
@@ -186,8 +194,9 @@ Rules:
 ### MQTT `goodwe/bms`
 
 - Not retained, published on every accepted sample.
-- The payload is a JSON object with all decoded fields plus `cell_mv` and
-  `module_voltages`, as JSON numbers (not strings, unlike `telemetry`).
+- The payload is a JSON object with `timestamp`, all decoded fields, and
+  `cell_mv` and `module_voltages`. Values are JSON numbers (not strings,
+  unlike `telemetry`).
 - `raw_1100` isn't published.
 - Documented in `MQTT_TOPICS.md`.
 
@@ -195,7 +204,7 @@ Rules:
 
 - **All-or-nothing poll:**
   - one poll = the summary block read plus the cell block reads;
-  - each read has a 5 s timeout (`asyncio.wait_for`);
+  - connecting and each read have a 5 s timeout (`asyncio.wait_for`);
   - any timeout, Modbus/V5 exception or short response fails the whole poll.
     There's no row, no payload and no partial sample.
 - **Plausibility checks.** A failing check fails the poll, and the log names
@@ -211,11 +220,12 @@ Rules:
   - After 3 consecutive failed polls, the interval doubles on each further
     failure: 60 → 120 → 240 → 480 → 600 s (cap).
   - One success resets it to `BMS_POLL_SECONDS`.
-- **Logging on transitions only:**
-  - WARNING on the first failure, with the reason;
-  - WARNING on entering backoff;
-  - INFO on recovery, with the failure count and duration;
-  - repeated failures in between log at DEBUG.
+- **Logging on transitions only.** Single misses are expected, e.g. while
+  the logger uploads to the SolarMan cloud, so they don't warn.
+  - INFO on the first and second consecutive failure, with the reason;
+  - WARNING on the third (entering backoff);
+  - DEBUG for further failures while in backoff;
+  - INFO on recovery, with the failure count and outage duration.
 - **Startup:** an unreachable logger never blocks or delays goodwe_manager's
   startup. The poller just begins in its retry cycle.
 - **DB write failure:** logged at WARNING; the sample is dropped and polling
@@ -258,12 +268,16 @@ Unit tests only use fakes (no network, no real sleeps).
     counted as a failure;
   - backoff sequence and reset, with a fake clock;
   - a new client after a failure;
-  - log levels on first failure, repeat and recovery.
+  - log levels: INFO on failures 1-2, WARNING on the 3rd, DEBUG after,
+    INFO on recovery;
+  - a connect that never completes is timed out like a read.
 - **Loop safety:** a poller against a never-answering fake runs next to a
   task ticking every 10 ms; assert the ticks stay regular.
 - **Wiring:**
   - host or serial missing → disabled, no task, `pysolarmanv5` not in
-    `sys.modules`;
+    `sys.modules` (checked in a subprocess, since other tests import it);
+  - a non-integer serial → ERROR log, disabled, no exception;
+  - `BMS_POLL_SECONDS=5` → clamped to 10;
   - defaults for port, slave ID and interval.
 - **Storage:**
   - `bms.db` and the table and index are created on first use;
