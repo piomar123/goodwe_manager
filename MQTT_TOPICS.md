@@ -491,7 +491,7 @@ Predbat `apps.yaml`:
     - input_datetime.goodwe_discharge_end_time
 ```
 
-Predbat runtime settings (HA entities, not `apps.yaml`): `set_charge_freeze` and `set_export_freeze` on (expert mode), `set_reserve_enable` on, `set_reserve_min` 20 (the executor warns below 20 %), `best_soc_min` 1.4 kWh and `best_soc_keep` 1.8 kWh (~20 / 25 % of 7.1 kWh), `set_charge_low_power` / `set_export_low_power` on. Keep `battery_rate_max` at the battery's representative rate (3400 W here) - `CONTROL_MAX_BATTERY_W` is only a ceiling above it.
+Predbat runtime settings (HA entities, not `apps.yaml`): `set_charge_freeze` and `set_export_freeze` on (expert mode), `set_reserve_enable` on, `set_reserve_min` ~12 (the executor warns below 10 %), `best_soc_min` ~15 % and `best_soc_keep` 20-25 % of 7.1 kWh (see the spec's "Predbat battery model" section; the BMS SoC resyncs around 22-18 %, so levels are a trade-off, not a hard limit), `set_charge_low_power` / `set_export_low_power` on. Keep `battery_rate_max` at the battery's representative rate (3400 W here) - `CONTROL_MAX_BATTERY_W` is only a ceiling above it.
 
 ## Failure behavior
 

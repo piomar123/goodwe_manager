@@ -213,7 +213,7 @@ class Sample:
 TARGET_DEBOUNCE = timedelta(seconds=30)
 CHARGE_TARGET_HYSTERESIS = 3
 RESERVE_HYSTERESIS = 2
-RESERVE_WARN_BELOW = 20
+RESERVE_WARN_BELOW = 10
 OFF_GRID_RELEASE = timedelta(seconds=60)
 FLOOR_STEP = 3  # freeze floor follows a rising SoC in steps of this many points
 MIN_FLOOR_SAMPLES = 3  # freeze floor needs this many SoC samples (startup, after reconnect gaps)
@@ -513,7 +513,7 @@ def compute_warnings(readback: dict, eco_slots_enabled: Optional[list], reserve:
         if enabled:
             warnings.append(f'eco slot {i} is enabled')
     if reserve is not None and reserve < RESERVE_WARN_BELOW:
-        warnings.append(f'reserve {reserve}% is below {RESERVE_WARN_BELOW}% (BMS SoC is unreliable there)')
+        warnings.append(f'reserve {reserve}% is below {RESERVE_WARN_BELOW}% (near the BMS floor, SoC is unreliable there)')
     if min_soc_hold is not None:
         warnings.append(f'discharge may stay blocked until SoC reaches {min_soc_hold + INVERTER_RESUME_MARGIN}% '
                         f'(the inverter resumes {INVERTER_RESUME_MARGIN} points above its minimum SoC after a freeze)')

@@ -194,8 +194,9 @@ Order of precedence each tick:
      SoC sample after a new command, where an already-met target counts at
      once. Releasing a charge hold (and the reserve below) needs 30 s too.
 5. **Software reserve**: in `auto`, if SoC ≤ reserve → `freeze_charge` until
-   SoC ≥ reserve + 2. Values below 20 % are accepted but warned about in the
-   dashboard (BMS SoC resyncs by ~4 points around 22-18 %). `CONTROL_MIN_SOC`
+   SoC ≥ reserve + 2. Values below 10 % are accepted but warned about in the
+   dashboard (near the BMS floor; the BMS SoC also resyncs by ~4 points around
+   22-18 %, which is accepted, see the battery model section). `CONTROL_MIN_SOC`
    stays the floor in every other mode.
 6. Otherwise the commanded mode.
 
@@ -300,7 +301,7 @@ on, and forced EMS modes have no meaning without the grid.
 | `CONTROL_MODE` | `off` | `off`, `shadow` (compute + publish state with `"shadow": true`, no writes), `on` |
 | `CONTROL_CHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_charge_current`, e.g. 19.0 |
 | `CONTROL_DISCHARGE_CURRENT_A` | - (required when not `off`) | normal `battery_discharge_current` |
-| `CONTROL_MIN_SOC` | - (required when not `off`) | normal on-grid minimum SoC % (`battery_discharge_depth`), e.g. 14 |
+| `CONTROL_MIN_SOC` | - (required when not `off`) | normal on-grid minimum SoC % (`battery_discharge_depth`, the inverter's `battery_min_soc`), e.g. 10-14 |
 | `CONTROL_MAX_BATTERY_W` | 3600 | power clamp (the inverter enforces the live BMS limit itself) |
 | `CONTROL_MAX_WRITES_PER_DAY` | 300 | warning threshold |
 
@@ -343,13 +344,20 @@ linear in SoC, so it would over-estimate what is left below ~25 %.
 
 Changes in `apps.yaml` / Predbat settings (the HA repo, not this code):
 
-- **Keep plans at the edge of the non-linear band**: `best_soc_min` (hard
-  minimum the planner may target) = 20 % of `soc_max`, and `best_soc_keep`
-  (soft floor, the user's "low only right before the next charge") = 25 %,
-  tuned from experience.
-- **Reserve** driven by Predbat into the executor's software reserve, never
-  below 20 % (executor warns below 20 %); the inverter DoD stays the hard
-  floor underneath.
+- **Levels relative to the non-linear band** (revised 2026-09-29): the
+  first version kept plans above the band (`best_soc_min` 20 %,
+  `best_soc_keep` 25 %). The user now prefers to go lower - discharge deeper
+  right before PV charging and charge a little at the start of a cheap slot
+  - and accepts the imprecise SoC in the band. Target values: inverter
+  `battery_min_soc` (`CONTROL_MIN_SOC`) 10 %, Predbat `set_reserve_min`
+  12 %, `best_soc_min` 15 %, `best_soc_keep` 20-25 %. A high `best_soc_keep`
+  also distorts the plan: it is a metric penalty `(keep-soc)*import_rate*
+  step/60`, so it can delay an export to a cheaper slot (replays of 15 debug
+  snapshots: 1.8 kWh delayed a 32 -> 20 % export from ~09:00 to 10:30;
+  1.6 kWh moved it back).
+- **Reserve** driven by Predbat into the executor's software reserve; the
+  executor warns below 10 % (`RESERVE_WARN_BELOW`); the inverter DoD stays
+  the hard floor underneath.
 - **Usable capacity**: leave `soc_max` at the nominal 7.1 kWh (the linear
   middle is what Predbat plans with) and do not model the bottom band at all
   - the ~0.45 kWh it lacks is inside the reserve and never planned against.

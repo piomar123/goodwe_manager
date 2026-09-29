@@ -579,13 +579,14 @@ class ExecutorSnapshotTest(unittest.TestCase):
 
 class ComputeWarningsTest(unittest.TestCase):
     def test_all_warnings(self):
-        w = control.compute_warnings({'soc_upper_limit': 90, 'work_mode': 0}, [True, False, True, False], 15, 3)
+        w = control.compute_warnings({'soc_upper_limit': 90, 'work_mode': 0}, [True, False, True, False], 8, 3)
         self.assertEqual(w, ['soc_upper_limit is 90 (expected 100)', 'work_mode changed from 3 to 0',
                              'eco slot 1 is enabled', 'eco slot 3 is enabled',
-                             'reserve 15% is below 20% (BMS SoC is unreliable there)'])
+                             'reserve 8% is below 10% (near the BMS floor, SoC is unreliable there)'])
 
     def test_no_warnings(self):
         self.assertEqual(control.compute_warnings({'soc_upper_limit': 100, 'work_mode': 3}, [False] * 4, 25, 3), [])
+        self.assertEqual(control.compute_warnings({'soc_upper_limit': 100, 'work_mode': 3}, [False] * 4, 12, 3), [])
         self.assertEqual(control.compute_warnings({}, None, None, None), [])
 
     def test_min_soc_hold_warning(self):
