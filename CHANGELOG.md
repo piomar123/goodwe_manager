@@ -8,6 +8,10 @@ grouped under `Unreleased` until that changes.
 
 ### Changed
 
+- `battery_min_cell_temp` / `battery_max_cell_temp` (BMS cell temperatures,
+  registers 37020/37021) are now stored in `inverter_history`, published in
+  MQTT telemetry and browsable on `/history`. The new columns are added to
+  an existing `data.db` automatically on startup.
 - Live telemetry now writes to SQLite (`data.db`, `inverter_history` table)
   instead of per-run `data-*.csv` files. **If you have existing CSV files,
   run the one-off migration script** - see the README's "Upgrading" section.

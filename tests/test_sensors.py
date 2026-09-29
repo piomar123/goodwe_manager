@@ -194,6 +194,12 @@ class SensorColumnsTest(unittest.TestCase):
         self.assertIn('e_total', column_names)
         self.assertIn('e_total', DB_SENSORS)
 
+    def test_battery_cell_temperatures_are_persisted_as_real(self):
+        columns = dict(sensor_columns())
+
+        self.assertEqual(columns['battery_min_cell_temp'], 'REAL')
+        self.assertEqual(columns['battery_max_cell_temp'], 'REAL')
+
     def test_label_columns_are_text_everything_else_is_real(self):
         columns = dict(sensor_columns())
 

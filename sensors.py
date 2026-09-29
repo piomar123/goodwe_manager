@@ -93,6 +93,11 @@ SELECTED_SENSORS = [
     'battery_mode',
     'battery_mode_label',
     'battery_temperature',
+    # Min/max cell temperature from the BMS (registers 37020/37021).
+    # battery_temperature (37003) is a separate BMS reading that runs well
+    # above what the modules report (e.g. in SolarMan).
+    'battery_min_cell_temp',
+    'battery_max_cell_temp',
     'battery_soc',
     'battery_charge_limit',
     'battery_discharge_limit',

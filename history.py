@@ -19,6 +19,7 @@ RAW_COLUMNS = (
     'active_power', 'reactive_power', 'apparent_power', 'total_inverter_power',
     'load_ptotal', 'load_p1', 'load_p2', 'load_p3', 'house_consumption',
     'battery_soc', 'pbattery1', 'vbattery1', 'ibattery1', 'battery_temperature',
+    'battery_min_cell_temp', 'battery_max_cell_temp',
     'e_day', 'e_total_exp', 'e_total_imp', 'e_load_total',
     'meter_e_total_exp', 'meter_e_total_imp', 'meter_active_power_total',
     'e_bat_charge_total', 'e_bat_discharge_total',
