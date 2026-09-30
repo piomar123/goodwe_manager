@@ -187,6 +187,9 @@ cython_debug/
 /forecast_history.db
 /forecast_history.db-wal
 /forecast_history.db-shm
+/bms.db
+/bms.db-wal
+/bms.db-shm
 /.idea
 .superpowers/
 /.worktrees/
