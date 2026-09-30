@@ -9,10 +9,11 @@ register map and how each field was confirmed.
 No import-time side effects: pysolarmanv5 is only imported by
 default_client_factory, so a setup without the battery never loads it.
 """
+import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import List, Mapping, Optional
+from typing import Awaitable, Callable, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -160,3 +161,129 @@ def _check_plausible(s: BmsSample) -> None:
     total = sum(s.module_voltages)
     if abs(total - s.pack_voltage) > 0.02 * s.pack_voltage:
         raise BmsDecodeError(f'module voltages sum {total:.2f} V, pack reads {s.pack_voltage} V')
+
+
+BACKOFF_AFTER_FAILURES = 3
+MAX_INTERVAL_S = 600
+
+
+class PollFailed(Exception):
+    pass
+
+
+def sample_to_payload(sample: BmsSample) -> dict:
+    """MQTT payload: every decoded field as a JSON number; the raw register
+    block stays in bms.db only."""
+    payload = asdict(sample)
+    del payload['raw_1100']
+    return payload
+
+
+class BmsPoller:
+    """Polls the BMS every config.poll_seconds until cancelled. Every
+    network call is bounded by timeout_s - this runs on the same asyncio loop
+    as the inverter poll, so nothing here may block or hang."""
+
+    def __init__(self, config: BmsConfig, on_sample: Callable[[BmsSample], Awaitable[None]],
+                 client_factory=default_client_factory, now_fn=datetime.now, sleep=asyncio.sleep,
+                 timeout_s: float = READ_TIMEOUT_S):
+        self._config = config
+        self._on_sample = on_sample
+        self._client_factory = client_factory
+        self._now_fn = now_fn
+        self._sleep = sleep
+        self._timeout_s = timeout_s
+        self._client = None
+        self._failures = 0
+        self._failing_since: Optional[datetime] = None
+
+    @property
+    def interval(self) -> float:
+        if self._failures < BACKOFF_AFTER_FAILURES:
+            return self._config.poll_seconds
+        return min(self._config.poll_seconds * 2 ** (self._failures - BACKOFF_AFTER_FAILURES + 1), MAX_INTERVAL_S)
+
+    async def run(self) -> None:
+        try:
+            while True:
+                await self.poll_once()
+                await self._sleep(self.interval)
+        finally:
+            await self._close_client()
+
+    async def poll_once(self) -> Optional[BmsSample]:
+        when = self._now_fn()
+        try:
+            if self._client is None:
+                self._client = self._client_factory(self._config)
+                await asyncio.wait_for(self._client.connect(), self._timeout_s)
+            summary = await self._read(SUMMARY_START, SUMMARY_COUNT)
+            cells = await self._read_cells()
+            sample = decode(summary, cells, when)
+        except Exception as e:  # CancelledError is a BaseException: shutdown passes through
+            await self._record_failure(e, when)
+            return None
+        self._record_success(when)
+        try:
+            await self._on_sample(sample)
+        except Exception as e:
+            logger.warning(f'BMS sample handler failed: {e!r}')
+        return sample
+
+    async def _read(self, start: int, count: int) -> List[int]:
+        values: List[int] = []
+        for addr in range(start, start + count, CHUNK):
+            quantity = min(CHUNK, start + count - addr)
+            chunk = await asyncio.wait_for(
+                self._client.read_holding_registers(register_addr=addr, quantity=quantity), self._timeout_s)
+            if len(chunk) != quantity:
+                raise PollFailed(f'short response at {addr:#06x}: {len(chunk)} of {quantity} registers')
+            values.extend(chunk)
+        return values
+
+    async def _read_cells(self) -> List[int]:
+        cells: List[int] = []
+        for addr in range(CELLS_START, CELLS_END, CHUNK):
+            try:
+                chunk = await self._read(addr, CHUNK)
+            except Exception as e:
+                # Past the first chunk, an address the BMS doesn't have just
+                # means the cell list ended (only 0x1500-0x153F is verified).
+                if addr != CELLS_START and type(e).__name__ == 'IllegalDataAddressError':
+                    break
+                raise
+            cells.extend(chunk)
+            if 0 in chunk:
+                break
+        return cells
+
+    async def _record_failure(self, error: Exception, when: datetime) -> None:
+        await self._close_client()
+        self._failures += 1
+        if self._failures == 1:
+            self._failing_since = when
+        reason = f'{type(error).__name__}: {error}' if str(error) else type(error).__name__
+        if self._failures < BACKOFF_AFTER_FAILURES:
+            logger.info(f'BMS poll failed ({reason}), attempt {self._failures}')
+        elif self._failures == BACKOFF_AFTER_FAILURES:
+            logger.warning(f'BMS poll failed {self._failures} times in a row ({reason}); '
+                           f'backing off, next try in {self.interval:.0f} s')
+        else:
+            logger.debug(f'BMS poll failed ({reason}), attempt {self._failures}, next try in {self.interval:.0f} s')
+
+    def _record_success(self, when: datetime) -> None:
+        if self._failures:
+            outage = when - self._failing_since if self._failing_since else None
+            logger.info(f'BMS poll recovered after {self._failures} failed polls'
+                        + (f' ({outage.total_seconds():.0f} s)' if outage is not None else ''))
+        self._failures = 0
+        self._failing_since = None
+
+    async def _close_client(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.disconnect(), self._timeout_s)
+        except Exception:
+            pass
