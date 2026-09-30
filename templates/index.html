@@ -232,8 +232,10 @@
         const key = el.getAttribute('data-inverter');
         el.innerHTML = data[key];
       });
-      eventTarget.innerHTML = Object.entries(data)
-        .map(([k, v]) => `${k}: ${typeof v === 'object' && v !== null ? JSON.stringify(v) : v}<br>`).join('');
+      // textContent, not innerHTML: _control carries strings from MQTT
+      // (e.g. a rejected command's mode) that must not be parsed as HTML.
+      eventTarget.textContent = Object.entries(data)
+        .map(([k, v]) => `${k}: ${typeof v === 'object' && v !== null ? JSON.stringify(v) : v}`).join('\n');
 
       lastMessageReceivedAt = Date.now();
       lastReadDurationSeconds = data['_read_duration_seconds'];
