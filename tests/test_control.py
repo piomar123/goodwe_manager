@@ -361,6 +361,16 @@ class ExecutorReserveTest(unittest.TestCase):
         ex.tick(S(20), at(0))
         self.assertEqual(ex.tick(S(20), at(60))['ems_mode'], 3)
 
+    def test_resending_same_reserve_keeps_the_hold(self):
+        # The reserve topic is retained, so an MQTT reconnect re-delivers it.
+        ex = control.Executor(CFG)
+        ex.set_reserve(25)
+        ex.tick(S(26), at(0))
+        ex.tick(S(25), at(1))
+        self.assertEqual(ex.tick(S(25), at(31))['battery_discharge_depth'], 25)
+        ex.set_reserve(25)
+        self.assertEqual(ex.tick(S(25), at(32))['battery_discharge_depth'], 25)
+
     def test_reserve_cleared(self):
         ex = control.Executor(CFG)
         ex.set_reserve(25)

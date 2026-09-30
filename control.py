@@ -294,6 +294,8 @@ class Executor:
         self._reset_latches()
 
     def set_reserve(self, soc: Optional[int]) -> None:
+        if soc == self._reserve:
+            return  # a re-send (the topic is retained, so every reconnect): keep the hold
         self._reserve = soc
         self._reserve_latched = False
         self._reserve_deb.reset()
