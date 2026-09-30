@@ -4,6 +4,8 @@ Decoding is tested against real register dumps read from the Pylontech
 Force H2 BMS through the SolarMan logger on 2026-09-29 (SolarMan app showed
 cell temperatures 27.2 / 25.7 °C and SOH 97 % at the time).
 """
+import subprocess
+import sys
 import unittest
 from datetime import datetime
 
@@ -105,6 +107,42 @@ class PlausibilityTest(unittest.TestCase):
 
     def test_no_modules(self):
         self.assert_rejected(summary=with_reg(SUMMARY, 0x1118, 0), match='module')
+
+
+class LoadConfigTest(unittest.TestCase):
+    def test_disabled_without_host_or_serial(self):
+        for env in ({}, {'BMS_LOGGER_HOST': '192.168.1.221'}, {'BMS_LOGGER_SERIAL': '4060493924'},
+                    {'BMS_LOGGER_HOST': ' ', 'BMS_LOGGER_SERIAL': '4060493924'}):
+            with self.assertLogs('bms_poller', 'INFO') as logs:
+                self.assertIsNone(bms_poller.load_bms_config(env))
+            self.assertIn('BMS poller disabled', logs.output[0])
+
+    def test_defaults(self):
+        cfg = bms_poller.load_bms_config({'BMS_LOGGER_HOST': '192.168.1.221', 'BMS_LOGGER_SERIAL': '4060493924'})
+        self.assertEqual(cfg, bms_poller.BmsConfig('192.168.1.221', 4060493924, 8899, 1, 60))
+
+    def test_overrides(self):
+        cfg = bms_poller.load_bms_config({'BMS_LOGGER_HOST': 'h', 'BMS_LOGGER_SERIAL': '7',
+                                          'BMS_LOGGER_PORT': '9000', 'BMS_SLAVE_ID': '2', 'BMS_POLL_SECONDS': '30'})
+        self.assertEqual(cfg, bms_poller.BmsConfig('h', 7, 9000, 2, 30))
+
+    def test_invalid_number_disables_with_error(self):
+        for key in ('BMS_LOGGER_SERIAL', 'BMS_LOGGER_PORT', 'BMS_SLAVE_ID', 'BMS_POLL_SECONDS'):
+            env = {'BMS_LOGGER_HOST': 'h', 'BMS_LOGGER_SERIAL': '7', key: 'abc'}
+            with self.assertLogs('bms_poller', 'ERROR'):
+                self.assertIsNone(bms_poller.load_bms_config(env))
+
+    def test_poll_interval_is_clamped_to_ten_seconds(self):
+        with self.assertLogs('bms_poller', 'WARNING'):
+            cfg = bms_poller.load_bms_config({'BMS_LOGGER_HOST': 'h', 'BMS_LOGGER_SERIAL': '7', 'BMS_POLL_SECONDS': '5'})
+        self.assertEqual(cfg.poll_seconds, 10)
+
+    def test_disabled_config_never_imports_pysolarmanv5(self):
+        # Subprocess: other tests may import pysolarmanv5 into this process.
+        code = ("import sys, bms_poller; bms_poller.load_bms_config({}); "
+                "sys.exit(1 if 'pysolarmanv5' in sys.modules else 0)")
+        result = subprocess.run([sys.executable, '-c', code], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

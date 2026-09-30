@@ -12,7 +12,7 @@ default_client_factory, so a setup without the battery never loads it.
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List
+from typing import List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,51 @@ CELLS_START = 0x1500
 CELLS_END = 0x1600  # exclusive; only 0x1500-0x153F is verified to respond
 CHUNK = 32
 MAX_MODULE_SLOTS = 4  # 0x1118-0x111B; 0x111C onwards holds temperatures
+READ_TIMEOUT_S = 5.0
+MIN_POLL_SECONDS = 10  # protects the logger (it also uploads to the SolarMan cloud)
+
+
+@dataclass(frozen=True)
+class BmsConfig:
+    host: str
+    serial: int
+    port: int = 8899
+    slave_id: int = 1
+    poll_seconds: int = 60
+
+
+def load_bms_config(env: Mapping[str, str]) -> Optional[BmsConfig]:
+    """BmsConfig from BMS_* environment variables, or None (module off) when
+    BMS_LOGGER_HOST / BMS_LOGGER_SERIAL aren't set or a number doesn't parse.
+    Never raises - a bad BMS config must not stop goodwe_manager starting."""
+    host = (env.get('BMS_LOGGER_HOST') or '').strip()
+    serial = (env.get('BMS_LOGGER_SERIAL') or '').strip()
+    if not host or not serial:
+        logger.info('BMS poller disabled (BMS_LOGGER_HOST / BMS_LOGGER_SERIAL not set)')
+        return None
+    try:
+        config = BmsConfig(
+            host=host,
+            serial=int(serial),
+            port=int(env.get('BMS_LOGGER_PORT') or 8899),
+            slave_id=int(env.get('BMS_SLAVE_ID') or 1),
+            poll_seconds=int(env.get('BMS_POLL_SECONDS') or 60),
+        )
+    except ValueError as e:
+        logger.error(f'BMS poller disabled, invalid BMS_* setting: {e}')
+        return None
+    if config.poll_seconds < MIN_POLL_SECONDS:
+        logger.warning(f'BMS_POLL_SECONDS={config.poll_seconds} is below {MIN_POLL_SECONDS}, using {MIN_POLL_SECONDS}')
+        config = BmsConfig(config.host, config.serial, config.port, config.slave_id, MIN_POLL_SECONDS)
+    return config
+
+
+def default_client_factory(config: BmsConfig):
+    """An unconnected SolarMan V5 client. The import lives here so
+    pysolarmanv5 is only loaded when the module is enabled."""
+    from pysolarmanv5 import PySolarmanV5Async
+    return PySolarmanV5Async(config.host, config.serial, port=config.port, mb_slave_id=config.slave_id,
+                             socket_timeout=READ_TIMEOUT_S, auto_reconnect=False)
 
 
 class BmsDecodeError(ValueError):
