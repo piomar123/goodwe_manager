@@ -22,6 +22,26 @@ object. **Every value is a string** (mirrors how `inverter_history` rows
 are read back) - HA/Predbat consumers must coerce numeric fields
 themselves.
 
+## `bms` (not retained, every `BMS_POLL_SECONDS`, default 60 s)
+
+Only published when the optional Pylontech BMS poller is enabled
+(`BMS_LOGGER_HOST` / `BMS_LOGGER_SERIAL` in `.env`). One accepted BMS
+sample, with **real JSON numbers** (unlike `telemetry`):
+
+```json
+{"timestamp": "2026-09-29 08:45:30", "timestamp_epoch": 1790664330,
+ "pack_voltage": 196.5, "bms_temperature": 36.0, "soc": 33, "soh": 97,
+ "cell_voltage_max": 3.276, "cell_voltage_min": 3.273,
+ "cell_voltage_max_id": 3, "cell_voltage_min_id": 24,
+ "cell_temp_max": 27.2, "cell_temp_min": 25.7,
+ "module_voltages": [98.25, 98.24], "cell_mv": [3276, 3275, ...]}
+```
+
+`bms_temperature` is the BMS's own sensor (the same 36 °C the inverter
+reports as `battery_temperature`); `cell_temp_max`/`_min` are the cells.
+Nothing is published while the BMS can't be read - use `expire_after` on
+HA sensors.
+
 ## `prices/export` (retained, published at startup and on day rollover)
 
 ```json

@@ -152,6 +152,15 @@ class MqttBridgeEnabledTest(unittest.TestCase):
         self.assertEqual(json.loads(payload), {'ppv': '100'})
         self.assertFalse(retain)
 
+
+    def test_publish_bms_is_not_retained_and_keeps_numbers(self):
+        asyncio.run(self.bridge.connect())
+        asyncio.run(self.bridge.publish_bms({'soh': 97, 'cell_temp_max': 27.2, 'cell_mv': [3276, 3275]}))
+
+        topic, payload, retain = self.fake_client.published[-1]
+        self.assertEqual(topic, 'goodwe/bms')
+        self.assertFalse(retain)
+        self.assertEqual(json.loads(payload), {'soh': 97, 'cell_temp_max': 27.2, 'cell_mv': [3276, 3275]})
     def test_publish_export_prices_is_retained(self):
         asyncio.run(self.bridge.connect())
         asyncio.run(self.bridge.publish_export_prices({'raw_today': [], 'raw_tomorrow': []}))
