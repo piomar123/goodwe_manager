@@ -1306,7 +1306,7 @@ Expected: ERROR `AttributeError: module 'main' has no attribute 'BMS_CONFIG'`
 
 In `main.py`:
 
-a) Imports, in the local-module block (alphabetical, before `eco_encoder`):
+a) Imports, in the local-module block (alphabetical, before `import control`):
 
 ```python
 import bms_poller
@@ -1417,7 +1417,7 @@ Expected: all PASS.
 - [ ] **Step 5: Run the whole suite**
 
 Run: `../../venv/bin/python -m unittest discover -s tests`
-Expected: OK. The original 367 tests plus the new ones must all pass,
+Expected: OK. The original 488 tests plus the new ones must all pass,
 especially `test_main_dry_run_guards` (`run()` behaviour in dry-run is
 unchanged).
 
@@ -1438,10 +1438,10 @@ Not code. Do these after the branch is reviewed, timed between executor
 commands. Check `sensor.goodwe_control_mode` first: a restart drops the
 active command until Predbat's next call.
 
-- [ ] The Pi runs `predbat-control-executor` (PR #40) plus a stale merge of
-  the closed PR #41. Reset its checkout to
-  `origin/predbat-control-executor`, merge `origin/bms-poller`, and run
-  `venv/bin/pip install -r requirements.txt`.
+- [ ] The Pi runs `predbat-control-executor` plus a stale merge of the
+  closed PR #41. PR #40 is merged, so switch it to `main` once this branch
+  is merged. Before that, to test, use a detached checkout of
+  `origin/bms-poller`. Then run `venv/bin/pip install -r requirements.txt`.
 - [ ] Check the logger's current IP (discovery broadcast on UDP 48899 from
   `wlan0`) and add `BMS_LOGGER_HOST=<ip>` and
   `BMS_LOGGER_SERIAL=4060493924` to `.env`.
