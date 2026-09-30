@@ -11,12 +11,28 @@ import unittest
 import mqtt_bridge
 
 
+class FakeMessage:
+    def __init__(self, topic, payload):
+        self.topic = topic
+        self.payload = payload
+
+
 class FakeMqttClient:
     def __init__(self):
         self.published = []
         self.connected = False
         self.disconnected = False
         self.aenter_count = 0
+        self.subscribed = []
+        self._inbox = None
+
+    @property
+    def inbox(self):
+        # Created lazily inside the running loop - asyncio.Queue() at
+        # construction time fails on Python < 3.10 (no current event loop).
+        if self._inbox is None:
+            self._inbox = asyncio.Queue()
+        return self._inbox
 
     async def __aenter__(self):
         self.connected = True
@@ -28,6 +44,20 @@ class FakeMqttClient:
 
     async def publish(self, topic, payload, retain=False):
         self.published.append((topic, payload, retain))
+
+    async def subscribe(self, topic, qos=0):
+        self.subscribed.append((topic, qos))
+
+    @property
+    def messages(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        while True:
+            item = await self.inbox.get()
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
 
 class MqttBridgeDisabledTest(unittest.TestCase):
@@ -271,6 +301,122 @@ class MqttBridgeReconnectTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             asyncio.run(failing_bridge.connect())
         self.assertIsNone(failing_bridge._client)
+
+
+class MqttBridgeControlTest(unittest.TestCase):
+    def test_subscribes_and_dispatches_control_messages(self):
+        async def go():
+            client = FakeMqttClient()
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            received = []
+            bridge.set_control_handler(lambda suffix, payload: received.append((suffix, payload)))
+            await bridge.connect()
+            self.assertEqual(client.subscribed, [('goodwe/control/set', 1), ('goodwe/control/reserve/set', 1)])
+            await client.inbox.put(FakeMessage('goodwe/control/set', b'{"mode":"auto"}'))
+            await client.inbox.put(FakeMessage('goodwe/control/reserve/set', b'25'))
+            await asyncio.sleep(0.01)
+            self.assertEqual(received, [('control/set', b'{"mode":"auto"}'), ('control/reserve/set', b'25')])
+            await bridge.publish_offline_and_disconnect()
+        asyncio.run(go())
+
+    def test_no_subscription_without_handler(self):
+        async def go():
+            client = FakeMqttClient()
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            await bridge.connect()
+            self.assertEqual(client.subscribed, [])
+        asyncio.run(go())
+
+    def test_handler_exception_does_not_stop_reader(self):
+        async def go():
+            client = FakeMqttClient()
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            received = []
+
+            def handler(suffix, payload):
+                if payload == b'boom':
+                    raise ValueError('boom')
+                received.append(payload)
+            bridge.set_control_handler(handler)
+            await bridge.connect()
+            await client.inbox.put(FakeMessage('goodwe/control/set', b'boom'))
+            await client.inbox.put(FakeMessage('goodwe/control/set', b'ok'))
+            await asyncio.sleep(0.01)
+            self.assertEqual(received, [b'ok'])
+            await bridge.publish_offline_and_disconnect()
+        asyncio.run(go())
+
+    def test_resubscribes_after_reconnect(self):
+        async def go():
+            clients = [FakeMqttClient(), FakeMqttClient()]
+            factory = iter(clients)
+            now = [0.0]
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: next(factory),
+                                            reconnect_interval_seconds=0, now_fn=lambda: now[0])
+            received = []
+            bridge.set_control_handler(lambda s, p: received.append((s, p)))
+            await bridge.connect()
+            await clients[0].inbox.put(ConnectionError('broker gone'))
+            await asyncio.sleep(0.01)
+            now[0] = 100.0
+            await bridge.publish_telemetry({'x': '1'})  # triggers the reconnect path
+            self.assertEqual(clients[1].subscribed[0], ('goodwe/control/set', 1))
+            await clients[1].inbox.put(FakeMessage('goodwe/control/reserve/set', b'30'))
+            await asyncio.sleep(0.01)
+            self.assertEqual(received, [('control/reserve/set', b'30')])
+            await bridge.publish_offline_and_disconnect()
+        asyncio.run(go())
+
+    def test_no_subscription_when_status_publish_fails(self):
+        async def go():
+            client = FakeMqttClient()
+
+            async def broken(*a, **kw):
+                raise ConnectionError('gone')
+            client.publish = broken
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            bridge.set_control_handler(lambda s, p: None)
+            await bridge.connect()
+            self.assertEqual(client.subscribed, [])
+        asyncio.run(go())
+
+    def test_failed_subscribe_closes_the_client(self):
+        async def go():
+            client = FakeMqttClient()
+
+            async def broken(*a, **kw):
+                raise ConnectionError('gone')
+            client.subscribe = broken
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            bridge.set_control_handler(lambda s, p: None)
+            await bridge.connect()
+            self.assertTrue(client.disconnected)
+            self.assertIsNone(bridge._client)
+        asyncio.run(go())
+
+    def test_cancelled_subscribe_drops_the_client(self):
+        async def go():
+            client = FakeMqttClient()
+
+            async def slow(*a, **kw):
+                await asyncio.sleep(10)
+            client.subscribe = slow
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            bridge.set_control_handler(lambda s, p: None)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(bridge.connect(), timeout=0.01)
+            self.assertIsNone(bridge._client)  # next publish reconnects and re-subscribes
+            self.assertTrue(client.disconnected)
+        asyncio.run(go())
+
+    def test_publish_control_state_is_retained(self):
+        async def go():
+            client = FakeMqttClient()
+            bridge = mqtt_bridge.MqttBridge(host='broker', client_factory=lambda **kw: client)
+            await bridge.connect()
+            await bridge.publish_control_state({'mode': 'auto'})
+            self.assertIn(('goodwe/control/state', '{"mode": "auto"}', True), client.published)
+        asyncio.run(go())
 
 
 if __name__ == '__main__':

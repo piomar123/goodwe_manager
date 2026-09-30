@@ -99,6 +99,38 @@ methodology and the sensor-level quirks (BMS self-consumption offset,
 grid phase sign disagreement, cross-register poll timing skew) it
 depends on and works around.
 
+## Battery control from Predbat / other optimizers (optional)
+
+With the MQTT bridge enabled, `CONTROL_MODE` lets an optimizer drive the
+battery through MQTT commands (`control/set`, see `MQTT_TOPICS.md` for the
+payloads, the Home Assistant script and the Predbat `apps.yaml` example).
+`off` (default) changes nothing; `shadow` computes and publishes what it
+would do in `control/state` but never writes; `on` writes to the inverter.
+`CONTROL_CHARGE_CURRENT_A`, `CONTROL_DISCHARGE_CURRENT_A` and
+`CONTROL_MIN_SOC` are your normal battery current limits and on-grid
+minimum SoC - required when not `off`, and restored whenever the battery
+isn't frozen.
+
+| Mode | What the inverter does (measured on a GW8KN-ET) |
+|---|---|
+| `auto` | normal self-use (EMS AUTO) |
+| `charge` P | battery charges at exactly P W; shortfall from the grid |
+| `export` P | battery discharges at exactly P W; PV not curtailed, the rest is exported |
+| `freeze_charge` | no discharge (on-grid minimum SoC raised to the current SoC); surplus PV still charges |
+| `freeze_export` | no charging (charge current 0); surplus exported, battery covers the deficit |
+
+Fail-safe rules: every command expires (at most 60 min ahead) and falls
+back to `auto`; a restart falls back to `auto`; a grid outage switches to
+`auto` with the normal limits until 60 s after the grid is back. There is
+no inverter-side watchdog on this firmware, so if the Pi dies the inverter
+keeps the last mode.
+
+Before `on`: disable the eco mode slots (they still act in `auto`; enabled
+ones show up as warnings), and while control is on, change the on-grid
+minimum SoC through `CONTROL_MIN_SOC`, not SolarGo - the executor rewrites
+it. To change other settings in SolarGo, set a dashboard override to `auto`
+first, otherwise an active command is re-applied within ~10 s.
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 

@@ -9,6 +9,7 @@ Disabled entirely (every publish_* method becomes a no-op) when no
 MQTT_HOST is configured - a fresh checkout or another user's fork with no
 new env vars set behaves exactly as before this feature existed.
 """
+import asyncio
 import json
 import logging
 import time
@@ -17,6 +18,8 @@ from typing import Any, Callable, Optional
 import aiomqtt
 
 logger = logging.getLogger(__name__)
+
+CONTROL_TOPICS = ('control/set', 'control/reserve/set')
 
 
 class MqttBridge:
@@ -53,6 +56,8 @@ class MqttBridge:
         self._reconnect_interval_seconds = reconnect_interval_seconds
         self._now_fn = now_fn or time.monotonic
         self._last_connect_attempt = None
+        self._control_handler: Optional[Callable[[str, bytes], None]] = None
+        self._reader_task: Optional[asyncio.Task] = None
 
     @property
     def enabled(self) -> bool:
@@ -106,6 +111,21 @@ class MqttBridge:
             raise
         self._client = client
         await self._publish('bridge/status', 'online', retain=True)
+        if self._control_handler is not None and self._client is client:
+            try:
+                await self._subscribe_control(client)
+            except BaseException as e:
+                # Also on cancellation (callers wrap publishes in wait_for):
+                # a connected client without the control subscription would
+                # never re-subscribe, since later publishes succeed.
+                logger.warning(f'Could not subscribe to control topics: {e!r}')
+                self._client = None
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception as close_error:
+                    logger.debug(f'Error closing MQTT client after failed subscribe: {close_error}')
+                if not isinstance(e, Exception):
+                    raise
 
     async def publish_offline_and_disconnect(self) -> None:
         """Explicit offline publish before a clean disconnect - the MQTT
@@ -114,6 +134,9 @@ class MqttBridge:
         leaving the retained status topic stuck on 'online'."""
         if not self.enabled or self._client is None:
             return
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            self._reader_task = None
         await self._publish('bridge/status', 'offline', retain=True)
         try:
             await self._client.__aexit__(None, None, None)
@@ -138,6 +161,41 @@ class MqttBridge:
 
     async def publish_pv_forecast(self, series: dict) -> None:
         await self._publish('forecast/pv', json.dumps(series), retain=True)
+
+    def set_control_handler(self, handler: Callable[[str, bytes], None]) -> None:
+        """Subscribe to the control topics on every (re)connect and call
+        handler(topic_suffix, payload) for each message, on the asyncio loop.
+        Must be set before connect() - main.py does it at import time."""
+        self._control_handler = handler
+
+    async def publish_control_state(self, state: dict) -> None:
+        await self._publish('control/state', json.dumps(state), retain=True)
+
+    async def _subscribe_control(self, client) -> None:
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+        for suffix in CONTROL_TOPICS:
+            await client.subscribe(self._topic(suffix), qos=1)
+        self._reader_task = asyncio.create_task(self._read_control_messages(client))
+
+    async def _read_control_messages(self, client) -> None:
+        prefix = self._prefix + '/'
+        try:
+            async for message in client.messages:
+                topic = str(getattr(message.topic, 'value', message.topic))
+                suffix = topic[len(prefix):] if topic.startswith(prefix) else topic
+                try:
+                    self._control_handler(suffix, message.payload)
+                except Exception as e:
+                    logger.warning(f'Control message on {topic} failed: {e}')
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Same recovery path as a failed publish: drop the client so the
+            # next ~1 Hz telemetry publish reconnects (and re-subscribes).
+            logger.warning(f'MQTT control subscription ended: {e}')
+            if self._client is client:
+                self._client = None
 
     async def _publish(self, topic_suffix: str, payload, retain: bool) -> None:
         if not self.enabled:

@@ -24,6 +24,8 @@ import matplotlib
 from flask import request
 from goodwe.sensor import EcoModeV2
 
+import control
+import control_runtime
 import eco_encoder
 import export_price
 import forecast
@@ -57,6 +59,12 @@ MQTT_TOPIC_PREFIX = os.environ.get('MQTT_TOPIC_PREFIX', 'goodwe')
 TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 RCE_EXPORT_GRANULARITY = os.environ.get('RCE_EXPORT_GRANULARITY', '15min')
 RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
+# Invalid CONTROL_* values fail startup on purpose - better than silently
+# running without the control the user configured.
+CONTROL_CONFIG = control.config_from_env(os.environ)
+# Today's control write count (control_runtime), next to data.db, so the
+# CONTROL_MAX_WRITES_PER_DAY warning keeps counting across restarts.
+CONTROL_WRITES_PATH = 'control_writes.json'
 WARSAW_TZ = ZoneInfo('Europe/Warsaw')
 # manager.log rotation: normal DEBUG output is ~50KB/day, so this keeps
 # months of history while capping disk use at ~60MB even if something
@@ -226,6 +234,8 @@ class AsyncioThread(threading.Thread):
         logger.info(f'Connecting to {self._inverter_address}')
         self._inverter = await goodwe.connect(self._inverter_address, family='ET', timeout=1, retries=60)
         logger.info(f'Connected to the inverter')
+        if control_runtime_instance is not None:
+            control_runtime_instance.attach(self._inverter)
         self._db_conn = await storage.init_db_async(storage.DATA_DB_PATH, sensor_columns())
         try:
             await mqtt.connect()
@@ -278,6 +288,11 @@ class AsyncioThread(threading.Thread):
                     '_read_duration_seconds': round(read_done - read_start, 3),
                     '_server_received_at': server_received_at,
                 }
+                if control_runtime_instance is not None and control_runtime_instance.last_state is not None:
+                    # Previous iteration's state - running the control step
+                    # before announcing would delay every SSE update by its
+                    # register reads.
+                    announce_payload['_control'] = control_runtime_instance.last_state
                 announcer.announce(json.dumps(announce_payload))
                 new_hour_start, _ = storage.current_hour_bounds(datetime.now())
                 if new_hour_start != current_hour_start:
@@ -296,6 +311,8 @@ class AsyncioThread(threading.Thread):
                         await asyncio.wait_for(mqtt.publish_telemetry(sensors_data_with_calculated), timeout=5)
                     except Exception as e:
                         logger.warning(f"Could not publish telemetry: {e}")
+                if control_runtime_instance is not None:
+                    await control_runtime_instance.step(inverter_runtime)
                 new_day_start, _ = storage.current_day_bounds(datetime.now())
                 if new_day_start != current_day_start:
                     current_day_start = new_day_start
@@ -432,6 +449,11 @@ class AsyncioThread(threading.Thread):
 
 mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USERNAME,
                               password=MQTT_PASSWORD, topic_prefix=MQTT_TOPIC_PREFIX)
+control_runtime_instance: Optional[control_runtime.ControlRuntime] = None
+if CONTROL_CONFIG is not None:
+    control_runtime_instance = control_runtime.ControlRuntime(CONTROL_CONFIG, mqtt,
+                                                                counter_path=CONTROL_WRITES_PATH)
+    mqtt.set_control_handler(control_runtime_instance.on_mqtt_message)
 
 
 def _fire_and_forget(coro) -> None:
@@ -660,7 +682,8 @@ def get_config():
     logger.debug('Waiting for the response from the inverter')
     settings: dict[str, Any] = settings_future.result(timeout=60)
     logger.info(settings)
-    return flask.render_template('config.html', settings=settings)
+    return flask.render_template('config.html', settings=settings,
+                                 control_state=control_runtime_instance.last_state if control_runtime_instance else None)
 
 
 @app.post('/config/<setting>')
@@ -679,6 +702,54 @@ def update_config(setting: str):
     write_future = asyncio_thread.run_coroutine_threadsafe(write_inverter_setting(setting, value))
     write_future.result(timeout=60)
     return flask.redirect('/config')
+
+
+CONTROL_CALL_TIMEOUT_S = 10
+
+
+async def _control_call(fn, *args):
+    return fn(*args)
+
+
+def _run_control_call(fn, *args):
+    """Run fn on the asyncio loop; a timeout doesn't cancel it - the call
+    may still land once the loop catches up."""
+    try:
+        asyncio_thread.run_coroutine_threadsafe(_control_call(fn, *args)).result(timeout=CONTROL_CALL_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        return flask.Response('Control loop busy - the change may still apply in a moment', status=504)
+    return flask.redirect('/')
+
+
+def _require_control():
+    if control_runtime_instance is None:
+        flask.abort(404)
+
+
+@app.get('/control/state')
+def get_control_state():
+    _require_control()
+    return flask.jsonify(control_runtime_instance.last_state or {})
+
+
+@app.post('/control/override')
+def set_control_override():
+    _require_control()
+    try:
+        cmd = control.make_override(request.form.get('mode', ''), request.form.get('power_w'),
+                                    request.form.get('target_soc'), request.form.get('duration_min'),
+                                    datetime.now().astimezone())
+    except (control.CommandError, ValueError) as e:
+        return flask.Response(f'Invalid override: {e}', status=400)
+    logger.info(f'Dashboard override: {cmd}')
+    return _run_control_call(control_runtime_instance.set_override, cmd)
+
+
+@app.post('/control/override/clear')
+def clear_control_override():
+    _require_control()
+    logger.info('Dashboard override cleared')
+    return _run_control_call(control_runtime_instance.clear_override)
 
 
 @app.get('/prices')
@@ -1038,6 +1109,9 @@ def main():
     matplotlib.use('agg')
     configure_logging()
     install_uncaught_exception_logging(logger)
+    if CONTROL_CONFIG is not None:
+        # Logged here, not at import - logging isn't configured until now.
+        logger.info(f'Battery control enabled in {CONTROL_CONFIG.mode} mode')
     if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
         logger.warning("Running in dry-run mode without inverter connection")
         dry_run = True

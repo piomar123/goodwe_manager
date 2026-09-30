@@ -8,6 +8,11 @@ grouped under `Unreleased` until that changes.
 
 ### Changed
 
+- Battery control executor (off by default): MQTT `control/set`/`control/reserve/set`/`control/state`,
+  dashboard override, `CONTROL_*` env keys (`CONTROL_MIN_SOC` new: the executor owns the on-grid
+  minimum SoC). No behaviour change unless `CONTROL_MODE` is set.
+  Today's write count is kept in `control_writes.json` (git-ignored) so the
+  `CONTROL_MAX_WRITES_PER_DAY` warning keeps counting across restarts.
 - Live telemetry now writes to SQLite (`data.db`, `inverter_history` table)
   instead of per-run `data-*.csv` files. **If you have existing CSV files,
   run the one-off migration script** - see the README's "Upgrading" section.

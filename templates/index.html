@@ -102,6 +102,41 @@
         </div>
       </div>
     </div>
+    <div class="row" id="control-panel" style="display: none">
+      <div class="col">
+        <h4>Battery control <span id="control-shadow" class="badge bg-secondary" style="display: none">shadow</span></h4>
+        <div>Mode: <b id="control-effective"></b> <span id="control-reason" class="text-muted"></span></div>
+        <div>Command: <span id="control-command"></span></div>
+        <div>Applied: <span id="control-applied" class="badge"></span> <span id="control-error" class="text-danger"></span></div>
+        <div>Reserve: <span id="control-reserve"></span></div>
+        <div id="control-warnings" class="text-warning"></div>
+        <div class="text-muted small">Settings: <span id="control-registers"></span> · writes today <span id="control-writes"></span></div>
+        <div class="mt-1">
+          <span id="control-override"></span>
+          <form id="control-override-clear" method="post" action="/control/override/clear" style="display: none">
+            <button class="btn btn-sm btn-outline-secondary" type="submit">Clear override</button>
+          </form>
+        </div>
+        <details class="mt-1">
+          <summary class="text-muted small">Manual override</summary>
+        <form class="row row-cols-lg-auto g-2 align-items-center mt-1" method="post" action="/control/override">
+          <div class="col-12">
+            <select class="form-select form-select-sm" name="mode">
+              <option value="auto">auto</option>
+              <option value="charge">charge</option>
+              <option value="export">export</option>
+              <option value="freeze_charge">freeze charge</option>
+              <option value="freeze_export">freeze export</option>
+            </select>
+          </div>
+          <div class="col-12"><input class="form-control form-control-sm" name="power_w" type="number" min="100" placeholder="power W"></div>
+          <div class="col-12"><input class="form-control form-control-sm" name="target_soc" type="number" min="0" max="100" placeholder="target %"></div>
+          <div class="col-12"><input class="form-control form-control-sm" name="duration_min" type="number" min="15" max="720" value="60" required> min</div>
+          <div class="col-12"><button class="btn btn-sm btn-warning" type="submit">Override</button></div>
+        </form>
+        </details>
+      </div>
+    </div>
     <div class="row">
       <hr>
       <div class="col">
@@ -125,6 +160,33 @@
     var readBadge = document.getElementById('read-badge');
     var deliveryBadge = document.getElementById('delivery-badge');
     var eventSource = new EventSource('/listen');
+
+    function renderControl(c) {
+      const panel = document.getElementById('control-panel');
+      if (!c) { panel.style.display = 'none'; return; }
+      panel.style.display = '';
+      const text = (id, v) => { document.getElementById(id).textContent = v; };
+      text('control-effective', c.effective_mode);
+      text('control-reason', c.reason ? `(${c.reason})` : '');
+      document.getElementById('control-shadow').style.display = c.shadow ? '' : 'none';
+      const cmd = c.mode === 'auto' && !c.source ? 'none'
+        : `${c.mode}${c.power_w ? ' ' + c.power_w + ' W' : ''}${c.power_clamped ? ' (clamped to ' + c.power_applied_w + ' W)' : ''}` +
+          `${c.target_soc != null ? ' → ' + c.target_soc + '%' : ''} from ${c.source}` +
+          `${c.expires_at ? ' until ' + new Date(c.expires_at).toLocaleTimeString() : ''}`;
+      text('control-command', cmd);
+      const applied = document.getElementById('control-applied');
+      applied.textContent = c.applied ? 'yes' : 'no';
+      applied.className = 'badge ' + (c.applied ? 'bg-success' : 'bg-danger');
+      text('control-error', c.last_error || '');
+      text('control-reserve', c.reserve_soc != null ? c.reserve_soc + '%' : 'not set');
+      text('control-warnings', (c.warnings || []).map(w => '⚠ ' + w).join(' · '));
+      text('control-registers', Object.entries(c.registers || {}).map(([k, v]) => `${k}=${v}`).join(', '));
+      text('control-writes', c.writes_today);
+      text('control-override', c.override
+        ? `Override: ${c.override.mode}${c.override.power_w ? ' ' + c.override.power_w + ' W' : ''} until ${new Date(c.override.until).toLocaleTimeString()}`
+        : '');
+      document.getElementById('control-override-clear').style.display = c.override ? 'inline' : 'none';
+    }
 
     // Two independent lag sources, tracked separately:
     //  - readDurationSeconds: how long the inverter itself took to answer
@@ -165,11 +227,15 @@
 
     eventSource.onmessage = function (e) {
       let data = JSON.parse(e.data);
+      renderControl(data['_control']);
       document.querySelectorAll("[data-inverter]").forEach(el => {
         const key = el.getAttribute('data-inverter');
         el.innerHTML = data[key];
       });
-      eventTarget.innerHTML = Object.entries(data).map(([k, v]) => `${k}: ${v}<br>`).join('');
+      // textContent, not innerHTML: _control carries strings from MQTT
+      // (e.g. a rejected command's mode) that must not be parsed as HTML.
+      eventTarget.textContent = Object.entries(data)
+        .map(([k, v]) => `${k}: ${typeof v === 'object' && v !== null ? JSON.stringify(v) : v}`).join('\n');
 
       lastMessageReceivedAt = Date.now();
       lastReadDurationSeconds = data['_read_duration_seconds'];

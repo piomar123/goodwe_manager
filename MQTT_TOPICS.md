@@ -1,7 +1,7 @@
 # MQTT topics published by the optional bridge
 
-Reference for the topics/payloads `mqtt_bridge.py` publishes when
-`MQTT_HOST` is set (see README.MD's "MQTT bridge" section for setup).
+Reference for the topics/payloads `mqtt_bridge.py` publishes (and, for
+battery control, subscribes to) when `MQTT_HOST` is set (see README.MD's "MQTT bridge" section for setup).
 Every topic is prefixed with `MQTT_TOPIC_PREFIX` (default `goodwe`) -
 paths below omit the prefix for brevity, e.g. `telemetry` is really
 published to `goodwe/telemetry`.
@@ -195,6 +195,303 @@ mqtt:
       payload_off: "offline"
       device_class: connectivity
 ```
+
+## `control/set` (subscribed, QoS 1, not retained) - only when `CONTROL_MODE` is `shadow` or `on`
+
+```json
+{"mode": "charge", "power_w": 3000, "target_soc": 80, "source": "predbat", "ttl_s": 900}
+```
+
+| Field | Meaning |
+|---|---|
+| `mode` | `auto`, `charge`, `export`, `freeze_charge`, `freeze_export` |
+| `power_w` | required for `charge`/`export`; clamped to 100 W … `CONTROL_MAX_BATTERY_W` (the inverter enforces the live BMS limit itself; `bms_charge_limit_w`/`bms_discharge_limit_w` in the state show it) |
+| `target_soc` | optional for `charge`/`export`: charge → `freeze_charge` once reached; export → `auto` once reached |
+
+`freeze_charge` raises the on-grid minimum SoC (`battery_discharge_depth`) to the current SoC (never below `CONTROL_MIN_SOC`) and follows a rising SoC in 3-point steps; before the first SoC reading it stays `auto` (`reason: waiting for SoC`). The inverter only discharges again 5 points above its minimum, so a freeze ending near `CONTROL_MIN_SOC` shows a warning.
+| `ttl_s` / `expires_at` | one required unless `mode` is `auto`; max 3600 s / 60 min ahead. Re-send before it runs out (Predbat: `repeat: true`) |
+| `stop` | with `mode: auto` only: `charge` or `export` - clears the current command only if it is in that domain |
+| `source`, `id` | free text, echoed in the state |
+
+Invalid commands are rejected (the current one stays) and reported in `control/state.last_error`.
+
+## `control/reserve/set` (subscribed, retained)
+
+Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or below it (for 30 s) switches to `freeze_charge` until SoC is 2 points above.
+
+## `control/state` (retained, on change and every 10 s)
+
+```json
+{"mode": "charge", "effective_mode": "freeze_charge", "power_w": 3000, "power_applied_w": 3000,
+ "power_clamped": false, "bms_charge_limit_w": 3420, "bms_discharge_limit_w": 3420, "target_soc": 80, "source": "predbat", "expires_at": "2026-09-26T15:10:00+02:00",
+ "since": "2026-09-26T14:58:12+02:00", "override": null, "reserve_soc": 25, "reason": "target_soc reached",
+ "shadow": false, "off_grid": false, "freeze_floor": 80, "applied": true, "last_error": null, "warnings": [],
+ "writes_today": 14,
+ "registers": {"ems_mode": 1, "ems_power_limit": 0, "battery_charge_current": 19.0,
+               "battery_discharge_current": 19.0, "battery_discharge_depth": 80, "soc_upper_limit": 100,
+               "work_mode": 3}}
+```
+
+`applied` is true only when the last read-back of all five mode settings matches what `effective_mode` needs. `off_grid` is true during a grid outage (and 60 s after it), when everything is held at `auto`.
+
+## Home Assistant + Predbat example
+
+As configured in the `home-assistant-raspberry4` repo (Predbat v9.1.0,
+checked against its `inverter.py`). Predbat calls the service templates,
+which run an HA script that publishes the JSON command; the executor's
+state comes back as MQTT sensors. Predbat also writes charge/discharge
+rate, target SoC, windows and schedule switches - these are HA helpers
+holding Predbat's own view (the rate helper is what it passes as
+`power`); only the reserve reaches the executor.
+
+`configuration.yaml`:
+
+```yaml
+mqtt:
+  sensor:
+    - name: "Goodwe Control Mode"
+      unique_id: goodwe_control_mode
+      state_topic: "goodwe/control/state"
+      value_template: "{{ value_json.effective_mode }}"
+      json_attributes_topic: "goodwe/control/state"
+      availability_topic: "goodwe/bridge/status"
+      payload_available: "online"
+      payload_not_available: "offline"
+      icon: mdi:battery-sync
+    - name: "Goodwe Control Reason"
+      unique_id: goodwe_control_reason
+      state_topic: "goodwe/control/state"
+      value_template: "{{ value_json.reason }}"
+      availability_topic: "goodwe/bridge/status"
+      payload_available: "online"
+      payload_not_available: "offline"
+      icon: mdi:information-outline
+    - name: "Goodwe Control Warnings"
+      unique_id: goodwe_control_warnings
+      state_topic: "goodwe/control/state"
+      # State is capped at 255 chars by HA; the full list is in the
+      # warnings attribute of Goodwe Control Mode.
+      value_template: >-
+        {% set w = (value_json.warnings or []) + ([value_json.last_error] if value_json.last_error else []) %}
+        {{ (w | join('; ') if w else 'none')[:250] }}
+      availability_topic: "goodwe/bridge/status"
+      payload_available: "online"
+      payload_not_available: "offline"
+      icon: mdi:alert-outline
+  binary_sensor:
+    - name: "Goodwe Control Applied"
+      unique_id: goodwe_control_applied
+      state_topic: "goodwe/control/state"
+      value_template: "{{ 'ON' if value_json.applied else 'OFF' }}"
+      availability_topic: "goodwe/bridge/status"
+      payload_available: "online"
+      payload_not_available: "offline"
+    - name: "Goodwe Off Grid"
+      unique_id: goodwe_off_grid
+      state_topic: "goodwe/control/state"
+      value_template: "{{ 'ON' if value_json.off_grid else 'OFF' }}"
+      availability_topic: "goodwe/bridge/status"
+      payload_available: "online"
+      payload_not_available: "offline"
+      device_class: problem
+  number:
+    - name: "Goodwe Reserve"
+      unique_id: goodwe_reserve
+      command_topic: "goodwe/control/reserve/set"
+      state_topic: "goodwe/control/state"
+      value_template: "{{ value_json.reserve_soc | int(0) }}"
+      retain: true
+      min: 0
+      max: 100
+      step: 1
+      unit_of_measurement: "%"
+      mode: box
+      icon: mdi:battery-lock
+
+input_boolean:
+  goodwe_scheduled_charge_enable:
+    name: "Goodwe scheduled charge enable (Predbat)"
+    icon: mdi:battery-clock
+  goodwe_scheduled_discharge_enable:
+    name: "Goodwe scheduled discharge enable (Predbat)"
+    icon: mdi:battery-clock-outline
+
+input_datetime:
+  goodwe_charge_start_time:
+    name: "Goodwe charge start (Predbat)"
+    has_date: false
+    has_time: true
+  goodwe_charge_end_time:
+    name: "Goodwe charge end (Predbat)"
+    has_date: false
+    has_time: true
+  goodwe_discharge_start_time:
+    name: "Goodwe discharge start (Predbat)"
+    has_date: false
+    has_time: true
+  goodwe_discharge_end_time:
+    name: "Goodwe discharge end (Predbat)"
+    has_date: false
+    has_time: true
+
+# EV charge target for Predbat's car_charging_limit (%). No `initial:` so
+# HA restores the last value across restarts. The finish time and current
+# SoC are Predbat's own entities (select.predbat_car_charging_plan_time,
+# input_number.predbat_car_charging_manual_soc_kwh).
+
+input_number:
+  goodwe_charge_rate:
+    name: "Goodwe charge rate (Predbat)"
+    min: 0
+    max: 3400
+    step: 1
+    unit_of_measurement: "W"
+    mode: box
+  goodwe_discharge_rate:
+    name: "Goodwe discharge rate (Predbat)"
+    min: 0
+    max: 3400
+    step: 1
+    unit_of_measurement: "W"
+    mode: box
+  goodwe_charge_limit:
+    name: "Goodwe charge limit (Predbat)"
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+```
+
+`scripts.yaml`:
+
+```yaml
+script:
+  goodwe_control:
+    alias: "GoodWe control command"
+    mode: queued
+    max: 10
+    fields:
+      control_mode:
+        description: "auto, charge, export, freeze_charge or freeze_export"
+      power:
+        description: "W, for charge/export"
+      target_soc:
+        description: "%, optional for charge/export"
+      stop:
+        description: "charge or export, only with mode auto"
+    sequence:
+      - action: mqtt.publish
+        data:
+          topic: "goodwe/control/set"
+          qos: 1
+          retain: false
+          payload: >-
+            {% set cmd = {'mode': control_mode, 'source': 'predbat', 'ttl_s': 900} %}
+            {% if power is defined and power not in ('', None) and control_mode in ('charge', 'export') %}
+            {% set cmd = dict(cmd, power_w=power | int) %}
+            {% endif %}
+            {% if target_soc is defined and target_soc not in ('', None) and control_mode in ('charge', 'export') %}
+            {% set cmd = dict(cmd, target_soc=target_soc | int) %}
+            {% endif %}
+            {% if stop is defined and stop %}
+            {% set cmd = dict(cmd, stop=stop) %}
+            {% endif %}
+            {{ cmd | to_json }}
+```
+
+Predbat `apps.yaml`:
+
+```yaml
+  inverter_type: GWMGR
+  inverter:
+    name: "GoodWe via goodwe_manager"
+    has_rest_api: False
+    has_mqtt_api: False
+    has_service_api: True
+    output_charge_control: "power"
+    charge_control_immediate: False
+    has_charge_enable_time: True
+    has_discharge_enable_time: True
+    has_target_soc: True
+    target_soc_used_for_discharge: False
+    has_reserve_soc: True
+    has_timed_pause: False
+    has_ge_inverter_mode: False
+    has_ge_eco_toggle: False
+    has_idle_time: False
+    time_button_press: False
+    support_charge_freeze: True
+    support_discharge_freeze: True
+    charge_discharge_with_rate: False
+    has_time_window: True
+    charge_time_format: "HH:MM:SS"
+    charge_time_entity_is_option: True
+    can_span_midnight: True
+    clock_time_format: "%H:%M:%S"
+    soc_units: "%"
+    num_load_entities: 1
+    write_and_poll_sleep: 2
+
+  charge_rate:
+    - input_number.goodwe_charge_rate
+  discharge_rate:
+    - input_number.goodwe_discharge_rate
+  charge_limit:
+    - input_number.goodwe_charge_limit
+  reserve:
+    - number.goodwe_reserve
+  scheduled_charge_enable:
+    - input_boolean.goodwe_scheduled_charge_enable
+  scheduled_discharge_enable:
+    - input_boolean.goodwe_scheduled_discharge_enable
+
+  # Every template repeats each Predbat cycle (repeat: true) - the executor
+  # drops a command after its 15 min ttl, so a silent Predbat falls back to
+  # auto. The stops are scoped: Predbat sends the opposite stop before
+  # every start (discharge_stop before charge_start and vice versa).
+  charge_start_service:
+    - service: script.goodwe_control
+      control_mode: charge
+      power: "{power}"
+      target_soc: "{target_soc}"
+      repeat: true
+  charge_freeze_service:
+    - service: script.goodwe_control
+      control_mode: freeze_charge
+      repeat: true
+  charge_stop_service:
+    - service: script.goodwe_control
+      control_mode: auto
+      stop: charge
+      repeat: true
+  discharge_start_service:
+    - service: script.goodwe_control
+      control_mode: export
+      power: "{power}"
+      target_soc: "{target_soc}"
+      repeat: true
+  discharge_freeze_service:
+    - service: script.goodwe_control
+      control_mode: freeze_export
+      repeat: true
+  discharge_stop_service:
+    - service: script.goodwe_control
+      control_mode: auto
+      stop: export
+      repeat: true
+
+  charge_start_time:
+    - input_datetime.goodwe_charge_start_time
+  charge_end_time:
+    - input_datetime.goodwe_charge_end_time
+  discharge_start_time:
+    - input_datetime.goodwe_discharge_start_time
+  discharge_end_time:
+    - input_datetime.goodwe_discharge_end_time
+```
+
+Predbat runtime settings (HA entities, not `apps.yaml`): `set_charge_freeze` and `set_export_freeze` on (expert mode), `set_reserve_enable` on, `set_reserve_min` ~12 (the executor warns below 10 %), `best_soc_min` ~15 % and `best_soc_keep` 20-25 % of 7.1 kWh (see the spec's "Predbat battery model" section; the BMS SoC resyncs around 22-18 %, so levels are a trade-off, not a hard limit), `set_charge_low_power` / `set_export_low_power` on. Keep `battery_rate_max` at the battery's representative rate (3400 W here) - `CONTROL_MAX_BATTERY_W` is only a ceiling above it.
 
 ## Failure behavior
 
