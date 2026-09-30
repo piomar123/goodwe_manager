@@ -24,6 +24,8 @@ import matplotlib
 from flask import request
 from goodwe.sensor import EcoModeV2
 
+import bms_poller
+import bms_storage
 import control
 import control_runtime
 import eco_encoder
@@ -56,6 +58,9 @@ MQTT_PORT = int(os.environ.get('MQTT_PORT', 1883))
 MQTT_USERNAME = os.environ.get('MQTT_USERNAME')
 MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD')
 MQTT_TOPIC_PREFIX = os.environ.get('MQTT_TOPIC_PREFIX', 'goodwe')
+# Optional Pylontech BMS poller (read through its SolarMan logger) - None
+# unless BMS_LOGGER_HOST and BMS_LOGGER_SERIAL are set; see bms_poller.py.
+BMS_CONFIG = bms_poller.load_bms_config(os.environ)
 TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 RCE_EXPORT_GRANULARITY = os.environ.get('RCE_EXPORT_GRANULARITY', '15min')
 RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
@@ -152,12 +157,33 @@ class AsyncioThread(threading.Thread):
         self._asyncio_loop = loop
         asyncio.set_event_loop(loop)
         try:
-            if not dry_run:
-                loop.create_task(self._get_inverter_data_with_retry())
+            self._create_loop_tasks(loop)
             loop.run_forever()
         finally:
             self._drain_and_close_loop(loop)
             logger.info("Finished the asyncio loop")
+
+    def _create_loop_tasks(self, loop) -> None:
+        if dry_run:
+            return
+        loop.create_task(self._get_inverter_data_with_retry())
+        if BMS_CONFIG is not None:
+            loop.create_task(self._run_bms_poller(BMS_CONFIG))
+
+    async def _run_bms_poller(self, config: bms_poller.BmsConfig) -> None:
+        """Runs until the loop shuts down (cancelled by _drain_and_close_loop).
+        Any failure here stays here - the BMS is optional, the inverter poll
+        on the same loop is not."""
+        try:
+            conn = await bms_storage.init_db_async()
+        except Exception as e:
+            logger.error(f'BMS poller disabled: cannot open {bms_storage.BMS_DB_PATH}: {e!r}')
+            return
+        logger.info(f'BMS poller started ({config.host}:{config.port}, every {config.poll_seconds} s)')
+        try:
+            await bms_poller.BmsPoller(config, _bms_sample_handler(conn)).run()
+        finally:
+            await conn.close()
 
     @property
     def loop(self):
@@ -449,6 +475,18 @@ class AsyncioThread(threading.Thread):
 
 mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USERNAME,
                               password=MQTT_PASSWORD, topic_prefix=MQTT_TOPIC_PREFIX)
+
+
+def _bms_sample_handler(conn):
+    async def on_sample(sample: bms_poller.BmsSample) -> None:
+        try:
+            await bms_storage.insert_sample(conn, sample)
+        except Exception as e:
+            logger.warning(f'BMS sample not stored: {e!r}')
+        await mqtt.publish_bms(bms_poller.sample_to_payload(sample))
+    return on_sample
+
+
 control_runtime_instance: Optional[control_runtime.ControlRuntime] = None
 if CONTROL_CONFIG is not None:
     control_runtime_instance = control_runtime.ControlRuntime(CONTROL_CONFIG, mqtt,
