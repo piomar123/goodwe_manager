@@ -137,6 +137,16 @@
         </details>
       </div>
     </div>
+    <div class="row" id="bms-panel" style="display: none">
+      <div class="col">
+        <h4>Battery cells <small class="text-muted">(Pylontech BMS)</small></h4>
+        <div id="bms-summary" class="small"></div>
+        <svg id="bms-cells" class="w-100" style="height: 140px"></svg>
+        <div class="small text-muted">Each bar is one cell; the dashed line separates modules. Lowest cell
+          <span style="color: #d9534f">red</span>, highest <span style="color: #2e8b57">green</span>.
+          Updated once a minute.</div>
+      </div>
+    </div>
     <div class="row">
       <hr>
       <div class="col">
@@ -332,6 +342,8 @@
     window.BACKUP_ACTIVE_THRESHOLD_W = {{ backup_active_threshold_w }};
   </script>
   <script src="/static/js/diagram-render.js"></script>
+  <script src="/static/js/bms-cells-calc.js"></script>
+  <script src="/static/js/bms-cells-render.js"></script>
 </body>
 
 </html>

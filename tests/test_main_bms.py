@@ -4,6 +4,7 @@ main.py wiring of the optional BMS poller: only started when configured and
 not in --dry-run, never allowed to take goodwe_manager down with it.
 """
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from unittest import mock
 os.environ.setdefault('INVERTER_IP', '127.0.0.1')
 
 import bms_poller
+from announcer import MessageAnnouncer
 import main
 from tests.test_bms_poller import CELLS, SUMMARY, WHEN
 
@@ -64,6 +66,24 @@ class BmsSampleHandlerTest(unittest.TestCase):
             asyncio.run(main._bms_sample_handler(conn=object())(sample))
         publish.assert_awaited_once()
         self.assertNotIn('raw_1100', publish.await_args.args[0])
+
+
+class BmsDashboardEventTest(unittest.TestCase):
+    def test_each_sample_is_announced_as_a_sticky_bms_event(self):
+        sample = bms_poller.decode(SUMMARY, CELLS, WHEN)
+        fresh = MessageAnnouncer()
+        with mock.patch('bms_storage.insert_sample', mock.AsyncMock()), \
+                mock.patch.object(main.mqtt, 'publish_bms', mock.AsyncMock()), \
+                mock.patch.object(main, 'announcer', fresh):
+            asyncio.run(main._bms_sample_handler(conn=object())(sample))
+            listener = fresh.listen()  # a browser connecting after the sample
+
+        msg = listener.get_nowait()
+        self.assertEqual(msg.event, 'bms')
+        data = json.loads(msg.data)
+        self.assertEqual(len(data['cell_mv']), 60)
+        self.assertEqual(data['soh'], 97)
+        self.assertNotIn('raw_1100', data)
 
 
 class RunBmsPollerTest(unittest.TestCase):

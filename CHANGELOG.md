@@ -8,6 +8,10 @@ grouped under `Unreleased` until that changes.
 
 ### Changed
 
+- Dashboard: a "Battery cells" panel (only with the BMS poller enabled) shows
+  SOH, cell temperatures, the cell voltage spread and a bar chart of every
+  cell's voltage. Sent as a `bms` SSE event once per sample and replayed to
+  newly connected browsers.
 - Optional Pylontech BMS poller: with `BMS_LOGGER_HOST` / `BMS_LOGGER_SERIAL`
   set in `.env`, cell temperatures, SOH, and every cell's voltage are read
   from the BMS through its SolarMan logger every 60 s, stored in `bms.db`,
