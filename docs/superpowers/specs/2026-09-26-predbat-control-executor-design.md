@@ -18,8 +18,9 @@ Success criteria:
   verify service calls: it re-sends them every cycle (`repeat: true`) and
   re-plans from the measured SoC, so a missed command costs one cycle of
   plan deviation, not a stuck plan.
-- No command outlives its sender: stale commands, crashes and restarts end in
-  normal self-use (AUTO) with the user's own settings restored.
+- No command outlives its sender: stale commands and crashes end in normal
+  self-use (AUTO) with the user's own settings restored once the command's
+  TTL runs out. A restart keeps an unexpired command, never beyond its TTL.
 - The executor has no optimizer-specific logic; Predbat specifics live in
   HA/apps.yaml templates.
 
@@ -273,9 +274,11 @@ on, and forced EMS modes have no meaning without the grid.
 - **Expiry** → `auto` with user currents and floor (above).
 - **MQTT disconnect** does not change anything by itself; expiry handles it.
 - **Startup reconciliation**: before polling starts, read the control
-  registers. No valid command after a restart (commands are not persisted) →
-  desired = `auto`, so anything a crash left behind is reverted within the
-  first seconds. The retained reserve is re-read from MQTT.
+  registers. The active command and override are saved in
+  `control_state.json` and restored after a restart only while unexpired
+  (2026-09-30 change, so a deploy doesn't drop Predbat's command for a
+  cycle); with nothing valid saved → desired = `auto`, so anything a crash
+  left behind is reverted within the first seconds. The retained reserve is re-read from MQTT.
 - **Write failures**: 3 retries per register, then `last_error` set,
   `applied=false`, retried on the next change or every 60 s. A failed read is
   skipped (the dongle's ~20 s gaps), never an error on its own.
@@ -308,8 +311,8 @@ on, and forced EMS modes have no meaning without the grid.
 ## Dashboard override
 
 Form: mode, power (for charge/export), target SoC, duration (15 min - 12 h),
-"Clear override". Stored in memory only (a restart clears it and falls back
-to MQTT/auto). Shown in the state topic so Predbat/HA can see why its
+"Clear override". Saved with the active command in `control_state.json`,
+so a restart keeps it until its end time (then MQTT/auto). Shown in the state topic so Predbat/HA can see why its
 command is not applied.
 
 ## Predbat / Home Assistant side
