@@ -23,6 +23,7 @@ CELLS_START = 0x1500
 CELLS_END = 0x1600  # exclusive; only 0x1500-0x153F is verified to respond
 CHUNK = 32
 MAX_MODULE_SLOTS = 4  # 0x1118-0x111B; 0x111C onwards holds temperatures
+CELLS_PER_MODULE = 30  # Force H2 module: 30 LFP cells (98.25 V / 30 = 3.275 V)
 READ_TIMEOUT_S = 5.0
 MIN_POLL_SECONDS = 10  # protects the logger (it also uploads to the SolarMan cloud)
 
@@ -107,17 +108,15 @@ def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
     def reg(addr: int) -> int:
         return summary[addr - SUMMARY_START]
 
-    modules = []
-    for i in range(MAX_MODULE_SLOTS):
-        value = reg(0x1118 + i)
-        if value == 0:
-            break
-        modules.append(value / 100)
     cell_mv = []
     for value in cells:
         if value == 0:
             break
         cell_mv.append(value)
+    # Module count from the cell count, not the first zero register: 0x111A
+    # (0 in the first dump) has been seen reading 1 on a 2-module pack.
+    module_count = min(MAX_MODULE_SLOTS, max(1, len(cell_mv) // CELLS_PER_MODULE))
+    modules = [reg(0x1118 + i) / 100 for i in range(module_count)]
 
     sample = BmsSample(
         timestamp=when.strftime('%Y-%m-%d %H:%M:%S'),

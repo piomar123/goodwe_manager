@@ -67,12 +67,20 @@ class DecodeTest(unittest.TestCase):
         s = bms_poller.decode(SUMMARY, CELLS[:60] + [0, 3300, 3300], WHEN)
         self.assertEqual(len(s.cell_mv), 60)
 
-    def test_module_voltages_stop_at_four_slots(self):
-        # A 4-module pack: 0x1118-0x111B all set. Reading must stop there,
-        # not run on into 0x111C (cell temperature 27.2 -> "0.272 V").
-        summary = with_reg(with_reg(with_reg(SUMMARY, 0x1103, 3930), 0x111A, 9825), 0x111B, 9826)
+    def test_module_count_follows_cell_count_not_the_first_zero(self):
+        # Seen live on 2026-10-01: 0x111A (0 in the first dump) read 1, which
+        # "stop at the first zero" took for a third 0.01 V module.
+        summary = with_reg(with_reg(SUMMARY, 0x111A, 1), 0x111B, 1)
 
         s = bms_poller.decode(summary, CELLS, WHEN)
+
+        self.assertEqual(s.module_voltages, [98.25, 98.24])
+
+    def test_four_modules_for_120_cells(self):
+        cells = CELLS[:60] * 2
+        summary = with_reg(with_reg(with_reg(SUMMARY, 0x1103, 3930), 0x111A, 9825), 0x111B, 9826)
+
+        s = bms_poller.decode(summary, cells, WHEN)
 
         self.assertEqual(s.module_voltages, [98.25, 98.24, 98.25, 98.26])
 

@@ -138,10 +138,11 @@ These are all Modbus holding registers on slave 1. They were decoded
 
 Module count:
 
-- The number of non-zero values starting at 0x1118, before the zero at
-  0x111A (2 modules here).
-- Read at most 4 slots (0x1118-0x111B), stopping at the first zero.
-  0x111C onwards holds temperatures.
+- Cell count ÷ 30 (a Force H2 module has 30 cells), at least 1 and at most
+  4 slots (0x1118-0x111B; 0x111C onwards holds temperatures). 2 modules
+  here.
+- Not "up to the first zero": 0x111A read 0 in the first dump but 1 on
+  2026-10-01, which that rule took for a third 0.01 V module.
 - Only the 2-module layout is verified. The pack-voltage sum check rejects a
   misread on a bigger pack.
 
@@ -291,8 +292,8 @@ Unit tests only use fakes (no network, no real sleeps).
    `.env`. Restart between executor commands (restarts drop the active
    command until Predbat's next call).
 2. Compare `bms_history` values with the SolarMan app, within a poll or two.
-3. `inverter_history` rows per minute stay about 60 after enabling (compare
-   a few hours before and after).
+3. `inverter_history` rows per minute don't drop after enabling (compare a
+   few hours before and after; this setup writes about 27/min).
 4. The SolarMan app keeps updating after a day of polling. If it doesn't,
    raise `BMS_POLL_SECONDS`.
 5. Probe the current register during a charge and during an export. Decode
