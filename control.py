@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, List, Mapping, Optional
 
 
 class Mode(str, Enum):
@@ -140,6 +140,26 @@ def make_override(mode: str, power_w, target_soc, duration_min, now: datetime) -
         fields['target_soc'] = float(target_soc)
     cmd = parse_command(json.dumps(fields), now)  # reuse all field validation
     return Command(cmd.mode, cmd.power_w, cmd.target_soc, 'dashboard', now + duration)
+
+
+def command_to_dict(cmd: Command) -> dict:
+    """JSON-safe form of a Command, for control_state.json."""
+    return {'mode': cmd.mode.value, 'power_w': cmd.power_w, 'target_soc': cmd.target_soc, 'source': cmd.source,
+            'expires_at': None if cmd.expires_at is None else cmd.expires_at.isoformat(),
+            'stop': cmd.stop, 'id': cmd.id}
+
+
+def command_from_dict(data: Mapping[str, Any]) -> Command:
+    """Inverse of command_to_dict. Raises (KeyError/ValueError/TypeError) on
+    anything malformed."""
+    expires = data['expires_at']
+    expires = None if expires is None else datetime.fromisoformat(expires)
+    if expires is not None and expires.tzinfo is None:
+        raise ValueError('expires_at needs a timezone offset')
+    return Command(Mode(data['mode']),
+                   None if data['power_w'] is None else int(data['power_w']),
+                   None if data['target_soc'] is None else int(data['target_soc']),
+                   str(data['source']), expires, data['stop'], data['id'])
 
 
 @dataclass(frozen=True)
@@ -292,6 +312,31 @@ class Executor:
     def clear_override(self) -> None:
         self._override = None
         self._reset_latches()
+
+    def persistent_state(self) -> dict:
+        """What survives a restart: the MQTT command and dashboard override."""
+        return {'command': None if self._command is None else command_to_dict(self._command),
+                'override': None if self._override is None else command_to_dict(self._override)}
+
+    def restore(self, state: Mapping[str, Any], now: datetime) -> List[str]:
+        """Put back a saved command/override that is still valid. Expired ones,
+        stop requests, expiries further ahead than they could ever have been
+        set (clock trouble), and slots already filled by a live command are
+        skipped. Returns a description of each restored item."""
+        restored = []
+        cmd = state.get('command')
+        if cmd is not None and self._command is None:
+            cmd = command_from_dict(cmd)
+            if cmd.stop is None and cmd.expires_at is not None and now < cmd.expires_at <= now + MAX_EXPIRY:
+                self.submit(cmd)
+                restored.append(f'command {cmd.mode.value} from {cmd.source} until {cmd.expires_at.isoformat()}')
+        override = state.get('override')
+        if override is not None and self._override is None:
+            override = command_from_dict(override)
+            if override.expires_at is not None and now < override.expires_at <= now + OVERRIDE_MAX:
+                self.set_override(override)
+                restored.append(f'override {override.mode.value} until {override.expires_at.isoformat()}')
+        return restored
 
     def set_reserve(self, soc: Optional[int]) -> None:
         if soc == self._reserve:

@@ -23,11 +23,15 @@ class ControlRuntime:
                  now_fn: Callable[[], datetime] = lambda: datetime.now().astimezone(),
                  mono_fn: Callable[[], float] = time.monotonic,
                  eco_check_interval_s: float = 300.0, state_interval_s: float = 10.0,
-                 counter_path: Optional[str] = None):
+                 counter_path: Optional[str] = None, state_path: Optional[str] = None):
         self._config = config
         # writes_today is saved here so the daily cap survives restarts
         self._counter_path = counter_path
         self._saved_count: Optional[tuple] = None
+        # the active command/override is saved here so a restart (deploy,
+        # crash) keeps it until it expires instead of dropping to auto
+        self._state_path = state_path
+        self._saved_state: Optional[dict] = None
         self._mqtt = mqtt
         self._now = now_fn
         self._mono = mono_fn
@@ -57,6 +61,7 @@ class ControlRuntime:
             self._writer.carry_state_from(old)
         else:
             self._load_count()
+            self._load_state()
         self._next_eco = 0.0
 
     def _load_count(self) -> None:
@@ -84,6 +89,32 @@ class ControlRuntime:
             os.replace(tmp, self._counter_path)
         except OSError as e:
             logger.warning(f'Could not save control write counter {self._counter_path}: {e}')
+
+    def _load_state(self) -> None:
+        if not self._state_path:
+            return
+        try:
+            with open(self._state_path) as f:
+                saved = json.load(f)
+            for item in self.executor.restore(saved, self._now()):
+                logger.info(f'Restored control {item}')
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f'Ignoring unreadable control state {self._state_path}: {e}')
+
+    def _save_state(self) -> None:
+        current = self.executor.persistent_state()
+        if not self._state_path or current == self._saved_state:
+            return
+        self._saved_state = current  # also on failure: warn once per change, not per second
+        try:
+            tmp = self._state_path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(current, f)
+            os.replace(tmp, self._state_path)
+        except OSError as e:
+            logger.warning(f'Could not save control state {self._state_path}: {e}')
 
     def on_mqtt_message(self, topic_suffix: str, payload: bytes) -> None:
         if topic_suffix == 'control/set':
@@ -124,6 +155,7 @@ class ControlRuntime:
                     self._writer.restart()  # the backup side can't wait out a back-off
                 await self._writer.step(desired)
                 self._save_count()
+                self._save_state()
                 if self._initial_work_mode is None:
                     self._initial_work_mode = self._writer.readback.get('work_mode')
                 await self._maybe_read_eco()

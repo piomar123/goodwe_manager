@@ -29,15 +29,16 @@ class FakeMqtt:
         self.states.append(state)
 
 
-def make(eco_on=(False, False, False, False), counter_path=None):
+def make(eco_on=(False, False, False, False), counter_path=None, state_path=None, t0=T0, attach=True):
     clock = Clock()
     inv = FakeInverter(clock, base_values())
     for i, on in enumerate(eco_on, start=1):
         inv.values[f'eco_mode_{i}'] = SimpleNamespace(on_off=-1 if on else 0)
     mqtt = FakeMqtt()
-    rt = control_runtime.ControlRuntime(CFG, mqtt, now_fn=lambda: T0 + timedelta(seconds=clock.t), mono_fn=clock,
-                                        counter_path=counter_path)
-    rt.attach(inv)
+    rt = control_runtime.ControlRuntime(CFG, mqtt, now_fn=lambda: t0 + timedelta(seconds=clock.t), mono_fn=clock,
+                                        counter_path=counter_path, state_path=state_path)
+    if attach:
+        rt.attach(inv)
     return clock, inv, mqtt, rt
 
 
@@ -201,6 +202,123 @@ class WriteCounterPersistenceTest(unittest.TestCase):
         clock, inv, mqtt, rt = make(counter_path=os.path.join(self.dir.name, 'missing', 'x.json'))
         publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
         run(rt, clock, 10)
+        self.assertIn(('ems_mode', 11), inv.writes)
+
+
+class CommandPersistenceTest(unittest.TestCase):
+    """The active command and dashboard override survive a restart until
+    they expire - a deploy no longer drops Predbat's command for a cycle."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, 'control_state.json')
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def restart(self, after_s, **kwargs):
+        clock, inv, mqtt, rt = make(state_path=self.path, t0=T0 + timedelta(seconds=after_s), **kwargs)
+        return clock, inv, mqtt, rt
+
+    def test_unexpired_command_is_restored_after_restart(self):
+        clock, inv, mqtt, rt = make(state_path=self.path)
+        publish(rt, mode='charge', power_w=2000, target_soc=90, ttl_s=900, source='predbat')
+        run(rt, clock, 5)
+
+        with self.assertLogs('control_runtime', 'INFO') as logs:
+            clock2, inv2, mqtt2, rt2 = self.restart(60)
+        run(rt2, clock2, 10)
+
+        state = mqtt2.states[-1]
+        self.assertEqual((state['mode'], state['power_w'], state['target_soc'], state['source']),
+                         ('charge', 2000, 90, 'predbat'))
+        self.assertEqual(state['reason'], 'command from predbat')
+        self.assertIn(('ems_mode', 11), inv2.writes)
+        self.assertIn('Restored control command charge', logs.output[0])
+
+    def test_expired_command_is_not_restored(self):
+        clock, inv, mqtt, rt = make(state_path=self.path)
+        publish(rt, mode='charge', power_w=2000, ttl_s=120, source='predbat')
+        run(rt, clock, 5)
+
+        clock2, inv2, mqtt2, rt2 = self.restart(300)
+        run(rt2, clock2, 0)
+
+        self.assertEqual(mqtt2.states[-1]['mode'], 'auto')
+        self.assertEqual(mqtt2.states[-1]['reason'], 'no command')
+
+    def test_stopped_command_is_not_restored(self):
+        clock, inv, mqtt, rt = make(state_path=self.path)
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 5)
+        publish(rt, mode='auto', stop='charge', source='predbat')
+        run(rt, clock, 2)
+
+        clock2, inv2, mqtt2, rt2 = self.restart(60)
+        run(rt2, clock2, 0)
+
+        self.assertEqual(mqtt2.states[-1]['mode'], 'auto')
+        self.assertNotIn(('ems_mode', 11), inv2.writes)
+
+    def test_override_is_restored_until_it_ends(self):
+        clock, inv, mqtt, rt = make(state_path=self.path)
+        rt.set_override(control.make_override('export', '1500', '', '60', T0))
+        run(rt, clock, 5)
+
+        clock2, inv2, mqtt2, rt2 = self.restart(30 * 60)
+        run(rt2, clock2, 0)
+        self.assertEqual(mqtt2.states[-1]['override']['mode'], 'export')
+        self.assertEqual(mqtt2.states[-1]['reason'], 'dashboard override')
+
+        clock3, inv3, mqtt3, rt3 = self.restart(61 * 60)
+        run(rt3, clock3, 0)
+        self.assertIsNone(mqtt3.states[-1]['override'])
+
+    def test_live_command_received_before_attach_wins(self):
+        clock, inv, mqtt, rt = make(state_path=self.path)
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 5)
+
+        clock2, inv2, mqtt2, rt2 = self.restart(60, attach=False)
+        publish(rt2, mode='export', power_w=3000, ttl_s=900, source='predbat')
+        rt2.attach(inv2)
+        run(rt2, clock2, 0)
+
+        self.assertEqual(mqtt2.states[-1]['mode'], 'export')
+
+    def test_expiry_too_far_ahead_is_ignored(self):
+        # e.g. the clock was wrong when it was saved
+        far = (T0 + timedelta(hours=3)).isoformat()
+        with open(self.path, 'w') as f:
+            json.dump({'command': {'mode': 'charge', 'power_w': 2000, 'target_soc': None, 'source': 'predbat',
+                                   'expires_at': far, 'stop': None, 'id': None},
+                       'override': {'mode': 'export', 'power_w': 1500, 'target_soc': None, 'source': 'dashboard',
+                                    'expires_at': (T0 + timedelta(hours=13)).isoformat(), 'stop': None, 'id': None}},
+                      f)
+        clock, inv, mqtt, rt = make(state_path=self.path)
+        run(rt, clock, 0)
+
+        self.assertEqual(mqtt.states[-1]['mode'], 'auto')
+        self.assertIsNone(mqtt.states[-1]['override'])
+
+    def test_corrupt_state_file_starts_in_auto(self):
+        with open(self.path, 'w') as f:
+            f.write('{not json')
+        with self.assertLogs('control_runtime', 'WARNING'):
+            clock, inv, mqtt, rt = make(state_path=self.path)
+        run(rt, clock, 0)
+        self.assertEqual(mqtt.states[-1]['mode'], 'auto')
+
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        run(rt, clock, 2)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f)['command']['mode'], 'charge')
+
+    def test_unwritable_state_path_does_not_break_control(self):
+        clock, inv, mqtt, rt = make(state_path=os.path.join(self.dir.name, 'missing', 'x.json'))
+        publish(rt, mode='charge', power_w=2000, ttl_s=900, source='predbat')
+        with self.assertLogs('control_runtime', 'WARNING'):
+            run(rt, clock, 10)
         self.assertIn(('ems_mode', 11), inv.writes)
 
 
