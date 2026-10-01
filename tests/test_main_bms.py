@@ -5,6 +5,8 @@ not in --dry-run, never allowed to take goodwe_manager down with it.
 """
 import asyncio
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -71,6 +73,18 @@ class RunBmsPollerTest(unittest.TestCase):
                 self.assertLogs('main', 'ERROR') as logs:
             asyncio.run(main.asyncio_thread._run_bms_poller(CONFIG))
         self.assertIn('BMS poller disabled', logs.output[0])
+
+
+class ImportTimeTest(unittest.TestCase):
+    def test_bms_config_is_not_parsed_at_import(self):
+        # Logging isn't configured at import time - anything logged then is
+        # lost (or bare on stderr), so parsing waits for main().
+        env = dict(os.environ, INVERTER_IP='127.0.0.1', BMS_LOGGER_HOST='h', BMS_LOGGER_SERIAL='abc')
+        result = subprocess.run([sys.executable, '-c', 'import main; print(main.BMS_CONFIG)'],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], 'None')
+        self.assertNotIn('BMS poller', result.stderr)
 
 
 if __name__ == '__main__':

@@ -60,7 +60,9 @@ MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD')
 MQTT_TOPIC_PREFIX = os.environ.get('MQTT_TOPIC_PREFIX', 'goodwe')
 # Optional Pylontech BMS poller (read through its SolarMan logger) - None
 # unless BMS_LOGGER_HOST and BMS_LOGGER_SERIAL are set; see bms_poller.py.
-BMS_CONFIG = bms_poller.load_bms_config(os.environ)
+# Set by _load_bms_config() in main(), after logging is configured, so its
+# "disabled" / invalid-config lines reach manager.log.
+BMS_CONFIG: Optional[bms_poller.BmsConfig] = None
 TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 RCE_EXPORT_GRANULARITY = os.environ.get('RCE_EXPORT_GRANULARITY', '15min')
 RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
@@ -1139,6 +1141,13 @@ def configure_logging(log_path: str = 'manager.log') -> None:
     logging.getLogger('goodwe.protocol').setLevel(logging.INFO)
     # aiosqlite logs two DEBUG lines per DB operation - ~350MB/day of noise
     logging.getLogger('aiosqlite').setLevel(logging.INFO)
+    # pysolarmanv5 dumps every V5 frame at DEBUG - ~3MB/day with the BMS poller
+    logging.getLogger('pysolarmanv5').setLevel(logging.INFO)
+
+
+def _load_bms_config() -> None:
+    global BMS_CONFIG
+    BMS_CONFIG = bms_poller.load_bms_config(os.environ)
 
 
 def main():
@@ -1150,6 +1159,7 @@ def main():
     if CONTROL_CONFIG is not None:
         # Logged here, not at import - logging isn't configured until now.
         logger.info(f'Battery control enabled in {CONTROL_CONFIG.mode} mode')
+    _load_bms_config()
     if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
         logger.warning("Running in dry-run mode without inverter connection")
         dry_run = True
