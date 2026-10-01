@@ -162,6 +162,11 @@ class MqttBridge:
     async def publish_pv_forecast(self, series: dict) -> None:
         await self._publish('forecast/pv', json.dumps(series), retain=True)
 
+    async def publish_bms(self, payload: dict) -> None:
+        """Pylontech BMS sample (bms_poller.sample_to_payload) - numbers stay
+        numbers, unlike the string-valued telemetry payload."""
+        await self._publish('bms', json.dumps(payload), retain=False)
+
     def set_control_handler(self, handler: Callable[[str, bytes], None]) -> None:
         """Subscribe to the control topics on every (re)connect and call
         handler(topic_suffix, payload) for each message, on the asyncio loop.
