@@ -26,6 +26,13 @@ CELLS = (
     + [3274, 3275, 3277, 3276, 3275, 3277, 3276, 3276, 3277, 3277, 3274, 3275, 0, 0, 0, 0]
 )
 WHEN = datetime(2026, 9, 29, 8, 45, 30)
+# Per-module and per-cell blocks (0x1460, 0x14B0, 0x1800), consistent with
+# SUMMARY: modules 98.25 / 98.24 V, module 1 warmest (0x111E = 1), cell
+# temperatures 28 °C max at cell 30 and 25 °C min from cell 22 (0x1114-0x1117).
+MODULE_MV = [9825, 9824]
+MODULE_T = [257, 272]
+CELL_T = [260] * 22 + [250] * 8 + [280] * 15 + [270] * 15
+BLOCKS = bms_poller.ModuleBlocks(MODULE_MV, MODULE_T, CELL_T)
 
 
 def with_reg(block, addr, value, start=bms_poller.SUMMARY_START):
@@ -36,7 +43,7 @@ def with_reg(block, addr, value, start=bms_poller.SUMMARY_START):
 
 class DecodeTest(unittest.TestCase):
     def test_decodes_the_real_dump(self):
-        s = bms_poller.decode(SUMMARY, CELLS, WHEN)
+        s = bms_poller.decode(SUMMARY, CELLS, WHEN, BLOCKS)
 
         self.assertEqual(s.timestamp, '2026-09-29 08:45:30')
         self.assertEqual(s.timestamp_epoch, int(WHEN.timestamp()))
@@ -48,41 +55,115 @@ class DecodeTest(unittest.TestCase):
         self.assertAlmostEqual(s.cell_voltage_min, 3.273)
         self.assertEqual(s.cell_voltage_max_id, 3)
         self.assertEqual(s.cell_voltage_min_id, 24)
-        self.assertAlmostEqual(s.cell_temp_max, 27.2)
-        self.assertAlmostEqual(s.cell_temp_min, 25.7)
+        self.assertAlmostEqual(s.cell_temp_max, 28.0)
+        self.assertAlmostEqual(s.cell_temp_min, 25.0)
+        self.assertEqual(s.cell_temp_max_id, 30)
+        self.assertEqual(s.cell_temp_min_id, 22)
+        self.assertAlmostEqual(s.module_voltage_max, 98.25)
+        self.assertAlmostEqual(s.module_voltage_min, 98.24)
+        self.assertEqual(s.module_voltage_max_id, 0)
+        self.assertEqual(s.module_voltage_min_id, 1)
+        self.assertAlmostEqual(s.module_temp_max, 27.2)
+        self.assertAlmostEqual(s.module_temp_min, 25.7)
+        self.assertEqual(s.module_temp_max_id, 1)
+        self.assertEqual(s.module_temp_min_id, 0)
+        self.assertEqual(s.state, 'idle')
+        self.assertEqual(s.current, 0.0)
+        self.assertEqual(s.cycle_count, 679)
+        # Wh in the register: the modules are in series, 7.1 kWh at 100 % = 2 x 3.55 kWh
+        self.assertAlmostEqual(s.remaining_capacity, 2.347)
+        self.assertAlmostEqual(s.charge_voltage_limit, 216.0)
+        self.assertAlmostEqual(s.charge_current_limit, 18.5)
+        self.assertAlmostEqual(s.discharge_voltage_limit, 174.0)
+        self.assertAlmostEqual(s.discharge_current_limit, 18.5)
+        self.assertEqual(s.charge_today_wh, 2652)
+        self.assertEqual(s.discharge_today_wh, 4021)
+        self.assertEqual(s.charge_total_kwh, 4942)
+        self.assertEqual(s.discharge_total_kwh, 4902)
+        self.assertIs(s.fully_charged, False)
         self.assertEqual(s.module_voltages, [98.25, 98.24])
+        self.assertEqual(s.module_temps, [25.7, 27.2])
+        self.assertEqual(len(s.cell_temps), 60)
+        self.assertEqual((s.cell_temps[0], s.cell_temps[22], s.cell_temps[30]), (26.0, 25.0, 28.0))
         self.assertEqual(len(s.cell_mv), 60)
         self.assertEqual(s.cell_mv[:3], [3276, 3275, 3276])
         self.assertEqual(s.raw_1100, SUMMARY)
 
     def test_negative_temperatures_are_signed(self):
         summary = with_reg(with_reg(SUMMARY, 0x111C, 65536 - 25), 0x111D, 65536 - 52)
+        summary = with_reg(with_reg(summary, 0x1114, 65536 - 20), 0x1115, 65536 - 60)
 
         s = bms_poller.decode(summary, CELLS, WHEN)
 
-        self.assertAlmostEqual(s.cell_temp_max, -2.5)
-        self.assertAlmostEqual(s.cell_temp_min, -5.2)
+        self.assertAlmostEqual(s.module_temp_max, -2.5)
+        self.assertAlmostEqual(s.module_temp_min, -5.2)
+        self.assertAlmostEqual(s.cell_temp_max, -2.0)
+        self.assertAlmostEqual(s.cell_temp_min, -6.0)
+
+    def test_current_is_signed_32_bit_positive_when_charging(self):
+        # Seen live 2026-10-01/02 against the inverter's ibattery1 (-16.8 A
+        # charging, +17.4 A exporting - the inverter's sign is the opposite).
+        charging = with_reg(with_reg(SUMMARY, 0x1104, 0), 0x1105, 1668)
+        exporting = with_reg(with_reg(SUMMARY, 0x1104, 65535), 0x1105, 63755)
+
+        self.assertAlmostEqual(bms_poller.decode(charging, CELLS, WHEN).current, 16.68)
+        self.assertAlmostEqual(bms_poller.decode(exporting, CELLS, WHEN).current, -17.81)
+
+    def test_state_from_the_low_bits_of_0x1100(self):
+        for raw, state in ((0x801, 'charge'), (0x1002, 'discharge'), (0x403, 'idle'), (0x405, 'unknown (5)')):
+            self.assertEqual(bms_poller.decode(with_reg(SUMMARY, 0x1100, raw), CELLS, WHEN).state, state)
+
+    def test_fully_charged_flag(self):
+        self.assertIs(bms_poller.decode(with_reg(SUMMARY, 0x1138, 1), CELLS, WHEN).fully_charged, True)
 
     def test_trailing_cells_after_the_first_zero_are_ignored(self):
         s = bms_poller.decode(SUMMARY, CELLS[:60] + [0, 3300, 3300], WHEN)
         self.assertEqual(len(s.cell_mv), 60)
 
-    def test_module_count_follows_cell_count_not_the_first_zero(self):
-        # Seen live on 2026-10-01: 0x111A (0 in the first dump) read 1, which
-        # "stop at the first zero" took for a third 0.01 V module.
-        summary = with_reg(with_reg(SUMMARY, 0x111A, 1), 0x111B, 1)
+    def test_without_module_blocks_module_voltages_are_summed_from_the_cells(self):
+        # Rows stored before the module blocks were read (bms.db migration).
+        s = bms_poller.decode(SUMMARY, CELLS, WHEN)
+
+        self.assertEqual(s.module_voltages, [98.273, 98.271])
+        self.assertIsNone(s.module_temps)
+        self.assertIsNone(s.cell_temps)
+
+    def test_negative_module_and_cell_temperatures_are_signed(self):
+        blocks = bms_poller.ModuleBlocks(MODULE_MV, [65536 - 25, 272], [65536 - 30] + CELL_T[1:])
+        summary = with_reg(with_reg(SUMMARY, 0x1115, 65536 - 30), 0x111D, 65536 - 25)
+
+        s = bms_poller.decode(summary, CELLS, WHEN, blocks)
+
+        self.assertEqual(s.module_temps[0], -2.5)
+        self.assertEqual(s.cell_temps[0], -3.0)
+
+    def test_cell_count_must_match_0x1137(self):
+        with self.assertRaisesRegex(bms_poller.BmsDecodeError, 'cell count'):
+            bms_poller.decode(SUMMARY, CELLS[:59] + [0], WHEN, bms_poller.ModuleBlocks(MODULE_MV, MODULE_T, CELL_T[:59]))
+
+    def test_module_count_out_of_range(self):
+        with self.assertRaisesRegex(bms_poller.BmsDecodeError, 'module count'):
+            bms_poller.decode(with_reg(SUMMARY, 0x1136, 0), CELLS, WHEN, BLOCKS)
+
+    def test_module_voltages_ignore_the_module_id_registers(self):
+        # 0x111A read 1 live on 2026-10-01; it is the id of the max module,
+        # not a third module's voltage.
+        summary = with_reg(with_reg(SUMMARY, 0x111A, 1), 0x111B, 0)
 
         s = bms_poller.decode(summary, CELLS, WHEN)
 
-        self.assertEqual(s.module_voltages, [98.25, 98.24])
+        self.assertEqual(s.module_voltages, [98.273, 98.271])
+        self.assertEqual(s.module_voltage_max_id, 1)
 
     def test_four_modules_for_120_cells(self):
         cells = CELLS[:60] * 2
-        summary = with_reg(with_reg(with_reg(SUMMARY, 0x1103, 3930), 0x111A, 9825), 0x111B, 9826)
+        summary = with_reg(with_reg(with_reg(SUMMARY, 0x1103, 3930), 0x1136, 4), 0x1137, 120)
+        blocks = bms_poller.ModuleBlocks(MODULE_MV * 2, MODULE_T * 2, CELL_T * 2)
 
-        s = bms_poller.decode(summary, cells, WHEN)
+        s = bms_poller.decode(summary, cells, WHEN, blocks)
 
-        self.assertEqual(s.module_voltages, [98.25, 98.24, 98.25, 98.26])
+        self.assertEqual(s.module_voltages, [98.25, 98.24, 98.25, 98.24])
+        self.assertEqual(len(s.cell_temps), 120)
 
     def test_wrong_summary_length_is_rejected(self):
         with self.assertRaisesRegex(bms_poller.BmsDecodeError, 'summary'):
@@ -112,11 +193,25 @@ class PlausibilityTest(unittest.TestCase):
     def test_temperature_out_of_range(self):
         self.assert_rejected(summary=with_reg(SUMMARY, 0x1106, 900), match='temperature')
 
-    def test_module_sum_off_by_more_than_two_percent(self):
-        self.assert_rejected(summary=with_reg(SUMMARY, 0x1119, 9000), match='module')
+    def test_cell_sum_off_the_pack_voltage_by_more_than_two_percent(self):
+        self.assert_rejected(summary=with_reg(SUMMARY, 0x1103, 1900), match='cells sum')
 
-    def test_no_modules(self):
-        self.assert_rejected(summary=with_reg(SUMMARY, 0x1118, 0), match='module')
+    def test_module_max_off_the_cell_sums(self):
+        self.assert_rejected(summary=with_reg(SUMMARY, 0x1118, 9000), match='module_voltage_max')
+
+    def test_module_min_off_the_cell_sums(self):
+        self.assert_rejected(summary=with_reg(SUMMARY, 0x1119, 0), match='module_voltage_min')
+
+    def test_module_temperature_out_of_range(self):
+        self.assert_rejected(summary=with_reg(SUMMARY, 0x111C, 900), match='temperature')
+
+    def test_module_voltages_off_the_pack_voltage(self):
+        with self.assertRaisesRegex(bms_poller.BmsDecodeError, 'module voltages sum'):
+            bms_poller.decode(SUMMARY, CELLS, WHEN, bms_poller.ModuleBlocks([9825, 9000], MODULE_T, CELL_T))
+
+    def test_cell_temperature_out_of_range(self):
+        with self.assertRaisesRegex(bms_poller.BmsDecodeError, 'cell_temps'):
+            bms_poller.decode(SUMMARY, CELLS, WHEN, bms_poller.ModuleBlocks(MODULE_MV, MODULE_T, [900] + CELL_T[1:]))
 
 
 class LoadConfigTest(unittest.TestCase):
@@ -193,9 +288,12 @@ class FakeClient:
         return values[:-1] if self.short else values
 
 
-def bms_registers(cells=CELLS):
+def bms_registers(cells=CELLS, cell_t=CELL_T):
     regs = {bms_poller.SUMMARY_START + i: v for i, v in enumerate(SUMMARY)}
     regs.update({bms_poller.CELLS_START + i: v for i, v in enumerate(cells)})
+    regs.update({bms_poller.MODULE_VOLTAGES_START + i: v for i, v in enumerate(MODULE_MV)})
+    regs.update({bms_poller.MODULE_TEMPS_START + i: v for i, v in enumerate(MODULE_T)})
+    regs.update({bms_poller.CELL_TEMPS_START + i: v for i, v in enumerate(cell_t)})
     return regs
 
 
@@ -226,8 +324,17 @@ class PollOnceTest(unittest.TestCase):
         sample = asyncio.run(h.poller.poll_once())
         self.assertEqual(h.samples, [sample])
         self.assertEqual(sample.soh, 97)
-        # summary in 2 chunks, cells stop after the chunk containing a zero
-        self.assertEqual(h.created[0].reads, [(0x1100, 32), (0x1120, 32), (0x1500, 32), (0x1520, 32)])
+        self.assertEqual(sample.module_temps, [25.7, 27.2])
+        self.assertEqual(len(sample.cell_temps), 60)
+        # summary in 2 chunks, cells stop after the chunk containing a zero,
+        # then one register per module and one per cell
+        self.assertEqual(h.created[0].reads, [(0x1100, 32), (0x1120, 32), (0x1500, 32), (0x1520, 32),
+                                              (0x1460, 2), (0x14B0, 2), (0x1800, 32), (0x1820, 28)])
+
+    def test_failed_module_block_read_gives_no_sample(self):
+        h = PollerHarness([FakeClient(bms_registers(), fail_at=0x14B0)])
+        self.assertIsNone(asyncio.run(h.poller.poll_once()))
+        self.assertEqual(h.samples, [])
 
     def test_failed_second_read_gives_no_sample(self):
         h = PollerHarness([FakeClient(bms_registers(), fail_at=0x1120)])
@@ -257,7 +364,10 @@ class PollOnceTest(unittest.TestCase):
 
     def test_cells_filling_a_chunk_continue_until_illegal_address(self):
         cells = [3300] * 64  # no zero in 0x1500-0x153F; 0x1540 doesn't exist
-        h = PollerHarness([FakeClient(bms_registers(cells))])
+        regs = bms_registers(cells, cell_t=[260] * 64)
+        # pack, cell count and module voltages to match: 211.2 V, 2 modules of 105.6 V
+        regs.update({0x1103: 2112, 0x1137: 64, 0x1118: 10560, 0x1119: 10560, 0x1460: 10560, 0x1461: 10560})
+        h = PollerHarness([FakeClient(regs)])
         sample = asyncio.run(h.poller.poll_once())
         self.assertEqual(len(sample.cell_mv), 64)
 
@@ -368,12 +478,16 @@ class RunLoopTest(unittest.TestCase):
 
 class PayloadTest(unittest.TestCase):
     def test_payload_has_numbers_and_no_raw_block(self):
-        payload = bms_poller.sample_to_payload(bms_poller.decode(SUMMARY, CELLS, WHEN))
+        payload = bms_poller.sample_to_payload(bms_poller.decode(SUMMARY, CELLS, WHEN, BLOCKS))
         self.assertNotIn('raw_1100', payload)
         self.assertEqual(payload['timestamp'], '2026-09-29 08:45:30')
         self.assertEqual(payload['soh'], 97)
-        self.assertIsInstance(payload['cell_temp_max'], float)
+        self.assertIsInstance(payload['module_temp_max'], float)
+        self.assertEqual(payload['state'], 'idle')
+        self.assertIs(payload['fully_charged'], False)
         self.assertEqual(len(payload['cell_mv']), 60)
+        self.assertEqual(len(payload['cell_temps']), 60)
+        self.assertEqual(payload['module_temps'], [25.7, 27.2])
 
 
 if __name__ == '__main__':

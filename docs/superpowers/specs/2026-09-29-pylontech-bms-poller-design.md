@@ -121,30 +121,67 @@ unchanged.
 
 ### Register map
 
-These are all Modbus holding registers on slave 1. They were decoded
-2026-09-29 against GoodWe telemetry and the SolarMan app.
+These are all Modbus holding registers on slave 1. The first fields were
+decoded 2026-09-29 against GoodWe telemetry and the SolarMan app; the rest
+on 2026-10-02 from a day of 1-minute samples (about 1,050) paired with the
+nearest `inverter_history` row. "32-bit" means high word first, signed.
+Ids are 0-based.
 
 | Field | Register | Scale | Unit | Confirmed by |
 |---|---|---|---|---|
+| `state` | 0x1100 bits 0-2 | 1 charge, 2 discharge, 3 idle | | current sign, all samples (bits 10-12 repeat it) |
 | `pack_voltage` | 0x1103 | ÷10 | V | GoodWe vbattery1 (196.5) |
+| `current` | 0x1104:0x1105 32-bit | ÷100 | A, + = charging | GoodWe ibattery1, r = −0.9995 (opposite sign) |
 | `bms_temperature` | 0x1106 | ÷10 | °C | GoodWe battery_temperature (36) |
 | `soc` | 0x1107 | 1 | % | GoodWe battery_soc (33) |
+| `cycle_count` | 0x1108 | 1 | | SolarMan (684); stepped 683 → 684 |
+| `charge_voltage_limit` | 0x1109 | ÷10 | V | 216.0 = 60 × 3.6 V |
+| `charge_current_limit` | 0x110A:0x110B 32-bit | ÷100 | A | GoodWe battery_charge_limit (18.5/7.4/0 ↔ 18/7/0) |
+| `discharge_voltage_limit` | 0x110C | ÷10 | V | 174.0 = 60 × 2.9 V |
+| `discharge_current_limit` | 0x110D:0x110E 32-bit, negative | ÷100, abs | A | GoodWe battery_discharge_limit (18) |
 | `cell_voltage_max` / `_min` | 0x1110 / 0x1111 | ÷1000 | V | the cell list |
-| `cell_voltage_max_id` / `_min_id` | 0x1112 / 0x1113 | 1 | cell no. | plausible, unverified |
-| `module_voltages` | 0x1118 + n | ÷100 | V | sum = pack voltage |
-| `cell_temp_max` / `_min` | 0x111C / 0x111D | ÷10 | °C | SolarMan (27.2 / 25.7) |
+| `cell_voltage_max_id` / `_min_id` | 0x1112 / 0x1113 | 1 | cell 0-59 | 0x111A/B agree in most samples |
+| `cell_temp_max` / `_min` | 0x1114 / 0x1115 | ÷10 (1 °C steps) | °C | r = 0.99 with 0x111C/D |
+| `cell_temp_max_id` / `_min_id` | 0x1116 / 0x1117 | 1 | sensor no. | ids in the module 0x111E/F name |
+| `module_voltage_max` / `_min` | 0x1118 / 0x1119 | ÷100 | V | max ≥ min in every sample; matches the cell sum of the module 0x111A/B name |
+| `module_voltage_max_id` / `_min_id` | 0x111A / 0x111B | 1 | module 0-1 | as above |
+| `module_temp_max` / `_min` | 0x111C / 0x111D | ÷10 | °C | SolarMan (27.2 / 25.7) |
+| `module_temp_max_id` / `_min_id` | 0x111E / 0x111F | 1 | module 0-1 | same layout as 0x1118-0x111B; constant 1 / 0 so far |
 | `soh` | 0x1120 | 1 | % | SolarMan (97) |
+| `remaining_capacity` | 0x1121:0x1122 32-bit | ÷1000 | kWh | r = 0.999 with SoC; 7.097 at 100 % ≈ 2 × 3.55 kWh (modules in series); ha-solarman reads it as Wh too |
+| `charge_today_wh` / `discharge_today_wh` | 0x1123:0x1124 / 0x1125:0x1126 32-bit | 1 | Wh | rise only while charging / discharging, reset at midnight; 10-15 % above GoodWe's counters |
+| `charge_total_kwh` / `discharge_total_kwh` | 0x112B:0x112C / 0x112D:0x112E 32-bit | 1 | kWh | step +1 per ~1 kWh charged / discharged; 4941 kWh / 684 cycles = 7.2 kWh |
+| `fully_charged` | 0x1138 | 0/1 | | 1 only at SoC 100 % |
+| `module_voltages` | 0x1460 + m | ÷100 | V | cell sums of each module (within ~10 mV), 0x1118/0x1119 |
+| `module_temps` | 0x14B0 + m, signed | ÷10 | °C | equal 0x111C/0x111D at the ids in 0x111E/0x111F |
 | `cell_mv` | 0x1500 + n | 1 | mV | 60 cells, 3.273-3.277 V |
+| `cell_temps` | 0x1800 + n, signed | ÷10 (1 °C steps) | °C | max/min and their cells equal 0x1114-0x1117; about 8 cells share each sensor reading |
 
-Module count:
+Prior art: ha-solarman's `pylontech_force.yaml` (Force H1/H2/H3 profile,
+based on a published register scan) already maps nearly all of these,
+reading the identical block at 0x1400. It should have been checked before
+decoding from scratch. The per-module and per-cell blocks above come from
+it and were verified on this BMS on 2026-10-02. It doesn't map `state`
+(0x1100 bits 0-2) or `fully_charged` (0x1138). For the daily counters it
+uses 0x1427:0x1428 / 0x1429:0x142A, the second pair below.
 
-- Cell count ÷ 30 (a Force H2 module has 30 cells), at least 1 and at most
-  4 slots (0x1118-0x111B; 0x111C onwards holds temperatures). 2 modules
-  here.
-- Not "up to the first zero": 0x111A read 0 in the first dump but 1 on
-  2026-10-01, which that rule took for a third 0.01 V module.
-- Only the 2-module layout is verified. The pack-voltage sum check rejects a
-  misread on a bigger pack.
+Modules:
+
+- 0x1118/0x1119 are the max and min module (ids in 0x111A/0x111B), not a
+  per-module list. The first version read 0x1118 + n as "module n", which
+  was wrong: 0x1118 ≥ 0x1119 in all 1,054 samples, and 0x1118 matched
+  module 2's cell sum in 103 of them.
+- The module count is 0x1136 (1-16), and the cell list must be exactly
+  0x1137 long.
+- Each poll reads one register per module at 0x1460 and 0x14B0 and one per
+  cell at 0x1800, in chunks of at most 32: 4 requests on top of the 4 for
+  the summary and the cells.
+- Checks: the cells and the module voltages each sum to within 2 % of
+  `pack_voltage`; `module_voltage_max` / `_min` are within 2 % of the
+  largest / smallest module voltage; every temperature is -30..80 °C.
+- Rows stored before schema 4 have no module blocks. Re-decoding them sums
+  `module_voltages` from the cells (30 per module), and leaves
+  `module_temps` / `cell_temps` NULL.
 
 Cell count:
 
@@ -157,15 +194,12 @@ Cell count:
   chunk rather than failing the poll. Only 0x1500-0x153F is verified to
   respond.
 
-Not decoded yet (kept in `raw_1100`):
+Not decoded (kept in `raw_1100`):
 
-- current: probably 0x1104/0x1105, but it read 0 at idle;
-- 0x1114 / 0x1115: 1 °C-resolution temperatures (28 / 25);
-- 0x1108 = 679;
-- 0x1109 = 2160, probably a 216.0 V charge voltage limit;
-- 0x110B-0x110F;
-- 0x1122-0x112E, possibly counters;
-- 0x1137 = 60.
+- 0x110F = 3, constant;
+- 0x1127:0x1128 / 0x1129:0x112A: a second pair of daily charge/discharge
+  counters within 1-3 % of the first; what differs isn't known;
+- 0x1101, 0x1102, 0x1130-0x1135, 0x1139-0x113F: always 0.
 
 ### Table `bms_history` in `bms.db`
 
@@ -174,13 +208,19 @@ Not decoded yet (kept in `raw_1100`):
 | `id` | INTEGER PRIMARY KEY | |
 | `timestamp` | TEXT | local `YYYY-MM-DD HH:MM:SS` at poll start, like `inverter_history` |
 | `timestamp_epoch` | INTEGER | indexed, like `inverter_history` |
-| `pack_voltage`, `bms_temperature`, `soc`, `soh` | REAL | |
-| `cell_voltage_max`, `cell_voltage_min` | REAL | |
-| `cell_voltage_max_id`, `cell_voltage_min_id` | INTEGER | |
-| `cell_temp_max`, `cell_temp_min` | REAL | |
+| `state` | TEXT | |
+| every other scalar field above | REAL / INTEGER | `fully_charged` as 0/1 |
 | `module_voltages` | TEXT | JSON array of V |
+| `module_temps` | TEXT | JSON array of °C, NULL before schema 4 |
 | `cell_mv` | TEXT | JSON array of mV, all cells |
+| `cell_temps` | TEXT | JSON array of °C, all cells, NULL before schema 4 |
 | `raw_1100` | TEXT | JSON array, all 64 registers 0x1100-0x113F |
+
+`PRAGMA user_version` holds the schema version (4). 3 fixed `remaining_capacity` from Ah to kWh. 4 added `module_temps`/`cell_temps`; when re-decoding, rows that have them get the module blocks rebuilt from the stored values. Opening a version-1
+file (the first deployment, 2026-10-01) adds the new columns and re-decodes
+every row from `raw_1100` and `cell_mv`, which also corrects `cell_temp_*`
+and `module_voltages` in those rows. Rows that no longer decode are left as
+they were.
 
 Rules:
 
@@ -296,5 +336,5 @@ Unit tests only use fakes (no network, no real sleeps).
    few hours before and after; this setup writes about 27/min).
 4. The SolarMan app keeps updating after a day of polling. If it doesn't,
    raise `BMS_POLL_SECONDS`.
-5. Probe the current register during a charge and during an export. Decode
-   it only if confirmed; otherwise it stays in `raw_1100`.
+5. Probe the current register during a charge and during an export. Done
+   2026-10-02: 0x1104:0x1105, see the register map.

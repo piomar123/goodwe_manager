@@ -30,15 +30,33 @@ sample, with **real JSON numbers** (unlike `telemetry`):
 
 ```json
 {"timestamp": "2026-09-29 08:45:30", "timestamp_epoch": 1790664330,
- "pack_voltage": 196.5, "bms_temperature": 36.0, "soc": 33, "soh": 97,
+ "state": "idle", "pack_voltage": 196.5, "current": 0.0, "bms_temperature": 36.0,
+ "soc": 33, "soh": 97, "remaining_capacity": 2.347, "cycle_count": 679,
+ "charge_voltage_limit": 216.0, "charge_current_limit": 18.5,
+ "discharge_voltage_limit": 174.0, "discharge_current_limit": 18.5,
  "cell_voltage_max": 3.276, "cell_voltage_min": 3.273,
  "cell_voltage_max_id": 3, "cell_voltage_min_id": 24,
- "cell_temp_max": 27.2, "cell_temp_min": 25.7,
- "module_voltages": [98.25, 98.24], "cell_mv": [3276, 3275, ...]}
+ "cell_temp_max": 28.0, "cell_temp_min": 25.0, "cell_temp_max_id": 30, "cell_temp_min_id": 22,
+ "module_voltage_max": 98.25, "module_voltage_min": 98.24,
+ "module_voltage_max_id": 0, "module_voltage_min_id": 1,
+ "module_temp_max": 27.2, "module_temp_min": 25.7, "module_temp_max_id": 1, "module_temp_min_id": 0,
+ "charge_today_wh": 2652, "discharge_today_wh": 4021,
+ "charge_total_kwh": 4942, "discharge_total_kwh": 4902, "fully_charged": false,
+ "module_voltages": [98.25, 98.24], "module_temps": [25.7, 27.2],
+ "cell_mv": [3276, 3275, ...], "cell_temps": [26.0, 26.0, ...]}
 ```
 
-`bms_temperature` is the BMS's own sensor (the same 36 °C the inverter
-reports as `battery_temperature`); `cell_temp_max`/`_min` are the cells.
+- `current` is positive while charging (the inverter's `ibattery1` uses the
+  opposite sign); `state` is `charge` / `discharge` / `idle`.
+- `bms_temperature` is the BMS's own sensor (the same 36 °C the inverter
+  reports as `battery_temperature`). `module_temp_*` (0.1 °C, what the
+  SolarMan app shows) and `cell_temp_*` (1 °C steps) are the cells.
+- `module_voltages` / `module_temps` have one value per module, and
+  `cell_mv` / `cell_temps` one per cell (cell n is in module n // 30). Cell
+  temperatures come in 1 °C steps, with about 8 cells sharing each reading.
+- Ids are 0-based: cells 0-59, modules 0-1.
+- `charge_today_wh`/`discharge_today_wh` reset at midnight (BMS clock).
+
 Nothing is published while the BMS can't be read - use `expire_after` on
 HA sensors.
 
