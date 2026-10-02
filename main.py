@@ -488,7 +488,11 @@ def _bms_sample_handler(conn):
             await bms_storage.insert_sample(conn, sample)
         except Exception as e:
             logger.warning(f'BMS sample not stored: {e!r}')
-        await mqtt.publish_bms(bms_poller.sample_to_payload(sample))
+        payload = bms_poller.sample_to_payload(sample)
+        await mqtt.publish_bms(payload)
+        # Dashboard: sent once per sample (not with every 1 Hz update) and
+        # replayed to browsers that connect in between.
+        announcer.announce(json.dumps(payload), event='bms', sticky=True)
     return on_sample
 
 
