@@ -110,6 +110,27 @@ class BmsStorageTest(unittest.TestCase):
         self.assertEqual(len([m for m in logs.output if 're-decoded' in m]), 1)
         self.assertIn('1 of 2', [m for m in logs.output if 're-decoded' in m][0])
 
+    def test_schema_2_rows_get_remaining_capacity_in_kwh(self):
+        # Schema 2 (deployed 2026-10-02 11:09) stored remaining_capacity as Ah (÷100).
+        sample = bms_poller.decode(SUMMARY, CELLS, WHEN)
+
+        async def write_v2():
+            conn = await bms_storage.init_db_async(self.path)
+            await bms_storage.insert_sample(conn, sample)
+            await conn.execute("UPDATE bms_history SET remaining_capacity = 23.47")
+            await conn.execute("PRAGMA user_version = 2")
+            await conn.commit()
+            await conn.close()
+
+        async def reopen():
+            conn = await bms_storage.init_db_async(self.path)
+            await conn.close()
+
+        asyncio.run(write_v2())
+        asyncio.run(reopen())
+        with sqlite3.connect(self.path) as db:
+            self.assertAlmostEqual(db.execute('SELECT remaining_capacity FROM bms_history').fetchone()[0], 2.347)
+
     def test_default_path_is_looked_up_at_call_time(self):
         orig = bms_storage.BMS_DB_PATH
         bms_storage.BMS_DB_PATH = self.path

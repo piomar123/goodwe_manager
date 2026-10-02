@@ -31,7 +31,7 @@ sample, with **real JSON numbers** (unlike `telemetry`):
 ```json
 {"timestamp": "2026-09-29 08:45:30", "timestamp_epoch": 1790664330,
  "state": "idle", "pack_voltage": 196.5, "current": 0.0, "bms_temperature": 36.0,
- "soc": 33, "soh": 97, "remaining_capacity": 23.47, "cycle_count": 679,
+ "soc": 33, "soh": 97, "remaining_capacity": 2.347, "cycle_count": 679,
  "charge_voltage_limit": 216.0, "charge_current_limit": 18.5,
  "discharge_voltage_limit": 174.0, "discharge_current_limit": 18.5,
  "cell_voltage_max": 3.276, "cell_voltage_min": 3.273,
