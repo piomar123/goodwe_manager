@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  cellScale, cellExtremes, moduleBoundaries, barHeight, sampleAgeSeconds, isStale, formatAge,
+  cellScale, cellExtremes, moduleBoundaries, barHeight, sampleAgeSeconds, isStale, formatAge, formatFlow,
 } = require('../../static/js/bms-cells-calc.js');
 
 test('cellScale pads the real min/max by 3 mV', () => {
@@ -41,4 +41,11 @@ test('formatAge shows seconds under 2 min, minutes after', () => {
   assert.equal(formatAge(45), '45 s');
   assert.equal(formatAge(119), '119 s');
   assert.equal(formatAge(600), '10 min');
+});
+
+test('formatFlow names the direction and the current magnitude', () => {
+  assert.equal(formatFlow('charge', 15.183), 'charging 15.2 A');
+  assert.equal(formatFlow('discharge', -17.81), 'discharging 17.8 A');
+  assert.equal(formatFlow('idle', 0), 'idle');
+  assert.equal(formatFlow('unknown (5)', 0.4), 'unknown (5) 0.4 A');
 });

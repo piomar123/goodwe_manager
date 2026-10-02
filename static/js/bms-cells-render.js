@@ -21,7 +21,8 @@
     var spread = Math.round((s.cell_voltage_max - s.cell_voltage_min) * 1000);
     var modules = s.module_voltages.map(function (v) { return v.toFixed(2); }).join(' / ');
     document.getElementById('bms-summary').textContent =
-      'SOH ' + s.soh + '% · cells ' + s.cell_temp_min.toFixed(1) + '–' + s.cell_temp_max.toFixed(1) + ' °C' +
+      C.formatFlow(s.state, s.current) + ' · SOH ' + s.soh + '%, ' + s.cycle_count + ' cycles · ' +
+      'cells ' + s.module_temp_min.toFixed(1) + '–' + s.module_temp_max.toFixed(1) + ' °C' +
       ' (BMS board ' + s.bms_temperature.toFixed(1) + ' °C) · ' +
       s.cell_voltage_min.toFixed(3) + '–' + s.cell_voltage_max.toFixed(3) + ' V, spread ' + spread + ' mV' +
       ' · modules ' + modules + ' V · ' + C.formatAge(ageS) + ' ago' +

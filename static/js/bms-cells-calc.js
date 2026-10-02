@@ -57,6 +57,15 @@
     return ageS < 120 ? ageS + ' s' : Math.round(ageS / 60) + ' min';
   }
 
+  // "charging 15.2 A" from the BMS state and current (A, + = charging).
+  function formatFlow(state, current) {
+    var amps = Math.abs(current).toFixed(1) + ' A';
+    if (state === 'charge') return 'charging ' + amps;
+    if (state === 'discharge') return 'discharging ' + amps;
+    if (state === 'idle') return 'idle';
+    return state + ' ' + amps;
+  }
+
   var BmsCellsCalc = {
     CELLS_PER_MODULE: CELLS_PER_MODULE,
     cellScale: cellScale,
@@ -66,6 +75,7 @@
     sampleAgeSeconds: sampleAgeSeconds,
     isStale: isStale,
     formatAge: formatAge,
+    formatFlow: formatFlow,
   };
 
   if (typeof module !== 'undefined' && module.exports) {
