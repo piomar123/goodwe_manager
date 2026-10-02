@@ -22,7 +22,6 @@ SUMMARY_COUNT = 64
 CELLS_START = 0x1500
 CELLS_END = 0x1600  # exclusive; only 0x1500-0x153F is verified to respond
 CHUNK = 32
-MAX_MODULE_SLOTS = 4  # 0x1118-0x111B; 0x111C onwards holds temperatures
 CELLS_PER_MODULE = 30  # Force H2 module: 30 LFP cells (98.25 V / 30 = 3.275 V)
 READ_TIMEOUT_S = 5.0
 MIN_POLL_SECONDS = 10  # protects the logger (it also uploads to the SolarMan cloud)
@@ -75,20 +74,48 @@ class BmsDecodeError(ValueError):
     pass
 
 
+STATES = {1: 'charge', 2: 'discharge', 3: 'idle'}  # 0x1100 bits 0-2; other values not seen yet
+
+
 @dataclass(frozen=True)
 class BmsSample:
+    """Units: V, A (current positive = charging), °C, %, Ah. Ids are 0-based
+    (cell 0-59, module 0-1 on a 2-module pack)."""
     timestamp: str
     timestamp_epoch: int
+    state: str
     pack_voltage: float
+    current: float
     bms_temperature: float
     soc: int
     soh: int
+    remaining_capacity: float
+    cycle_count: int
+    charge_voltage_limit: float
+    charge_current_limit: float
+    discharge_voltage_limit: float
+    discharge_current_limit: float
     cell_voltage_max: float
     cell_voltage_min: float
     cell_voltage_max_id: int
     cell_voltage_min_id: int
     cell_temp_max: float
     cell_temp_min: float
+    cell_temp_max_id: int
+    cell_temp_min_id: int
+    module_voltage_max: float
+    module_voltage_min: float
+    module_voltage_max_id: int
+    module_voltage_min_id: int
+    module_temp_max: float
+    module_temp_min: float
+    module_temp_max_id: int
+    module_temp_min_id: int
+    charge_today_wh: int
+    discharge_today_wh: int
+    charge_total_kwh: int
+    discharge_total_kwh: int
+    fully_charged: bool
     module_voltages: List[float]
     cell_mv: List[int]
     raw_1100: List[int]
@@ -96,6 +123,11 @@ class BmsSample:
 
 def _signed(value: int) -> int:
     return value - 0x10000 if value >= 0x8000 else value
+
+
+def _signed32(high: int, low: int) -> int:
+    value = (high << 16) | low
+    return value - 0x100000000 if value >= 0x80000000 else value
 
 
 def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
@@ -108,29 +140,55 @@ def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
     def reg(addr: int) -> int:
         return summary[addr - SUMMARY_START]
 
+    def reg32(addr: int) -> int:
+        return _signed32(reg(addr), reg(addr + 1))
+
     cell_mv = []
     for value in cells:
         if value == 0:
             break
         cell_mv.append(value)
-    # Module count from the cell count, not the first zero register: 0x111A
-    # (0 in the first dump) has been seen reading 1 on a 2-module pack.
-    module_count = min(MAX_MODULE_SLOTS, max(1, len(cell_mv) // CELLS_PER_MODULE))
-    modules = [reg(0x1118 + i) / 100 for i in range(module_count)]
+    # Per-module voltages are summed from the cells: the BMS only reports
+    # the max/min module (0x1118/0x1119) and their ids (0x111A/0x111B).
+    modules = [sum(cell_mv[i:i + CELLS_PER_MODULE]) / 1000 for i in range(0, len(cell_mv), CELLS_PER_MODULE)]
+    status = reg(0x1100) & 0x7
 
     sample = BmsSample(
         timestamp=when.strftime('%Y-%m-%d %H:%M:%S'),
         timestamp_epoch=int(when.timestamp()),
+        state=STATES.get(status, f'unknown ({status})'),
         pack_voltage=reg(0x1103) / 10,
+        current=reg32(0x1104) / 100,
         bms_temperature=_signed(reg(0x1106)) / 10,
         soc=reg(0x1107),
         soh=reg(0x1120),
+        remaining_capacity=reg32(0x1121) / 100,
+        cycle_count=reg(0x1108),
+        charge_voltage_limit=reg(0x1109) / 10,
+        charge_current_limit=reg32(0x110A) / 100,
+        discharge_voltage_limit=reg(0x110C) / 10,
+        discharge_current_limit=abs(reg32(0x110D)) / 100,  # the BMS reports it negative
         cell_voltage_max=reg(0x1110) / 1000,
         cell_voltage_min=reg(0x1111) / 1000,
         cell_voltage_max_id=reg(0x1112),
         cell_voltage_min_id=reg(0x1113),
-        cell_temp_max=_signed(reg(0x111C)) / 10,
-        cell_temp_min=_signed(reg(0x111D)) / 10,
+        cell_temp_max=_signed(reg(0x1114)) / 10,
+        cell_temp_min=_signed(reg(0x1115)) / 10,
+        cell_temp_max_id=reg(0x1116),
+        cell_temp_min_id=reg(0x1117),
+        module_voltage_max=reg(0x1118) / 100,
+        module_voltage_min=reg(0x1119) / 100,
+        module_voltage_max_id=reg(0x111A),
+        module_voltage_min_id=reg(0x111B),
+        module_temp_max=_signed(reg(0x111C)) / 10,
+        module_temp_min=_signed(reg(0x111D)) / 10,
+        module_temp_max_id=reg(0x111E),
+        module_temp_min_id=reg(0x111F),
+        charge_today_wh=reg32(0x1123),
+        discharge_today_wh=reg32(0x1125),
+        charge_total_kwh=reg32(0x112B),
+        discharge_total_kwh=reg32(0x112D),
+        fully_charged=bool(reg(0x1138)),
         module_voltages=modules,
         cell_mv=cell_mv,
         raw_1100=list(summary),
@@ -151,15 +209,18 @@ def _check_plausible(s: BmsSample) -> None:
     bad = [mv for mv in s.cell_mv if not 2000 <= mv <= 4000]
     if bad:
         raise BmsDecodeError(f'cell voltage {bad[0]} mV outside 2000-4000')
-    for name in ('bms_temperature', 'cell_temp_max', 'cell_temp_min'):
+    for name in ('bms_temperature', 'cell_temp_max', 'cell_temp_min', 'module_temp_max', 'module_temp_min'):
         value = getattr(s, name)
         if not -30 <= value <= 80:
             raise BmsDecodeError(f'{name} temperature {value} °C outside -30..80')
-    if not s.module_voltages:
-        raise BmsDecodeError('no module voltages')
-    total = sum(s.module_voltages)
+    total = sum(s.cell_mv) / 1000
     if abs(total - s.pack_voltage) > 0.02 * s.pack_voltage:
-        raise BmsDecodeError(f'module voltages sum {total:.2f} V, pack reads {s.pack_voltage} V')
+        raise BmsDecodeError(f'cells sum {total:.2f} V, pack reads {s.pack_voltage} V')
+    for name, expected in (('module_voltage_max', max(s.module_voltages)),
+                           ('module_voltage_min', min(s.module_voltages))):
+        value = getattr(s, name)
+        if abs(value - expected) > 0.02 * expected:
+            raise BmsDecodeError(f'{name} {value} V, the cells sum to {expected:.2f} V')
 
 
 BACKOFF_AFTER_FAILURES = 3
@@ -171,8 +232,8 @@ class PollFailed(Exception):
 
 
 def sample_to_payload(sample: BmsSample) -> dict:
-    """MQTT payload: every decoded field as a JSON number; the raw register
-    block stays in bms.db only."""
+    """MQTT payload: every decoded field (numbers, `state` a string,
+    `fully_charged` a bool); the raw register block stays in bms.db only."""
     payload = asdict(sample)
     del payload['raw_1100']
     return payload

@@ -11,9 +11,13 @@ grouped under `Unreleased` until that changes.
 - Optional Pylontech BMS poller: with `BMS_LOGGER_HOST` / `BMS_LOGGER_SERIAL`
   set in `.env`, cell temperatures, SOH, and every cell's voltage are read
   from the BMS through its SolarMan logger every 60 s, stored in `bms.db`,
-  and published on MQTT `goodwe/bms`. Run `pip install -r requirements.txt`
-  after pulling (new dependency `pysolarmanv5`). Without those settings
-  nothing changes.
+  and published on MQTT `goodwe/bms`, along with current, cycle count,
+  remaining capacity, BMS charge/discharge limits, and daily/lifetime energy
+  counters. Run `pip install -r requirements.txt` after pulling (new
+  dependency `pysolarmanv5`). Without those settings nothing changes. A
+  `bms.db` from a pre-merge deployment of this branch is migrated on start
+  (rows re-decoded; `cell_temp_*` now 0x1114/5, the 0.1 °C readings moved
+  to `module_temp_*`).
 - Battery control executor (off by default): MQTT `control/set`/`control/reserve/set`/`control/state`,
   dashboard override, `CONTROL_*` env keys (`CONTROL_MIN_SOC` new: the executor owns the on-grid
   minimum SoC). No behaviour change unless `CONTROL_MODE` is set.
