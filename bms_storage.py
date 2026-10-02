@@ -11,7 +11,7 @@ from typing import Optional
 
 import aiosqlite
 
-from bms_poller import BmsDecodeError, BmsSample, decode
+from bms_poller import BmsDecodeError, BmsSample, ModuleBlocks, decode
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,9 @@ BMS_DB_PATH = 'bms.db'
 # 1: first deployed version (2026-10-01). 2: full register map - current,
 # limits, counters, module max/min; cell_temp_* moved from 0x111C/D (module
 # temperatures) to 0x1114/5, module_voltages now summed from the cells.
-# 3: remaining_capacity in kWh (2 read it as Ah).
-SCHEMA_VERSION = 3
+# 3: remaining_capacity in kWh (2 read it as Ah). 4: module_temps and
+# cell_temps; module_voltages from the BMS's per-module registers.
+SCHEMA_VERSION = 4
 
 # Column -> SQLite type, in BmsSample field order (id is the primary key).
 _COLUMN_TYPES = {
@@ -61,11 +62,13 @@ _COLUMN_TYPES = {
     'discharge_total_kwh': 'INTEGER',
     'fully_charged': 'INTEGER',
     'module_voltages': 'TEXT',  # JSON array of V
+    'module_temps': 'TEXT',  # JSON array of °C, NULL before schema 4
     'cell_mv': 'TEXT',  # JSON array of mV
+    'cell_temps': 'TEXT',  # JSON array of °C, NULL before schema 4
     'raw_1100': 'TEXT',  # JSON array, all 64 registers 0x1100-0x113F
 }
 _COLUMNS = tuple(_COLUMN_TYPES)
-_JSON_COLUMNS = {'module_voltages', 'cell_mv', 'raw_1100'}
+_JSON_COLUMNS = {'module_voltages', 'module_temps', 'cell_mv', 'cell_temps', 'raw_1100'}
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS bms_history (id INTEGER PRIMARY KEY, "
@@ -75,13 +78,18 @@ _SCHEMA = (
 
 
 def _values(sample: BmsSample, columns) -> list:
-    return [json.dumps(getattr(sample, c)) if c in _JSON_COLUMNS else getattr(sample, c) for c in columns]
+    def value(column):
+        v = getattr(sample, column)
+        return json.dumps(v) if column in _JSON_COLUMNS and v is not None else v  # None -> SQL NULL, not 'null'
+    return [value(c) for c in columns]
 
 
 async def _migrate(conn: aiosqlite.Connection) -> None:
     """Bring an older bms.db up to SCHEMA_VERSION: add the missing columns,
     then re-decode every row from its raw registers and cells (the spec's
-    rule: a newly decoded column also fills in past rows)."""
+    rule: a newly decoded column also fills in past rows). Rows that already
+    have the module blocks get them rebuilt from the stored values; older
+    rows are decoded without them."""
     async with conn.execute("PRAGMA table_info('bms_history')") as cur:
         existing = {row[1] async for row in cur}
     for column, sql_type in _COLUMN_TYPES.items():
@@ -89,12 +97,18 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
             await conn.execute(f"ALTER TABLE bms_history ADD COLUMN {column} {sql_type.replace(' NOT NULL', '')}")
     redecoded = total = 0
     updated = [c for c in _COLUMNS if c not in ('timestamp', 'timestamp_epoch')]
-    async with conn.execute("SELECT id, timestamp, raw_1100, cell_mv FROM bms_history") as cur:
+    async with conn.execute("SELECT id, timestamp, raw_1100, cell_mv, module_voltages, module_temps, cell_temps"
+                            " FROM bms_history") as cur:
         rows = await cur.fetchall()
-    for row_id, timestamp, raw, cells in rows:
+    for row_id, timestamp, raw, cells, module_v, module_t, cell_t in rows:
         total += 1
         try:
-            sample = decode(json.loads(raw), json.loads(cells), datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S'))
+            blocks = None
+            if module_t is not None and cell_t is not None:
+                to_raw = lambda values, scale: [round(v * scale) & 0xFFFF for v in json.loads(values)]
+                blocks = ModuleBlocks(to_raw(module_v, 100), to_raw(module_t, 10), to_raw(cell_t, 10))
+            sample = decode(json.loads(raw), json.loads(cells), datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S'),
+                            blocks)
         except (BmsDecodeError, ValueError, TypeError):
             continue
         await conn.execute(f"UPDATE bms_history SET {', '.join(f'{c} = ?' for c in updated)} WHERE id = ?",

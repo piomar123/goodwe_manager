@@ -42,7 +42,8 @@ sample, with **real JSON numbers** (unlike `telemetry`):
  "module_temp_max": 27.2, "module_temp_min": 25.7, "module_temp_max_id": 1, "module_temp_min_id": 0,
  "charge_today_wh": 2652, "discharge_today_wh": 4021,
  "charge_total_kwh": 4942, "discharge_total_kwh": 4902, "fully_charged": false,
- "module_voltages": [98.273, 98.271], "cell_mv": [3276, 3275, ...]}
+ "module_voltages": [98.25, 98.24], "module_temps": [25.7, 27.2],
+ "cell_mv": [3276, 3275, ...], "cell_temps": [26.0, 26.0, ...]}
 ```
 
 - `current` is positive while charging (the inverter's `ibattery1` uses the
@@ -50,8 +51,9 @@ sample, with **real JSON numbers** (unlike `telemetry`):
 - `bms_temperature` is the BMS's own sensor (the same 36 °C the inverter
   reports as `battery_temperature`). `module_temp_*` (0.1 °C, what the
   SolarMan app shows) and `cell_temp_*` (1 °C steps) are the cells.
-- `module_voltages` is summed from the cells; `module_voltage_max`/`_min` are
-  the BMS's own readings.
+- `module_voltages` / `module_temps` have one value per module, and
+  `cell_mv` / `cell_temps` one per cell (cell n is in module n // 30). Cell
+  temperatures come in 1 °C steps, with about 8 cells sharing each reading.
 - Ids are 0-based: cells 0-59, modules 0-1.
 - `charge_today_wh`/`discharge_today_wh` reset at midnight (BMS clock).
 

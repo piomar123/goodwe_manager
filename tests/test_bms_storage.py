@@ -7,7 +7,7 @@ import unittest
 
 import bms_poller
 import bms_storage
-from tests.test_bms_poller import CELLS, SUMMARY, WHEN
+from tests.test_bms_poller import BLOCKS, CELLS, SUMMARY, WHEN
 
 
 V1_SCHEMA = """
@@ -39,7 +39,7 @@ class BmsStorageTest(unittest.TestCase):
             self.assertIn('idx_bms_history_timestamp_epoch', indexes)
 
     def test_row_round_trips(self):
-        sample = bms_poller.decode(SUMMARY, CELLS, WHEN)
+        sample = bms_poller.decode(SUMMARY, CELLS, WHEN, BLOCKS)
 
         async def go():
             conn = await bms_storage.init_db_async(self.path)
@@ -58,7 +58,9 @@ class BmsStorageTest(unittest.TestCase):
         self.assertEqual(row['state'], 'idle')
         self.assertEqual(row['cycle_count'], 679)
         self.assertEqual(row['fully_charged'], 0)
-        self.assertEqual(json.loads(row['module_voltages']), [98.273, 98.271])
+        self.assertEqual(json.loads(row['module_voltages']), [98.25, 98.24])
+        self.assertEqual(json.loads(row['module_temps']), [25.7, 27.2])
+        self.assertEqual(len(json.loads(row['cell_temps'])), 60)
         self.assertEqual(len(json.loads(row['cell_mv'])), 60)
         self.assertEqual(json.loads(row['raw_1100']), SUMMARY)
 
@@ -109,6 +111,32 @@ class BmsStorageTest(unittest.TestCase):
         self.assertIsNone(bad['cycle_count'])  # undecodable row left as it was
         self.assertEqual(len([m for m in logs.output if 're-decoded' in m]), 1)
         self.assertIn('1 of 2', [m for m in logs.output if 're-decoded' in m][0])
+
+    def test_re_decoding_keeps_module_blocks_of_newer_rows(self):
+        # A row with the module blocks must come out of a migration unchanged
+        # in those fields (they're rebuilt from the stored values).
+        sample = bms_poller.decode(SUMMARY, CELLS, WHEN, BLOCKS)
+
+        async def write_old_version():
+            conn = await bms_storage.init_db_async(self.path)
+            await bms_storage.insert_sample(conn, sample)
+            await conn.execute("PRAGMA user_version = 2")
+            await conn.commit()
+            await conn.close()
+
+        async def reopen():
+            conn = await bms_storage.init_db_async(self.path)
+            await conn.close()
+
+        asyncio.run(write_old_version())
+        with self.assertLogs('bms_storage', 'INFO'):
+            asyncio.run(reopen())
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute('SELECT * FROM bms_history').fetchone()
+        self.assertEqual(json.loads(row['module_voltages']), [98.25, 98.24])
+        self.assertEqual(json.loads(row['module_temps']), [25.7, 27.2])
+        self.assertEqual(json.loads(row['cell_temps'])[30], 28.0)
 
     def test_schema_2_rows_get_remaining_capacity_in_kwh(self):
         # Schema 2 (deployed 2026-10-02 11:09) stored remaining_capacity as Ah (÷100).

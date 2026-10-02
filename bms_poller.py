@@ -21,6 +21,12 @@ SUMMARY_START = 0x1100
 SUMMARY_COUNT = 64
 CELLS_START = 0x1500
 CELLS_END = 0x1600  # exclusive; only 0x1500-0x153F is verified to respond
+# Per-module and per-cell blocks, one register per module / cell (layout from
+# ha-solarman's pylontech_force.yaml, verified on this BMS 2026-10-02).
+MODULE_VOLTAGES_START = 0x1460
+MODULE_TEMPS_START = 0x14B0
+CELL_TEMPS_START = 0x1800
+MAX_MODULES = 16  # 0x1460-0x146F
 CHUNK = 32
 CELLS_PER_MODULE = 30  # Force H2 module: 30 LFP cells (98.25 V / 30 = 3.275 V)
 READ_TIMEOUT_S = 5.0
@@ -74,6 +80,21 @@ class BmsDecodeError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class ModuleBlocks:
+    """Raw registers from 0x1460 (module voltages), 0x14B0 (module
+    temperatures) and 0x1800 (cell temperatures)."""
+    module_voltages: List[int]
+    module_temps: List[int]
+    cell_temps: List[int]
+
+
+def module_count(summary: List[int]) -> int:
+    """0x1136, the number of modules in series, clamped to what the
+    per-module blocks can hold (decode rejects an out-of-range value)."""
+    return max(1, min(MAX_MODULES, summary[0x1136 - SUMMARY_START]))
+
+
 STATES = {1: 'charge', 2: 'discharge', 3: 'idle'}  # 0x1100 bits 0-2; other values not seen yet
 
 
@@ -117,7 +138,9 @@ class BmsSample:
     discharge_total_kwh: int
     fully_charged: bool
     module_voltages: List[float]
+    module_temps: Optional[List[float]]  # None for rows stored before 0x14B0 was read
     cell_mv: List[int]
+    cell_temps: Optional[List[float]]  # None for rows stored before 0x1800 was read
     raw_1100: List[int]
 
 
@@ -130,10 +153,14 @@ def _signed32(high: int, low: int) -> int:
     return value - 0x100000000 if value >= 0x80000000 else value
 
 
-def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
-    """Decode the 0x1100-0x113F summary block and the cell block read from
-    0x1500 into a BmsSample, then run the plausibility checks. Raises
-    BmsDecodeError if anything doesn't fit."""
+def decode(summary: List[int], cells: List[int], when: datetime,
+           blocks: Optional[ModuleBlocks] = None) -> BmsSample:
+    """Decode the 0x1100-0x113F summary block, the cell block read from
+    0x1500 and the per-module/per-cell blocks into a BmsSample, then run the
+    plausibility checks. Raises BmsDecodeError if anything doesn't fit.
+    `blocks` is None only when re-decoding rows stored before those blocks
+    were read: module voltages are then summed from the cells and the
+    temperature lists are None."""
     if len(summary) != SUMMARY_COUNT:
         raise BmsDecodeError(f'summary block has {len(summary)} registers, expected {SUMMARY_COUNT}')
 
@@ -148,9 +175,18 @@ def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
         if value == 0:
             break
         cell_mv.append(value)
-    # Per-module voltages are summed from the cells: the BMS only reports
-    # the max/min module (0x1118/0x1119) and their ids (0x111A/0x111B).
-    modules = [sum(cell_mv[i:i + CELLS_PER_MODULE]) / 1000 for i in range(0, len(cell_mv), CELLS_PER_MODULE)]
+    modules_in_series = reg(0x1136)
+    if not 1 <= modules_in_series <= MAX_MODULES:
+        raise BmsDecodeError(f'module count {modules_in_series} (0x1136) outside 1-{MAX_MODULES}')
+    if blocks is None:
+        modules = [sum(cell_mv[i:i + CELLS_PER_MODULE]) / 1000 for i in range(0, len(cell_mv), CELLS_PER_MODULE)]
+        module_temps = cell_temps = None
+    else:
+        if reg(0x1137) != len(cell_mv):
+            raise BmsDecodeError(f'cell count {len(cell_mv)}, the BMS reports {reg(0x1137)} (0x1137)')
+        modules = [v / 100 for v in blocks.module_voltages[:modules_in_series]]
+        module_temps = [_signed(v) / 10 for v in blocks.module_temps[:modules_in_series]]
+        cell_temps = [_signed(v) / 10 for v in blocks.cell_temps[:len(cell_mv)]]
     status = reg(0x1100) & 0x7
 
     sample = BmsSample(
@@ -190,7 +226,9 @@ def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
         discharge_total_kwh=reg32(0x112D),
         fully_charged=bool(reg(0x1138)),
         module_voltages=modules,
+        module_temps=module_temps,
         cell_mv=cell_mv,
+        cell_temps=cell_temps,
         raw_1100=list(summary),
     )
     _check_plausible(sample)
@@ -213,9 +251,17 @@ def _check_plausible(s: BmsSample) -> None:
         value = getattr(s, name)
         if not -30 <= value <= 80:
             raise BmsDecodeError(f'{name} temperature {value} °C outside -30..80')
+    for name in ('module_temps', 'cell_temps'):
+        values = getattr(s, name) or []
+        bad = [v for v in values if not -30 <= v <= 80]
+        if bad:
+            raise BmsDecodeError(f'{name} temperature {bad[0]} °C outside -30..80')
     total = sum(s.cell_mv) / 1000
     if abs(total - s.pack_voltage) > 0.02 * s.pack_voltage:
         raise BmsDecodeError(f'cells sum {total:.2f} V, pack reads {s.pack_voltage} V')
+    total = sum(s.module_voltages)
+    if abs(total - s.pack_voltage) > 0.02 * s.pack_voltage:
+        raise BmsDecodeError(f'module voltages sum {total:.2f} V, pack reads {s.pack_voltage} V')
     for name, expected in (('module_voltage_max', max(s.module_voltages)),
                            ('module_voltage_min', min(s.module_voltages))):
         value = getattr(s, name)
@@ -279,7 +325,14 @@ class BmsPoller:
                 await asyncio.wait_for(self._client.connect(), self._timeout_s)
             summary = await self._read(SUMMARY_START, SUMMARY_COUNT)
             cells = await self._read_cells()
-            sample = decode(summary, cells, when)
+            modules = module_count(summary)
+            cell_count = cells.index(0) if 0 in cells else len(cells)
+            blocks = ModuleBlocks(
+                module_voltages=await self._read(MODULE_VOLTAGES_START, modules),
+                module_temps=await self._read(MODULE_TEMPS_START, modules),
+                cell_temps=await self._read(CELL_TEMPS_START, cell_count) if cell_count else [],
+            )
+            sample = decode(summary, cells, when, blocks)
         except Exception as e:  # CancelledError is a BaseException: shutdown passes through
             await self._record_failure(e, when)
             return None
