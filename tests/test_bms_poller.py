@@ -63,7 +63,8 @@ class DecodeTest(unittest.TestCase):
         self.assertEqual(s.state, 'idle')
         self.assertEqual(s.current, 0.0)
         self.assertEqual(s.cycle_count, 679)
-        self.assertAlmostEqual(s.remaining_capacity, 23.47)
+        # Wh in the register: the modules are in series, 7.1 kWh at 100 % = 2 x 3.55 kWh
+        self.assertAlmostEqual(s.remaining_capacity, 2.347)
         self.assertAlmostEqual(s.charge_voltage_limit, 216.0)
         self.assertAlmostEqual(s.charge_current_limit, 18.5)
         self.assertAlmostEqual(s.discharge_voltage_limit, 174.0)

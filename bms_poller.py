@@ -79,7 +79,7 @@ STATES = {1: 'charge', 2: 'discharge', 3: 'idle'}  # 0x1100 bits 0-2; other valu
 
 @dataclass(frozen=True)
 class BmsSample:
-    """Units: V, A (current positive = charging), °C, %, Ah. Ids are 0-based
+    """Units: V, A (current positive = charging), °C, %, kWh. Ids are 0-based
     (cell 0-59, module 0-1 on a 2-module pack)."""
     timestamp: str
     timestamp_epoch: int
@@ -162,7 +162,7 @@ def decode(summary: List[int], cells: List[int], when: datetime) -> BmsSample:
         bms_temperature=_signed(reg(0x1106)) / 10,
         soc=reg(0x1107),
         soh=reg(0x1120),
-        remaining_capacity=reg32(0x1121) / 100,
+        remaining_capacity=reg32(0x1121) / 1000,  # Wh in the register
         cycle_count=reg(0x1108),
         charge_voltage_limit=reg(0x1109) / 10,
         charge_current_limit=reg32(0x110A) / 100,

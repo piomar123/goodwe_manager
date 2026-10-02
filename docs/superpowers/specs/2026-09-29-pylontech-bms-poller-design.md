@@ -148,7 +148,7 @@ Ids are 0-based.
 | `module_temp_max` / `_min` | 0x111C / 0x111D | ÷10 | °C | SolarMan (27.2 / 25.7) |
 | `module_temp_max_id` / `_min_id` | 0x111E / 0x111F | 1 | module 0-1 | same layout as 0x1118-0x111B; constant 1 / 0 so far |
 | `soh` | 0x1120 | 1 | % | SolarMan (97) |
-| `remaining_capacity` | 0x1121:0x1122 32-bit | ÷100 | Ah | r = 0.999 with SoC; 70.97 at 100 % = 2 × 37 Ah × 97 % |
+| `remaining_capacity` | 0x1121:0x1122 32-bit | ÷1000 | kWh | r = 0.999 with SoC; 7.097 at 100 % ≈ 2 × 3.55 kWh (modules in series); ha-solarman reads it as Wh too |
 | `charge_today_wh` / `discharge_today_wh` | 0x1123:0x1124 / 0x1125:0x1126 32-bit | 1 | Wh | rise only while charging / discharging, reset at midnight; 10-15 % above GoodWe's counters |
 | `charge_total_kwh` / `discharge_total_kwh` | 0x112B:0x112C / 0x112D:0x112E 32-bit | 1 | kWh | step +1 per ~1 kWh charged / discharged; 4941 kWh / 684 cycles = 7.2 kWh |
 | `fully_charged` | 0x1138 | 0/1 | | 1 only at SoC 100 % |
@@ -201,7 +201,7 @@ Not decoded (kept in `raw_1100`):
 | `cell_mv` | TEXT | JSON array of mV, all cells |
 | `raw_1100` | TEXT | JSON array, all 64 registers 0x1100-0x113F |
 
-`PRAGMA user_version` holds the schema version (2). Opening a version-1
+`PRAGMA user_version` holds the schema version (3; 3 fixed `remaining_capacity` from Ah to kWh). Opening a version-1
 file (the first deployment, 2026-10-01) adds the new columns and re-decodes
 every row from `raw_1100` and `cell_mv`, which also corrects `cell_temp_*`
 and `module_voltages` in those rows. Rows that no longer decode are left as

@@ -20,7 +20,8 @@ BMS_DB_PATH = 'bms.db'
 # 1: first deployed version (2026-10-01). 2: full register map - current,
 # limits, counters, module max/min; cell_temp_* moved from 0x111C/D (module
 # temperatures) to 0x1114/5, module_voltages now summed from the cells.
-SCHEMA_VERSION = 2
+# 3: remaining_capacity in kWh (2 read it as Ah).
+SCHEMA_VERSION = 3
 
 # Column -> SQLite type, in BmsSample field order (id is the primary key).
 _COLUMN_TYPES = {
