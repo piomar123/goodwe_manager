@@ -15,7 +15,8 @@ grouped under `Unreleased` until that changes.
 - Optional Pylontech BMS poller: with `BMS_LOGGER_HOST` / `BMS_LOGGER_SERIAL`
   set in `.env`, cell temperatures, SOH, and every cell's voltage are read
   from the BMS through its SolarMan logger every 60 s, stored in `bms.db`,
-  and published on MQTT `goodwe/bms`, along with current, cycle count,
+  and published on MQTT `goodwe/bms`, along with per-module voltages and
+  temperatures, every cell's temperature, current, cycle count,
   remaining capacity, BMS charge/discharge limits, and daily/lifetime energy
   counters. Run `pip install -r requirements.txt` after pulling (new
   dependency `pysolarmanv5`). Without those settings nothing changes. A
