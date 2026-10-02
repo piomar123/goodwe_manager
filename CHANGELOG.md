@@ -27,6 +27,11 @@ grouped under `Unreleased` until that changes.
   minimum SoC). No behaviour change unless `CONTROL_MODE` is set.
   Today's write count is kept in `control_writes.json` (git-ignored) so the
   `CONTROL_MAX_WRITES_PER_DAY` warning keeps counting across restarts.
+- The active control command and dashboard override are saved in
+  `control_state.json` (git-ignored) and restored after a restart while
+  still unexpired, so a deploy no longer drops Predbat's command to `auto`
+  until its next call. Expired, stopped, or implausibly far-ahead entries are
+  ignored; a command that arrives before the restore wins.
 - Live telemetry now writes to SQLite (`data.db`, `inverter_history` table)
   instead of per-run `data-*.csv` files. **If you have existing CSV files,
   run the one-off migration script** - see the README's "Upgrading" section.

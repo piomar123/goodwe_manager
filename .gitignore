@@ -196,3 +196,5 @@ cython_debug/
 /NOTES.local.md
 /control_writes.json
 /control_writes.json.tmp
+/control_state.json
+/control_state.json.tmp

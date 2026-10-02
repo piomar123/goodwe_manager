@@ -72,6 +72,9 @@ CONTROL_CONFIG = control.config_from_env(os.environ)
 # Today's control write count (control_runtime), next to data.db, so the
 # CONTROL_MAX_WRITES_PER_DAY warning keeps counting across restarts.
 CONTROL_WRITES_PATH = 'control_writes.json'
+# The active control command and dashboard override, so a restart keeps them
+# until they expire instead of dropping to auto until Predbat's next call.
+CONTROL_STATE_PATH = 'control_state.json'
 WARSAW_TZ = ZoneInfo('Europe/Warsaw')
 # manager.log rotation: normal DEBUG output is ~50KB/day, so this keeps
 # months of history while capping disk use at ~60MB even if something
@@ -496,7 +499,8 @@ def _bms_sample_handler(conn):
 control_runtime_instance: Optional[control_runtime.ControlRuntime] = None
 if CONTROL_CONFIG is not None:
     control_runtime_instance = control_runtime.ControlRuntime(CONTROL_CONFIG, mqtt,
-                                                                counter_path=CONTROL_WRITES_PATH)
+                                                                counter_path=CONTROL_WRITES_PATH,
+                                                                state_path=CONTROL_STATE_PATH)
     mqtt.set_control_handler(control_runtime_instance.on_mqtt_message)
 
 
