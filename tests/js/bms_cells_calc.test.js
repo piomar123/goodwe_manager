@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
-  cellScale, cellExtremes, moduleBoundaries, barHeight, sampleAgeSeconds, isStale, formatAge, formatFlow,
+  cellScale, cellExtremes, moduleBoundaries, barHeight, sampleAgeSeconds, isStale, formatAge, formatFlow, cellLabel,
 } = require('../../static/js/bms-cells-calc.js');
 
 test('cellScale pads the real min/max by 3 mV', () => {
@@ -48,4 +48,10 @@ test('formatFlow names the direction and the current magnitude', () => {
   assert.equal(formatFlow('discharge', -17.81), 'discharging 17.8 A');
   assert.equal(formatFlow('idle', 0), 'idle');
   assert.equal(formatFlow('unknown (5)', 0.4), 'unknown (5) 0.4 A');
+});
+
+test('cellLabel names module and cell, with the temperature when there is one', () => {
+  assert.equal(cellLabel(34, 3301, 32), 'Module 2 cell 5: 3.301 V, 32 °C');
+  assert.equal(cellLabel(0, 3276, undefined), 'Module 1 cell 1: 3.276 V');
+  assert.equal(cellLabel(1, 3276, -2.5), 'Module 1 cell 2: 3.276 V, -2.5 °C');
 });

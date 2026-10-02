@@ -66,6 +66,14 @@
     return state + ' ' + amps;
   }
 
+  // Bar tooltip: "Module 2 cell 5: 3.301 V, 32 °C" (cellIdx 0-based; the
+  // temperature is left out for samples without cell_temps).
+  function cellLabel(cellIdx, mv, tempC) {
+    var label = 'Module ' + (Math.floor(cellIdx / CELLS_PER_MODULE) + 1) + ' cell ' +
+      (cellIdx % CELLS_PER_MODULE + 1) + ': ' + (mv / 1000).toFixed(3) + ' V';
+    return tempC === undefined || tempC === null ? label : label + ', ' + tempC + ' °C';
+  }
+
   var BmsCellsCalc = {
     CELLS_PER_MODULE: CELLS_PER_MODULE,
     cellScale: cellScale,
@@ -76,6 +84,7 @@
     isStale: isStale,
     formatAge: formatAge,
     formatFlow: formatFlow,
+    cellLabel: cellLabel,
   };
 
   if (typeof module !== 'undefined' && module.exports) {

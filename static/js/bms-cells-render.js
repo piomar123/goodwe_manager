@@ -29,7 +29,7 @@
       (C.isStale(ageS) ? ' (stale)' : '');
   }
 
-  function renderChart(cells) {
+  function renderChart(cells, temps) {
     var svg = document.getElementById('bms-cells');
     var width = Math.max(svg.clientWidth || 600, LEFT + cells.length * 2);
     svg.setAttribute('viewBox', '0 0 ' + width + ' ' + HEIGHT);
@@ -50,8 +50,7 @@
       var h = C.barHeight(mv, scale, plotH);
       var color = i === extremes.minIdx ? COLORS.min : (i === extremes.maxIdx ? COLORS.max : COLORS.cell);
       var bar = el('rect', { x: LEFT + i * step + gap / 2, y: TOP + plotH - h, width: Math.max(1, step - gap), height: h, fill: color });
-      var module = Math.floor(i / C.CELLS_PER_MODULE) + 1, inModule = i % C.CELLS_PER_MODULE + 1;
-      bar.appendChild(el('title', {}, 'Module ' + module + ' cell ' + inModule + ': ' + (mv / 1000).toFixed(3) + ' V'));
+      bar.appendChild(el('title', {}, C.cellLabel(i, mv, temps ? temps[i] : undefined)));
       svg.appendChild(bar);
     });
 
@@ -68,7 +67,7 @@
     var ageS = C.sampleAgeSeconds(last.timestamp_epoch, Date.now());
     panel.style.opacity = C.isStale(ageS) ? 0.5 : 1;
     renderSummary(last, ageS);
-    renderChart(last.cell_mv);
+    renderChart(last.cell_mv, last.cell_temps);
   }
 
   window.eventSource.addEventListener('bms', function (e) {
