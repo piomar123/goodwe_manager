@@ -61,7 +61,9 @@ class ShadowScanGuard:
         self._next_try = 0.0
         self._attempts = 0
         self._backoff_s = FIRST_BACKOFF_S
-        self._load()
+        # Loaded on the first step: main.py builds the guard at import, before
+        # logging is configured, and the load logs what it resumed.
+        self._loaded = False
 
     async def step(self, inverter, off_grid: bool) -> None:
         """Call once per poll with the current goodwe object (it is new after
@@ -72,12 +74,15 @@ class ShadowScanGuard:
             logger.warning(f'Shadow scan guard step failed: {e}')
 
     async def _step(self, inverter, off_grid: bool) -> None:
+        if not self._loaded:
+            self._loaded = True
+            self._load()
         now = self._mono()
         restoring = False
         if off_grid:
             self._on_grid_since = None
             if not self._holding:
-                logger.info('Off-grid: turning shadow scan off')
+                logger.info('Off-grid: holding shadow scan off')
                 self._holding, self._restore = True, None
                 self._save()
             target = OFF

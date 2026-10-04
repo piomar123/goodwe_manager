@@ -142,6 +142,18 @@ class GuardTest(unittest.TestCase):
         self.tick(False, 30, guard=restarted)
         self.assertEqual(self.inv.writes, [('shadow_scan', 0), ('shadow_scan', 1)])
 
+    def test_state_is_loaded_on_first_step_not_at_construction(self):
+        # main.py builds the guard at import, before logging is configured:
+        # loading (and its log lines) must wait for the poll loop.
+        self.tick(True, 30)
+        with self.assertLogs('shadow_scan_guard', level='INFO') as logs:
+            restarted = self.make_guard()
+            shadow_scan_guard.logger.info('marker')  # assertLogs needs at least one record
+        self.assertEqual(logs.output, ['INFO:shadow_scan_guard:marker'])
+        with self.assertLogs('shadow_scan_guard', level='INFO') as logs:
+            self.tick(True, 1, guard=restarted)
+        self.assertIn('resumed', logs.output[0])
+
     def test_unreadable_state_file_is_ignored(self):
         with open(self.state_path, 'w') as f:
             f.write('not json')

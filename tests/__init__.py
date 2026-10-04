@@ -2,8 +2,9 @@
 Imported before any test module. main.py loads .env at import time, and in a
 deployed checkout that's the production config - blank everything that would
 reach real systems, so a test run there can't publish to the real MQTT
-broker, start battery control or the shadow scan guard, or poll the BMS. load_dotenv() never
-overrides variables that are already set, so these win over .env.
+broker, start battery control or the shadow scan guard, or poll the BMS.
+load_dotenv() never overrides variables that are already set, so these win
+over .env.
 """
 import os
 
