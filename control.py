@@ -220,14 +220,17 @@ class Sample:
         soc = _float_or_none(data.get('battery_soc'))
         if soc is not None and not 0 <= soc <= 100:
             soc = None
-        # Runtime (not the work_mode *setting*): grid_mode 0 not connected /
-        # 2 fault, work_mode 2 Normal (Off-Grid) - the history shows outages
-        # as grid_mode 2 + work_mode 2.
-        grid_mode = _float_or_none(data.get('grid_mode'))
-        work_mode = _float_or_none(data.get('work_mode'))
-        off_grid = (grid_mode is not None and grid_mode != 1) or work_mode == 2
         return Sample(soc, _float_or_none(data.get('vbattery1')), _float_or_none(data.get('battery_charge_limit')),
-                      _float_or_none(data.get('battery_discharge_limit')), off_grid)
+                      _float_or_none(data.get('battery_discharge_limit')), is_off_grid(data))
+
+
+def is_off_grid(data: dict) -> bool:
+    """From runtime data (not the work_mode *setting*): grid_mode 0 not
+    connected / 2 fault, work_mode 2 Normal (Off-Grid) - the history shows
+    outages as grid_mode 2 + work_mode 2."""
+    grid_mode = _float_or_none(data.get('grid_mode'))
+    work_mode = _float_or_none(data.get('work_mode'))
+    return (grid_mode is not None and grid_mode != 1) or work_mode == 2
 
 
 TARGET_DEBOUNCE = timedelta(seconds=30)

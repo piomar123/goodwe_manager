@@ -8,6 +8,11 @@ grouped under `Unreleased` until that changes.
 
 ### Changed
 
+- Optional off-grid shadow scan guard (off by default):
+  `OFF_GRID_SHADOW_SCAN_GUARD=on` turns shadow scan off while the inverter is
+  off-grid and restores the previous value after the grid has been up for
+  `OFF_GRID_SHADOW_SCAN_COOLDOWN_MIN` (default 15). Independent of
+  `CONTROL_MODE`; state in `shadow_scan_guard.json` (git-ignored).
 - Dashboard: a "Battery cells" panel (only with the BMS poller enabled) shows
   SOH, cell temperatures, the cell voltage spread and a bar chart of every
   cell's voltage. Sent as a `bms` SSE event once per sample and replayed to

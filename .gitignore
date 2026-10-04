@@ -198,3 +198,5 @@ cython_debug/
 /control_writes.json.tmp
 /control_state.json
 /control_state.json.tmp
+/shadow_scan_guard.json
+/shadow_scan_guard.json.tmp

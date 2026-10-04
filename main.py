@@ -35,6 +35,7 @@ import forecast_history
 import history
 import mqtt_bridge
 import pv_forecast_payload
+import shadow_scan_guard
 import storage
 import tariff_engine
 from announcer import MessageAnnouncer
@@ -75,6 +76,12 @@ CONTROL_WRITES_PATH = 'control_writes.json'
 # The active control command and dashboard override, so a restart keeps them
 # until they expire instead of dropping to auto until Predbat's next call.
 CONTROL_STATE_PATH = 'control_state.json'
+# Shadow scan off while off-grid, previous value back after an on-grid
+# cooldown - independent of CONTROL_MODE. Invalid values fail startup.
+SHADOW_SCAN_GUARD_CONFIG = shadow_scan_guard.config_from_env(os.environ)
+# Whether the guard is holding shadow scan off and what to restore, so a
+# restart mid-outage still puts it back.
+SHADOW_SCAN_GUARD_STATE_PATH = 'shadow_scan_guard.json'
 WARSAW_TZ = ZoneInfo('Europe/Warsaw')
 # manager.log rotation: normal DEBUG output is ~50KB/day, so this keeps
 # months of history while capping disk use at ~60MB even if something
@@ -344,6 +351,8 @@ class AsyncioThread(threading.Thread):
                         logger.warning(f"Could not publish telemetry: {e}")
                 if control_runtime_instance is not None:
                     await control_runtime_instance.step(inverter_runtime)
+                if shadow_scan_guard_instance is not None:
+                    await shadow_scan_guard_instance.step(self._inverter, control.is_off_grid(inverter_runtime))
                 new_day_start, _ = storage.current_day_bounds(datetime.now())
                 if new_day_start != current_day_start:
                     current_day_start = new_day_start
@@ -502,6 +511,11 @@ if CONTROL_CONFIG is not None:
                                                                 counter_path=CONTROL_WRITES_PATH,
                                                                 state_path=CONTROL_STATE_PATH)
     mqtt.set_control_handler(control_runtime_instance.on_mqtt_message)
+
+shadow_scan_guard_instance: Optional[shadow_scan_guard.ShadowScanGuard] = None
+if SHADOW_SCAN_GUARD_CONFIG is not None:
+    shadow_scan_guard_instance = shadow_scan_guard.ShadowScanGuard(SHADOW_SCAN_GUARD_CONFIG,
+                                                                   state_path=SHADOW_SCAN_GUARD_STATE_PATH)
 
 
 def _fire_and_forget(coro) -> None:
@@ -1167,6 +1181,9 @@ def main():
     if CONTROL_CONFIG is not None:
         # Logged here, not at import - logging isn't configured until now.
         logger.info(f'Battery control enabled in {CONTROL_CONFIG.mode} mode')
+    if SHADOW_SCAN_GUARD_CONFIG is not None:
+        logger.info(f'Off-grid shadow scan guard enabled, '
+                    f'cooldown {SHADOW_SCAN_GUARD_CONFIG.cooldown.total_seconds() / 60:g} min')
     _load_bms_config()
     if len(sys.argv) > 1 and sys.argv[1] == '--dry-run':
         logger.warning("Running in dry-run mode without inverter connection")
