@@ -53,6 +53,11 @@ APP_PORT = int(os.environ.get('APP_PORT', 5000))
 # noise (see docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md -
 # a flat constant for now, pending the adaptive-threshold formula explored
 # there).
+# Per request: with the forked goodwe each retry waits longer (1, 1.5, 2.25,
+# then 3 s), so 5 retries give up after ~14 s - longer than the loss bursts
+# seen on the Wi-Fi link (a few s), short enough that a dead link doesn't
+# stall the 1 Hz loop (and control writes) for minutes before reconnecting.
+INVERTER_RETRIES = 5
 BACKUP_ACTIVE_THRESHOLD_W = float(os.environ.get('BACKUP_ACTIVE_THRESHOLD_W', 35))
 MQTT_HOST = os.environ.get('MQTT_HOST') or None
 MQTT_PORT = int(os.environ.get('MQTT_PORT', 1883))
@@ -270,7 +275,8 @@ class AsyncioThread(threading.Thread):
 
     async def _get_inverter_data(self):
         logger.info(f'Connecting to {self._inverter_address}')
-        self._inverter = await goodwe.connect(self._inverter_address, family='ET', timeout=1, retries=60)
+        self._inverter = await goodwe.connect(self._inverter_address, family='ET', timeout=1,
+                                              retries=INVERTER_RETRIES)
         logger.info(f'Connected to the inverter')
         if control_runtime_instance is not None:
             control_runtime_instance.attach(self._inverter)
