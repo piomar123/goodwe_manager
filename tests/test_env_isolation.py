@@ -20,14 +20,15 @@ class EnvIsolationTest(unittest.TestCase):
         # same as .env values would.
         env = dict(os.environ, INVERTER_IP='10.10.100.253', MQTT_HOST='localhost', CONTROL_MODE='on',
                    CONTROL_CHARGE_CURRENT_A='19', CONTROL_DISCHARGE_CURRENT_A='19', CONTROL_MIN_SOC='10',
+                   OFF_GRID_SHADOW_SCAN_GUARD='on',
                    BMS_LOGGER_HOST='192.168.1.221', BMS_LOGGER_SERIAL='4060493924')
         code = ("import tests, main; "
-                "print(main.mqtt.enabled, main.CONTROL_CONFIG, main.INVERTER_IP, "
+                "print(main.mqtt.enabled, main.CONTROL_CONFIG, main.SHADOW_SCAN_GUARD_CONFIG, main.INVERTER_IP, "
                 "repr(os.environ.get('BMS_LOGGER_HOST')))")
         result = subprocess.run([sys.executable, '-c', 'import os; ' + code], cwd=REPO_ROOT,
                                 capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip().splitlines()[-1], "False None 127.0.0.1 ''")
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "False None None 127.0.0.1 ''")
 
 
 if __name__ == '__main__':

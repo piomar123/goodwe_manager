@@ -131,6 +131,18 @@ minimum SoC through `CONTROL_MIN_SOC`, not SolarGo - the executor rewrites
 it. To change other settings in SolarGo, set a dashboard override to `auto`
 first, otherwise an active command is re-applied within ~10 s.
 
+## Shadow scan off while off-grid (optional)
+
+`OFF_GRID_SHADOW_SCAN_GUARD=on` turns the inverter's shadow scan (PV global
+MPPT scan) off as soon as the inverter goes off-grid - it misbehaves there -
+and puts the previous value back once the grid has stayed up for
+`OFF_GRID_SHADOW_SCAN_COOLDOWN_MIN` (default 15): outages come in bursts and
+the grid often drops again minutes after returning. If shadow scan was
+already off, nothing is written. Independent of `CONTROL_MODE`. The pending
+restore is kept in `shadow_scan_guard.json` (git-ignored), so a restart
+mid-outage still puts it back. A manual change on the `/config` page during
+an outage or the cooldown is replaced by the saved value when it's restored.
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 
