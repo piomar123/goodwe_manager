@@ -8,6 +8,14 @@ grouped under `Unreleased` until that changes.
 
 ### Changed
 
+- goodwe is now a pinned fork (0.4.10 + upstream PR #156 + UDP fixes): a
+  late inverter response to an earlier attempt is accepted instead of lost,
+  each retry waits longer (1, 1.5, 2.25, then 3 s), and stray datagrams no
+  longer trigger instant retries. The inverter timeout went from 1 s to
+  0.6 s (replies take at most ~0.3 s, and a slower one is still accepted)
+  and retries per request from 60 to 5, so a dead link fails after ~8 s
+  instead of stalling the poll loop for a minute. Run
+  `pip install -r requirements.txt` after pulling.
 - Optional off-grid shadow scan guard (off by default):
   `OFF_GRID_SHADOW_SCAN_GUARD=on` turns shadow scan off while the inverter is
   off-grid and restores the previous value after the grid has been up for
