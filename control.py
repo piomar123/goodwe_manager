@@ -89,11 +89,11 @@ def parse_command(payload, now: datetime) -> Command:
         if power <= 0:
             raise CommandError(f'{mode.value} needs a positive power_w')
         power = int(power)
-        if data.get('target_soc') is not None:
-            target = _number(data['target_soc'], 'target_soc')
-            if not 0 <= target <= 100:
-                raise CommandError('target_soc must be 0-100')
-            target = int(target)
+    if (mode in POWERED_MODES or mode is Mode.FREEZE_CHARGE) and data.get('target_soc') is not None:
+        target = _number(data['target_soc'], 'target_soc')
+        if not 0 <= target <= 100:
+            raise CommandError('target_soc must be 0-100')
+        target = int(target)
 
     stop = data.get('stop')
     if stop is not None and (mode is not Mode.AUTO or stop not in STOP_DOMAINS):
@@ -433,8 +433,8 @@ class Executor:
             self._reset_latches()
 
     def _reset_latches(self) -> None:
-        self._charge_latched = self._export_latched = False
-        self._charge_deb, self._export_deb = _Debounce(), _Debounce()
+        self._charge_latched = self._export_latched = self._hold_latched = False
+        self._charge_deb, self._export_deb, self._hold_deb = _Debounce(), _Debounce(), _Debounce()
         self._charge_release_deb = _Debounce()
         self._fresh = True  # first SoC sample of a new command skips the debounce
 
@@ -459,8 +459,19 @@ class Executor:
         soc, target, fresh = sample.soc, active.target_soc, self._fresh
         if soc is not None:
             self._fresh = False
-        if target is None or soc is None and not (self._charge_latched or self._export_latched):
+        if target is None or soc is None and not (self._charge_latched or self._export_latched or self._hold_latched):
             return active.mode, reason
+        if active.mode is Mode.FREEZE_CHARGE:
+            # Predbat "Hold charging": the battery may discharge down to the
+            # target, then is frozen there. At or below it on arrival (FrzChrg
+            # and car holds send the SoC itself) it freezes at once.
+            if self._hold_latched:
+                return Mode.FREEZE_CHARGE, 'target_soc reached'
+            at_target = int(soc) <= target
+            if (fresh and at_target) or self._hold_deb.update(at_target, now):
+                self._hold_latched = True
+                return Mode.FREEZE_CHARGE, 'target_soc reached'
+            return Mode.AUTO, 'holding above target_soc'
         if active.mode is Mode.CHARGE:
             if self._charge_latched:
                 if soc is not None and self._charge_release_deb.update(soc < target - CHARGE_TARGET_HYSTERESIS, now):
