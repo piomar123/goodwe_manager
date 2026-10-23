@@ -4,12 +4,40 @@ Quick overview:
 
 https://github.com/user-attachments/assets/0824e02f-0407-40a6-8b6f-845b09fb819b
 
+Needs Python 3.12 or newer (the pinned numpy and matplotlib don't install on older ones).
+Tested only on a GW8KN-ET (with a Pylontech Force H2), connected locally over UDP.
+
 * Create venv `python3 -m venv venv` and activate it `. venv/bin/activate`
 * Install dependencies `pip install -r requirements.txt`
-* Copy `.env.example` to `.env` and fill in the values
-* Replace the rest of `poor-man's config` in `main.py`
+* Copy `.env.example` to `.env` and fill in the values (all configuration lives there)
 * Run with `python main.py` (TODO: instructions for gunicorn)
 * Run with `--dry-run` parameter to disable communication with the inverter (used for testing)
+
+The PV forecast uses Solcast with two sites (`SOLCAST_SITE_EAST_ID`,
+`SOLCAST_SITE_WEST_ID`) and assumes an east-west array, see the caveats at
+the end of this file.
+
+### Running as a service
+
+On the author's Raspberry Pi it runs as a systemd user service. Save as
+`~/.config/systemd/user/goodwe_manager.service` (adjust the paths):
+
+```ini
+[Unit]
+Description=Goodwe PV inverter manager
+
+[Service]
+WorkingDirectory=/home/pi/goodwe_manager/
+ExecStart=/home/pi/goodwe_manager/venv/bin/python main.py
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+then `systemctl --user daemon-reload && systemctl --user enable --now goodwe_manager`
+and `sudo loginctl enable-linger $USER`, so it keeps running without a login session.
+Logs: `journalctl --user -u goodwe_manager -f`.
 
 ## Upgrading
 
@@ -181,5 +209,3 @@ a solution would be to use an alternative to Flask that supports async (and also
 and that logic is quite hard-coded even though it looks like it's configurable
 * too much code in main.py - needs to be extracted for readability and maintainability
 * Jinja templates use a lot of code repetition - needs to extract meta-templates and macros
-
-TODO: instructions for running as a linux service
