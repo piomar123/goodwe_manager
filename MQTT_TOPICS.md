@@ -244,7 +244,7 @@ mqtt:
 |---|---|
 | `mode` | `auto`, `charge`, `export`, `freeze_charge`, `freeze_export` |
 | `power_w` | required for `charge`/`export`; clamped to 100 W … `CONTROL_MAX_BATTERY_W` (the inverter enforces the live BMS limit itself; `bms_charge_limit_w`/`bms_discharge_limit_w` in the state show it) |
-| `target_soc` | optional for `charge`/`export`: charge → `freeze_charge` once reached; export → `auto` once reached |
+| `target_soc` | optional for `charge`/`export`/`freeze_charge`: charge → `freeze_charge` once reached; export → `auto` once reached; freeze_charge (Predbat "Hold charging") → `auto` while the SoC is above it, then frozen there once reached. A freeze_charge target at or above the SoC freezes at once |
 
 `freeze_charge` raises the on-grid minimum SoC (`battery_discharge_depth`) to the current SoC (never below `CONTROL_MIN_SOC`) and follows a rising SoC in 3-point steps; before the first SoC reading it stays `auto` (`reason: waiting for SoC`). The inverter only discharges again 5 points above its minimum, so a freeze ending near `CONTROL_MIN_SOC` shows a warning.
 | `ttl_s` / `expires_at` | one required unless `mode` is `auto`; max 3600 s / 60 min ahead. Re-send before it runs out (Predbat: `repeat: true`) |
