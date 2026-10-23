@@ -41,8 +41,18 @@ class ParseCommandTest(unittest.TestCase):
         self.assertEqual((cmd.mode, cmd.expires_at, cmd.stop), (Mode.AUTO, None, 'charge'))
 
     def test_power_is_ignored_for_unpowered_modes(self):
-        cmd = control.parse_command(cmd_json(mode='freeze_charge', power_w=500, target_soc=50, ttl_s=60), NOW)
+        cmd = control.parse_command(cmd_json(mode='freeze_export', power_w=500, target_soc=50, ttl_s=60), NOW)
         self.assertEqual((cmd.power_w, cmd.target_soc), (None, None))
+
+    def test_freeze_charge_keeps_its_target_soc_but_not_power(self):
+        # Predbat's "Hold charging" (limit below the SoC) is a freeze_charge
+        # that carries the limit as target_soc.
+        cmd = control.parse_command(cmd_json(mode='freeze_charge', power_w=500, target_soc=86, ttl_s=60), NOW)
+        self.assertEqual((cmd.power_w, cmd.target_soc), (None, 86))
+
+    def test_freeze_charge_target_out_of_range_is_rejected(self):
+        with self.assertRaises(CommandError):
+            control.parse_command(cmd_json(mode='freeze_charge', target_soc=101, ttl_s=60), NOW)
 
     def test_rejections(self):
         cases = {
@@ -560,6 +570,89 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
         ex.submit(Command(Mode.AUTO))
         ex.tick(S(40), at(1))
         self.assertFalse(ex.min_soc_hold)
+
+
+class ExecutorHoldAboveTargetTest(unittest.TestCase):
+    """Predbat "Hold charging": freeze_charge with a target_soc below the SoC.
+    The battery may discharge down to the target, then is frozen there. A
+    freeze_charge without a target (FrzChrg, car/iBoost hold) freezes at the
+    current SoC at once - see ExecutorFreezeFloorTest."""
+
+    def hold(self, soc, target=86):
+        ex = control.Executor(CFG)
+        warm(ex, soc)
+        ex.submit(Command(Mode.FREEZE_CHARGE, None, target, 'predbat', at(3600)))
+        return ex
+
+    def test_discharge_stays_allowed_while_soc_is_above_the_target(self):
+        ex = self.hold(90)
+        s = ex.tick(S(90), NOW)
+        self.assertEqual((s['ems_mode'], s['battery_discharge_depth']), (control.EMS_AUTO, CFG.min_soc))
+        self.assertEqual(ex.snapshot(NOW)['effective_mode'], 'auto')
+        self.assertIsNone(ex.snapshot(NOW)['freeze_floor'])
+
+    def test_freezes_at_the_target_after_the_debounce(self):
+        ex = self.hold(90)
+        ex.tick(S(90), NOW)
+        ex.tick(S(86), at(10))
+        self.assertEqual(ex.tick(S(86), at(20))['battery_discharge_depth'], CFG.min_soc)  # not debounced yet
+        s = ex.tick(S(86), at(41))
+        self.assertEqual(s['battery_discharge_depth'], 86)
+        self.assertEqual(ex.snapshot(at(41))['effective_mode'], 'freeze_charge')
+
+    def test_stays_frozen_when_pv_lifts_the_soc_back_above_the_target(self):
+        ex = self.hold(90)
+        ex.tick(S(86), at(0))
+        ex.tick(S(86), at(31))
+        self.assertEqual(ex.tick(S(88), at(40))['battery_discharge_depth'], 86)
+        self.assertEqual(ex.snapshot(at(40))['effective_mode'], 'freeze_charge')
+
+    def test_soc_already_at_or_below_the_target_freezes_at_the_soc(self):
+        ex = self.hold(85, target=86)
+        s = ex.tick(S(85), NOW)
+        self.assertEqual(s['battery_discharge_depth'], 85)
+
+    def test_resending_the_same_hold_keeps_the_latch(self):
+        ex = self.hold(90)
+        ex.tick(S(86), at(0))
+        ex.tick(S(86), at(31))
+        ex.submit(Command(Mode.FREEZE_CHARGE, None, 86, 'predbat', at(3600)))
+        self.assertEqual(ex.tick(S(88), at(40))['battery_discharge_depth'], 86)
+
+    def test_a_new_target_restarts_the_hold(self):
+        ex = self.hold(90)
+        ex.tick(S(86), at(0))
+        ex.tick(S(86), at(31))
+        ex.submit(Command(Mode.FREEZE_CHARGE, None, 80, 'predbat', at(3600)))
+        s = ex.tick(S(86), at(40))
+        self.assertEqual(s['battery_discharge_depth'], CFG.min_soc)  # 86 is above the new target 80
+
+    def test_target_never_lowers_the_floor_below_min_soc(self):
+        ex = self.hold(20, target=10)
+        ex.tick(S(20), NOW)
+        ex.tick(S(10), at(1))
+        s = ex.tick(S(10), at(32))
+        self.assertEqual(s['battery_discharge_depth'], CFG.min_soc)
+
+    def test_target_equal_to_the_whole_soc_freezes_at_once(self):
+        # FrzChrg / car hold send target = the SoC rounded; 90.4 vs 90 must not
+        # turn an ordinary freeze into a discharge.
+        ex = self.hold(90.4, target=90)
+        self.assertEqual(ex.tick(S(90.4), NOW)['battery_discharge_depth'], 90)
+
+    def test_without_a_target_it_still_freezes_at_the_soc_at_once(self):
+        ex = control.Executor(CFG)
+        warm(ex, 90)
+        ex.submit(Command(Mode.FREEZE_CHARGE, None, None, 'predbat', at(3600)))
+        self.assertEqual(ex.tick(S(90), NOW)['battery_discharge_depth'], 90)
+
+    def test_reserve_above_the_target_still_freezes_first(self):
+        # Predbat also sets reserve = target + 1; whichever is reached first wins.
+        ex = self.hold(90)
+        ex.set_reserve(87)
+        ex.tick(S(87), at(0))
+        s = ex.tick(S(87), at(31))
+        self.assertEqual(s['battery_discharge_depth'], 87)
 
 
 class ExecutorSnapshotTest(unittest.TestCase):
