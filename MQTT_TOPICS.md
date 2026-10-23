@@ -97,8 +97,8 @@ to those two Predbat config keys in your HA template/sensor setup.
 
 ## Example Home Assistant sensor config
 
-Excerpt from the actual deployed `configuration.yaml` on `raspberry4.local`
-(see the `home-assistant-raspberry4` repo) - one `mqtt:` block can only have
+Excerpt from the author's deployed `configuration.yaml` (Home Assistant
+in Docker on a Raspberry Pi 4) - one `mqtt:` block can only have
 a single `sensor:`/`binary_sensor:` key each, so these entries are merged
 into whatever else that host's config already defines under those keys
 rather than living in their own file.
@@ -274,13 +274,17 @@ Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or be
 
 ## Home Assistant + Predbat example
 
-As configured in the `home-assistant-raspberry4` repo (Predbat v9.1.0,
+As deployed by the author (Predbat v9.4.x, the custom inverter definition
 checked against its `inverter.py`). Predbat calls the service templates,
 which run an HA script that publishes the JSON command; the executor's
 state comes back as MQTT sensors. Predbat also writes charge/discharge
 rate, target SoC, windows and schedule switches - these are HA helpers
 holding Predbat's own view (the rate helper is what it passes as
 `power`); only the reserve reaches the executor.
+
+Merge the `mqtt:` entries below with the sensors from "Example Home
+Assistant sensor config" above (one `mqtt:` key per config), and the
+`template:` entries with any you already have.
 
 `configuration.yaml`:
 
@@ -346,6 +350,9 @@ mqtt:
       mode: box
       icon: mdi:battery-lock
 
+# Predbat's apps.yaml validation rejects input_boolean for
+# scheduled_*_enable (only switch/select/number/time/input_number/
+# input_datetime), so these are wrapped in template switches below.
 input_boolean:
   goodwe_scheduled_charge_enable:
     name: "Goodwe scheduled charge enable (Predbat)"
@@ -372,23 +379,18 @@ input_datetime:
     has_date: false
     has_time: true
 
-# EV charge target for Predbat's car_charging_limit (%). No `initial:` so
-# HA restores the last value across restarts. The finish time and current
-# SoC are Predbat's own entities (select.predbat_car_charging_plan_time,
-# input_number.predbat_car_charging_manual_soc_kwh).
-
 input_number:
   goodwe_charge_rate:
     name: "Goodwe charge rate (Predbat)"
     min: 0
-    max: 3400
+    max: 3600
     step: 1
     unit_of_measurement: "W"
     mode: box
   goodwe_discharge_rate:
     name: "Goodwe discharge rate (Predbat)"
     min: 0
-    max: 3400
+    max: 3600
     step: 1
     unit_of_measurement: "W"
     mode: box
@@ -399,48 +401,81 @@ input_number:
     step: 1
     unit_of_measurement: "%"
     mode: box
+
+template:
+  - switch:
+      - name: "Goodwe Scheduled Charge Enable"
+        unique_id: goodwe_scheduled_charge_enable_switch
+        icon: mdi:battery-clock
+        state: "{{ is_state('input_boolean.goodwe_scheduled_charge_enable', 'on') }}"
+        turn_on:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.goodwe_scheduled_charge_enable
+        turn_off:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.goodwe_scheduled_charge_enable
+      - name: "Goodwe Scheduled Discharge Enable"
+        unique_id: goodwe_scheduled_discharge_enable_switch
+        icon: mdi:battery-clock-outline
+        state: "{{ is_state('input_boolean.goodwe_scheduled_discharge_enable', 'on') }}"
+        turn_on:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.goodwe_scheduled_discharge_enable
+        turn_off:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.goodwe_scheduled_discharge_enable
 ```
 
-`scripts.yaml`:
+`scripts.yaml` (top-level script ids, no `script:` key in this file):
 
 ```yaml
-script:
-  goodwe_control:
-    alias: "GoodWe control command"
-    mode: queued
-    max: 10
-    fields:
-      control_mode:
-        description: "auto, charge, export, freeze_charge or freeze_export"
-      power:
-        description: "W, for charge/export"
-      target_soc:
-        description: "%, optional for charge/export"
-      stop:
-        description: "charge or export, only with mode auto"
-    sequence:
-      - action: mqtt.publish
-        data:
-          topic: "goodwe/control/set"
-          qos: 1
-          retain: false
-          payload: >-
-            {% set cmd = {'mode': control_mode, 'source': 'predbat', 'ttl_s': 900} %}
-            {% if power is defined and power not in ('', None) and control_mode in ('charge', 'export') %}
-            {% set cmd = dict(cmd, power_w=power | int) %}
-            {% endif %}
-            {% if target_soc is defined and target_soc not in ('', None) and control_mode in ('charge', 'export') %}
-            {% set cmd = dict(cmd, target_soc=target_soc | int) %}
-            {% endif %}
-            {% if stop is defined and stop %}
-            {% set cmd = dict(cmd, stop=stop) %}
-            {% endif %}
-            {{ cmd | to_json }}
+goodwe_control:
+  alias: "GoodWe control command"
+  mode: queued
+  max: 10
+  fields:
+    control_mode:
+      description: "auto, charge, export, freeze_charge or freeze_export"
+    power:
+      description: "W, for charge/export"
+    target_soc:
+      description: "%, optional for charge/export; for freeze_charge the hold level (discharge down to it, then freeze)"
+    stop:
+      description: "charge or export, only with mode auto"
+  sequence:
+    - action: mqtt.publish
+      data:
+        topic: "goodwe/control/set"
+        qos: 1
+        retain: false
+        payload: >-
+          {% set cmd = {'mode': control_mode, 'source': 'predbat', 'ttl_s': 900} %}
+          {% if power is defined and power not in ('', None) and control_mode in ('charge', 'export') %}
+          {% set cmd = dict(cmd, power_w=power | int) %}
+          {% endif %}
+          {% if target_soc is defined and target_soc not in ('', None) and control_mode in ('charge', 'export', 'freeze_charge') %}
+          {% set cmd = dict(cmd, target_soc=target_soc | int) %}
+          {% endif %}
+          {% if stop is defined and stop %}
+          {% set cmd = dict(cmd, stop=stop) %}
+          {% endif %}
+          {{ cmd | to_json }}
 ```
 
-Predbat `apps.yaml`:
+Predbat `apps.yaml` (the keys under `pred_bat:`; everything not listed
+keeps Predbat's template default; the last block holds this installation's
+battery and inverter sizes, replace them with yours):
 
 ```yaml
+  timezone: Europe/Warsaw
+  currency_symbols:
+    - 'zł'
+    - 'gr'
+  num_inverters: 1
   inverter_type: GWMGR
   inverter:
     name: "GoodWe via goodwe_manager"
@@ -480,9 +515,9 @@ Predbat `apps.yaml`:
   reserve:
     - number.goodwe_reserve
   scheduled_charge_enable:
-    - input_boolean.goodwe_scheduled_charge_enable
+    - switch.goodwe_scheduled_charge_enable
   scheduled_discharge_enable:
-    - input_boolean.goodwe_scheduled_discharge_enable
+    - switch.goodwe_scheduled_discharge_enable
 
   # Every template repeats each Predbat cycle (repeat: true) - the executor
   # drops a command after its 15 min ttl, so a silent Predbat falls back to
@@ -497,6 +532,7 @@ Predbat `apps.yaml`:
   charge_freeze_service:
     - service: script.goodwe_control
       control_mode: freeze_charge
+      target_soc: "{target_soc}"
       repeat: true
   charge_stop_service:
     - service: script.goodwe_control
@@ -527,9 +563,45 @@ Predbat `apps.yaml`:
     - input_datetime.goodwe_discharge_start_time
   discharge_end_time:
     - input_datetime.goodwe_discharge_end_time
+
+  # Sensors from "Example Home Assistant sensor config" above
+  battery_power:
+    - sensor.goodwe_battery_power
+  pv_power:
+    - sensor.goodwe_pv_power
+  load_power:
+    - sensor.goodwe_load_power
+  grid_power:
+    - sensor.goodwe_grid_power
+  soc_percent:
+    - sensor.goodwe_battery_soc
+  load_today:
+    - sensor.goodwe_load_today
+  import_today:
+    - sensor.goodwe_import_today
+  export_today:
+    - sensor.goodwe_export_today
+  pv_today:
+    - sensor.goodwe_pv_today
+  pv_forecast_today: sensor.goodwe_pv_forecast_today
+  pv_forecast_tomorrow: sensor.goodwe_pv_forecast_tomorrow
+  metric_octopus_import: sensor.goodwe_import_price
+  metric_octopus_export: sensor.goodwe_export_price
+
+  # This installation: GW8KN-ET + Pylontech Force H2 7.1 kWh
+  soc_max:
+    - 7.1
+  inverter_limit:
+    - 8000
+  battery_rate_max:
+    - 3600
 ```
 
-Predbat runtime settings (HA entities, not `apps.yaml`): `set_charge_freeze` and `set_export_freeze` on (expert mode), `set_reserve_enable` on, `set_reserve_min` ~12 (the executor warns below 10 %), `best_soc_min` ~15 % and `best_soc_keep` 20-25 % of 7.1 kWh (see the spec's "Predbat battery model" section; the BMS SoC resyncs around 22-18 %, so levels are a trade-off, not a hard limit), `set_charge_low_power` / `set_export_low_power` on. Keep `battery_rate_max` at the battery's representative rate (3400 W here) - `CONTROL_MAX_BATTERY_W` is only a ceiling above it.
+`charge_freeze_service` passes `target_soc` for Predbat's "Hold charging"
+(discharge down to the limit, then hold); an executor without that support
+ignores it and freezes at the current SoC.
+
+Predbat runtime settings (HA entities, not `apps.yaml`): `set_charge_freeze` and `set_export_freeze` on (expert mode), `set_reserve_enable` on, `set_reserve_min` ~12 (the executor warns below 10 %), `best_soc_min` ~15 % and `best_soc_keep` 20-25 % of 7.1 kWh (see the spec's "Predbat battery model" section; the BMS SoC resyncs around 22-18 %, so levels are a trade-off, not a hard limit), `set_charge_low_power` / `set_export_low_power` on. Keep `battery_rate_max` at the battery's representative rate (3600 W here) - `CONTROL_MAX_BATTERY_W` is only a ceiling above it.
 
 ## Failure behavior
 
