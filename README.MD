@@ -86,14 +86,17 @@ to publish the true negative value instead - note the 23% VAT bonus is
 never applied to a negative price either way, since the law doesn't
 define a bonus on a loss.
 
-### Predbat setup note: zł-scale thresholds
+### Predbat setup note: prices and thresholds are in grosze
 
-Everything this bridge publishes stays in zł, unconverted - Predbat's own
-cost-optimization math (comparing import cost vs. export revenue to plan
-actions) works identically regardless of currency scale, as long as
-import and export use the same unit. The one place scale genuinely
-matters is Predbat's absolute-currency **threshold** settings, tuned
-against its own pence-scale examples:
+The bridge publishes prices in zł/kWh, but Predbat works in the minor
+unit: rate lists with `start`/`end`/`value` keys (the shape of
+`prices/import` and `prices/export`) are multiplied by 100 when Predbat
+reads them (`fetch_octopus_rates` in its `octopus.py`), so its plan,
+costs and the absolute **threshold** settings are all in grosze, like
+pence in its own docs. Set `currency_symbols` to `zł` / `gr`.
+
+The defaults are therefore already on a sensible scale and there is no
+need to shrink them:
 
 - `metric_min_improvement` (default `0.0`) - minimum cost improvement
   worth lowering the battery SoC for.
@@ -102,16 +105,9 @@ against its own pence-scale examples:
 - `metric_min_improvement_export_freeze` (default `0.1`) - minimum cost
   improvement worth freezing an export for.
 - `metric_min_improvement_plan` (default `2.0`) - minimum cost
-  improvement worth changing the whole plan for.
-
-Left at their pence-tuned defaults against zł-scale prices (roughly
-0.3-1.3 zł/kWh here), thresholds like `0.1` stop meaning "negligible"
-and start meaning "10-30% of a typical price difference," which can make
-Predbat silently skip real, worthwhile charge/discharge/export
-decisions. Set these explicitly to a zł-appropriate value (e.g. `0.001`
-in place of `0.1`) in Predbat's `apps.yaml` rather than relying on the
-shipped defaults - this is a Predbat-side config note, not something
-goodwe_manager can fix on its end.
+  improvement worth replacing the current plan for. Raised to `5` (gr)
+  on the author's installation: plans flipping back and forth over 2-5 gr
+  differences weren't worth the inverter writes.
 
 ### Estimating Predbat's battery/inverter loss config
 
