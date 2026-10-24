@@ -135,13 +135,19 @@ would do in `control/state` but never writes; `on` writes to the inverter.
 minimum SoC - required when not `off`, and restored whenever the battery
 isn't frozen.
 
-| Mode | What the inverter does (measured on a GW8KN-ET) |
-|---|---|
-| `auto` | normal self-use (EMS AUTO) |
-| `charge` P | battery charges at exactly P W; shortfall from the grid |
-| `export` P | battery discharges at exactly P W; PV not curtailed, the rest is exported |
-| `freeze_charge` | no discharge (on-grid minimum SoC raised to the current SoC); surplus PV still charges |
-| `freeze_export` | no charging (charge current 0); surplus exported, battery covers the deficit |
+| Predbat status | Mode | Inverter settings written | What the inverter does (measured on a GW8KN-ET) |
+|---|---|---|---|
+| Demand, Hold exporting | `auto` | EMS 1 (Auto), normal charge/discharge currents and on-grid minimum SoC | normal self-use |
+| Charging | `charge` P | EMS 11 (Charge Battery), EMS power limit P | battery charges at exactly P W; shortfall from the grid |
+| Exporting | `export` P | EMS 3 (Discharge PV), EMS power limit P | battery discharges at exactly P W; PV not curtailed, the rest is exported |
+| Freeze charging | `freeze_charge` | EMS 1 (Auto), on-grid minimum SoC raised to the current SoC | no discharge; surplus PV still charges |
+| Hold charging | `freeze_charge` with `target_soc` below the SoC | as `auto` until the SoC is down to the target, then as Freeze charging | discharges to the target, then holds it |
+| Freeze exporting | `freeze_export` | EMS 1 (Auto), charge current 0 | no charging; surplus exported, battery covers the deficit |
+
+The Predbat column follows the `apps.yaml` services in [`MQTT_TOPICS.md`](MQTT_TOPICS.md#home-assistant--predbat-example).
+Hold exporting is Predbat stopping an export once its target is reached (`stop: export`). The
+freeze modes aren't separate EMS modes: they are Auto with one limit changed. EMS mode numbers
+and names are the `goodwe` library's `EMSMode`.
 
 Fail-safe rules: every command expires (at most 60 min ahead) and falls
 back to `auto`; a restart falls back to `auto`; a grid outage switches to
