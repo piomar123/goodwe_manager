@@ -1,11 +1,13 @@
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import rce
 import rce_storage
 import export_price
+from tests.test_rce import load_pse_fixture
 
 WARSAW = ZoneInfo('Europe/Warsaw')
 
@@ -114,6 +116,51 @@ class BuildExportPricePayloadTest(unittest.TestCase):
         # mean(100,200,300,400) = 250 -> 0.3075; mean(500,500,500,500) = 500 -> 0.615
         self.assertAlmostEqual(first_occurrence['value'], 0.3075, places=6)
         self.assertAlmostEqual(second_occurrence['value'], 0.615, places=6)
+
+    def _assert_contiguous(self, bands, minutes):
+        for band, next_band in zip(bands, bands[1:]):
+            self.assertEqual(band['end'], next_band['start'])
+        for band in bands:
+            length = datetime.fromisoformat(band['end']) - datetime.fromisoformat(band['start'])
+            self.assertEqual(length, timedelta(minutes=minutes), band)
+
+    def test_real_dst_fall_back_day_15min_bands_are_contiguous(self):
+        self._store('2026-10-25', rce.convert_to_series_15min(load_pse_fixture('2026-10-25')))
+        bands = export_price.build_export_price_payload(date(2026, 10, 25), WARSAW)['raw_today']
+
+        self.assertEqual(len(bands), 100)
+        self._assert_contiguous(bands, 15)
+        self.assertEqual(bands[0]['start'], '2026-10-25T00:00:00+02:00')
+        self.assertEqual(bands[-1]['end'], '2026-10-26T00:00:00+01:00')
+        # PSE "03:00 - 02a:15" (01:00-01:15 UTC), 437.66 PLN/MWh
+        first_repeated = next(b for b in bands if b['start'] == '2026-10-25T02:00:00+01:00')
+        self.assertAlmostEqual(first_repeated['value'], round(437.66 / 1000 * 1.23, 4))
+
+    def test_real_dst_fall_back_day_hourly_bands_are_contiguous(self):
+        self._store('2026-10-25', rce.convert_to_series_15min(load_pse_fixture('2026-10-25')))
+        bands = export_price.build_export_price_payload(
+            date(2026, 10, 25), WARSAW, granularity='hourly')['raw_today']
+
+        self.assertEqual(len(bands), 25)
+        self._assert_contiguous(bands, 60)
+        by_start = {b['start']: b['value'] for b in bands}
+        # 02:00-03:00 CET = 01:00-02:00 UTC: mean(437.66, 405.42, 380.02, 350.02)
+        self.assertAlmostEqual(by_start['2026-10-25T02:00:00+01:00'],
+                               round((437.66 + 405.42 + 380.02 + 350.02) / 4 / 1000 * 1.23, 4))
+        # 03:00-04:00 CET = 02:00-03:00 UTC: mean(394.61, 367.34, 333.55, 284.74)
+        self.assertAlmostEqual(by_start['2026-10-25T03:00:00+01:00'],
+                               round((394.61 + 367.34 + 333.55 + 284.74) / 4 / 1000 * 1.23, 4))
+
+    def test_real_dst_spring_forward_day_bands_are_contiguous(self):
+        self._store('2026-03-29', rce.convert_to_series_15min(load_pse_fixture('2026-03-29')))
+        payload = export_price.build_export_price_payload(date(2026, 3, 29), WARSAW)
+        self.assertEqual(len(payload['raw_today']), 92)
+        self._assert_contiguous(payload['raw_today'], 15)
+
+        hourly = export_price.build_export_price_payload(
+            date(2026, 3, 29), WARSAW, granularity='hourly')['raw_today']
+        self.assertEqual(len(hourly), 23)
+        self._assert_contiguous(hourly, 60)
 
     def test_negative_price_defaults_to_zero(self):
         self._store('2026-07-15', [('00:00', -50.0), ('24:00', -50.0)])
