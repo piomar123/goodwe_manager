@@ -67,3 +67,13 @@ grouped under `Unreleased` until that changes.
   re-running `_migrate_csv_to_sqlite.py` against old CSVs, their values for
   these columns are silently dropped on import - harmless, since nothing
   reads them from `data.db`.
+
+### Fixed
+
+- RCE prices on DST days: period labels now come from PSE's UTC fields, not
+  the start of its `period` text. On the fall-back day (2026-10-25) the
+  first quarter of the repeated hour ("03:00 - 02a:15") was read as 03:00
+  CET, an hour late, and "03a:00" sorted after "03:45", so the export
+  prices sent to Predbat for 02:00-04:00 were scrambled (a 75-minute band,
+  a zero-length one). The cache is fixed in place on first start (no
+  re-fetch needed).

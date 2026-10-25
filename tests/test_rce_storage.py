@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -80,6 +81,71 @@ class RceStorageTest(unittest.TestCase):
         rce_storage.store_prices(self.conn, '2026-10-25', series)
         self.assertTrue(rce_storage.is_cached(self.conn, '2026-10-25'))
         self.assertEqual(rce_storage.get_cached_prices(self.conn, '2026-10-25'), series)
+
+
+
+class RelabelDstDaysMigrationTest(unittest.TestCase):
+    """Rows cached before rce_storage SCHEMA_VERSION 1 used the start of
+    PSE's `period` text as the label; init_db rewrites the DST days."""
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.remove(self.db_path)
+        old = sqlite3.connect(self.db_path)
+        old.execute("CREATE TABLE rce_prices (business_date TEXT NOT NULL, period TEXT NOT NULL, "
+                    "rce_pln REAL NOT NULL, PRIMARY KEY (business_date, period))")
+        rows = [
+            # fall-back day, old labels in PSE order
+            ('2026-10-25', '02:45', 1.0), ('2026-10-25', '03:00', 2.0), ('2026-10-25', '02a:15', 3.0),
+            ('2026-10-25', '02a:30', 4.0), ('2026-10-25', '02a:45', 5.0), ('2026-10-25', '03a:00', 6.0),
+            ('2026-10-25', '03:15', 7.0),
+            # spring-forward day
+            ('2026-03-29', '01:45', 1.0), ('2026-03-29', '02:00', 2.0), ('2026-03-29', '03:15', 3.0),
+            # normal day
+            ('2026-07-15', '02:00', 1.0), ('2026-07-15', '03:00', 2.0),
+        ]
+        old.executemany("INSERT INTO rce_prices VALUES (?, ?, ?)", rows)
+        old.commit()
+        old.close()
+
+    def tearDown(self):
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            if os.path.exists(path):
+                os.remove(path)
+
+    def _prices(self, business_date):
+        conn = rce_storage.init_db(self.db_path)
+        try:
+            return rce_storage.get_cached_prices(conn, business_date)
+        finally:
+            conn.close()
+
+    def test_fall_back_day_is_relabelled_into_time_order(self):
+        self.assertEqual(self._prices('2026-10-25'), [
+            ('02:45', 1.0), ('02a:00', 2.0), ('02a:15', 3.0), ('02a:30', 4.0),
+            ('02a:45', 5.0), ('03:00', 6.0), ('03:15', 7.0),
+        ])
+
+    def test_spring_forward_day_is_relabelled(self):
+        self.assertEqual(self._prices('2026-03-29'), [('01:45', 1.0), ('03:00', 2.0), ('03:15', 3.0)])
+
+    def test_normal_day_is_untouched(self):
+        self.assertEqual(self._prices('2026-07-15'), [('02:00', 1.0), ('03:00', 2.0)])
+
+    def test_runs_once(self):
+        # a second relabel would turn the new '03:00' into '02a:00' again
+        self._prices('2026-10-25')
+        self.assertEqual(self._prices('2026-10-25')[5], ('03:00', 6.0))
+
+    def test_new_db_starts_at_current_version(self):
+        os.remove(self.db_path)
+        conn = rce_storage.init_db(self.db_path)
+        try:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], rce_storage.SCHEMA_VERSION)
+        finally:
+            conn.close()
 
 
 if __name__ == '__main__':

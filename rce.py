@@ -1,9 +1,10 @@
 import argparse
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pprint import pprint
 from typing import Pattern
+from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,6 +16,7 @@ from matplotlib.ticker import FixedLocator
 import rce_storage
 
 ACCEPT_JSON_HEADER = {'Accept': 'application/json'}
+PSE_TZ = ZoneInfo('Europe/Warsaw')
 
 
 @dataclass
@@ -59,7 +61,7 @@ def query_pse_rce_15min(query_date: datetime.date) -> list[tuple[str, float]]:
             },
     """
     date_yyyymmdd = query_date.strftime('%Y-%m-%d')
-    response = requests.get(f'https://api.raporty.pse.pl/api/rce-pln?$select=period,rce_pln&$filter=business_date%20eq%20%27{date_yyyymmdd}%27',
+    response = requests.get(f'https://api.raporty.pse.pl/api/rce-pln?$select=period,period_utc,dtime_utc,rce_pln&$filter=business_date%20eq%20%27{date_yyyymmdd}%27',
                             headers=ACCEPT_JSON_HEADER)
     response.raise_for_status()
     data = response.json()
@@ -128,13 +130,41 @@ def main():
     plt.show()
 
 
+def _hh_mm_minutes(hh_mm: str) -> int:
+    hour, minute = hh_mm.split(':')
+    return int(hour) * 60 + int(minute)
+
+
+def _period_start_label(entry: dict) -> str:
+    """Local start-time label for one PSE period, derived from its UTC
+    fields rather than the `period` text. `dtime_utc` is the period's
+    end; `period_utc` gives its length ("01:00 - 01:15", or
+    "23:45 - 24:00" across UTC midnight).
+
+    The `period` text is accurate as an interval but its start alone
+    is misleading on DST days: on a fall-back day the first quarter of
+    the repeated hour is "03:00 - 02a:15" (03:00 CEST, the instant the
+    clock goes back), the 03:00 CET quarter is "03a:00 - 03:15",
+    and on a spring-forward day "02:00 - 03:15" starts at 03:00 CEST.
+    Taking the start as a label made the fall-back day's quarters
+    parse an hour off and sort out of order (see the 2026-10-25
+    fixture test).
+
+    Labels are 'HH:MM', with 'HHa:MM' for the second occurrence of a
+    repeated fall-back hour, e.g. '02:45', '02a:00', ..., '02a:45',
+    '03:00'. They sort chronologically as text, since ':' sorts before
+    'a' ('02:45' < '02a:00' < '03:00'), which rce_storage's ORDER BY
+    period relies on, and export_price._parse_period_start reads the
+    'a' back as fold=1."""
+    end_utc = datetime.strptime(entry['dtime_utc'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+    start_hh_mm, end_hh_mm = entry['period_utc'].split(' - ')
+    length_minutes = (_hh_mm_minutes(end_hh_mm) - _hh_mm_minutes(start_hh_mm)) % (24 * 60)
+    start = (end_utc - timedelta(minutes=length_minutes)).astimezone(PSE_TZ)
+    return f"{start:%H}{'a' if start.fold else ''}:{start:%M}"
+
+
 def convert_to_series_15min(response_data):
-    # Split on the ' - ' delimiter rather than slicing entry['period'][0:5]:
-    # on a DST fall-back day PSE disambiguates the repeated hour with an
-    # 'a' suffix (e.g. period "02a:15 - 02a:30"), which is 6 characters
-    # long, not the usual 5 ("00:00 - 00:15") - a fixed [0:5] slice would
-    # truncate "02a:15" down to "02a:1".
-    series = [(entry['period'].split(' - ')[0], entry['rce_pln']) for entry in response_data['value']]
+    series = [(_period_start_label(entry), entry['rce_pln']) for entry in response_data['value']]
     series.append(('24:00', series[-1][1]))
     return series
 

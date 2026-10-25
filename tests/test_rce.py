@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -9,6 +10,15 @@ matplotlib.use('Agg')
 
 import rce
 import rce_storage
+
+FIXTURES = os.path.join(os.path.dirname(__file__), 'fixtures')
+
+
+def load_pse_fixture(business_date):
+    """Real PSE rce-pln responses (period, period_utc, dtime_utc,
+    rce_pln) for the 2026 DST days, saved from the live API."""
+    with open(os.path.join(FIXTURES, f'pse_rce_{business_date}.json')) as f:
+        return json.load(f)
 
 
 class GetRce15MinTest(unittest.TestCase):
@@ -65,33 +75,42 @@ class GetRce15MinTest(unittest.TestCase):
 class ConvertToSeries15MinTest(unittest.TestCase):
     def test_normal_periods_keep_the_start_time(self):
         response_data = {'value': [
-            {'period': '00:00 - 00:15', 'rce_pln': 1.0},
-            {'period': '00:15 - 00:30', 'rce_pln': 2.0},
+            {'period': '00:00 - 00:15', 'period_utc': '22:00 - 22:15', 'dtime_utc': '2026-07-14 22:15:00', 'rce_pln': 1.0},
+            {'period': '00:15 - 00:30', 'period_utc': '22:15 - 22:30', 'dtime_utc': '2026-07-14 22:30:00', 'rce_pln': 2.0},
         ]}
         self.assertEqual(
             rce.convert_to_series_15min(response_data),
             [('00:00', 1.0), ('00:15', 2.0), ('24:00', 2.0)],
         )
 
-    def test_dst_fall_back_repeated_hour_periods_are_not_truncated(self):
-        # Real PSE response shape for the DST fall-back repeated hour
-        # (confirmed against the live API for business_date 2025-10-26):
-        # PSE disambiguates the repeat with an 'a' suffix, e.g.
-        # "02a:15 - 02a:30". That label is 6 characters, not the usual 5
-        # ("00:00 - 00:15"), so a fixed [0:5] slice would truncate
-        # "02a:15" down to "02a:1" - split on the ' - ' delimiter instead.
+    def test_period_ending_at_utc_midnight(self):
+        # period_utc "23:45 - 24:00": the length must wrap, not go negative
         response_data = {'value': [
-            {'period': '02:45 - 03:00', 'rce_pln': 36.23},
-            {'period': '03:00 - 02a:15', 'rce_pln': 44.46},
-            {'period': '02a:15 - 02a:30', 'rce_pln': 48.15},
-            {'period': '02a:30 - 02a:45', 'rce_pln': 48.31},
-            {'period': '02a:45 - 03a:00', 'rce_pln': 43.46},
-            {'period': '03a:00 - 03:15', 'rce_pln': 40.0},
+            {'period': '01:45 - 02:00', 'period_utc': '23:45 - 24:00', 'dtime_utc': '2026-07-15 00:00:00', 'rce_pln': 1.0},
         ]}
-        self.assertEqual(
-            [label for label, _ in rce.convert_to_series_15min(response_data)],
-            ['02:45', '03:00', '02a:15', '02a:30', '02a:45', '03a:00', '24:00'],
-        )
+        self.assertEqual(rce.convert_to_series_15min(response_data)[0][0], '01:45')
+
+    def test_dst_fall_back_labels_come_from_utc(self):
+        # PSE's own labels for the repeated hour are "03:00 - 02a:15", ...,
+        # "02a:45 - 03a:00", "03a:00 - 03:15": taking their start as the
+        # label read the first quarter as 03:00 CET (an hour late) and
+        # sorted "03a:00" after "03:45".
+        labels = [label for label, _ in rce.convert_to_series_15min(load_pse_fixture('2026-10-25'))]
+
+        self.assertEqual(len(labels), 101)
+        self.assertEqual(labels[8:14], ['02:00', '02:15', '02:30', '02:45', '02a:00', '02a:15'])
+        self.assertEqual(labels[14:18], ['02a:30', '02a:45', '03:00', '03:15'])
+        self.assertEqual(len(set(labels)), len(labels))
+        # rce_storage returns rows ORDER BY period, so text order must be time order
+        self.assertEqual(sorted(labels), labels)
+
+    def test_dst_spring_forward_labels_come_from_utc(self):
+        # PSE labels the quarter after 01:45 "02:00 - 03:15"; it starts at 03:00 CEST
+        labels = [label for label, _ in rce.convert_to_series_15min(load_pse_fixture('2026-03-29'))]
+
+        self.assertEqual(len(labels), 93)
+        self.assertEqual(labels[7:10], ['01:45', '03:00', '03:15'])
+        self.assertEqual(sorted(labels), labels)
 
 
 class PlotRceTest(unittest.TestCase):
