@@ -73,6 +73,7 @@ class ControlWriter:
         self._attempts: dict = {}
         self._warned_writes = False
         self._last_desired: Optional[dict] = None
+        self._new_target = False  # writes since the last change of desired that didn't apply yet
 
     def restart(self) -> None:
         """Forget retries, back-off and pending verification - for events
@@ -88,7 +89,7 @@ class ControlWriter:
         reconnects - a flaky link must not buy a stuck register fresh writes."""
         self._today, self.writes_today, self._warned_writes = other._today, other.writes_today, other._warned_writes
         self._attempts, self._backoff_until, self._backoff_s = dict(other._attempts), other._backoff_until, other._backoff_s
-        self._last_desired, self.last_error = other._last_desired, other.last_error
+        self._last_desired, self.last_error, self._new_target = other._last_desired, other.last_error, other._new_target
 
     @property
     def count_day(self) -> datetime.date:
@@ -115,8 +116,10 @@ class ControlWriter:
             # New target (e.g. off-grid restore): start fresh - don't let a
             # back-off or pending verification from the old target delay it.
             self._last_desired = dict(desired)
+            self._new_target = True
             self.restart()
         if self.applied(desired):
+            self._new_target = False
             self._attempts.clear()
             self._backoff_until = None
             self._backoff_s = self._error_backoff
@@ -143,7 +146,9 @@ class ControlWriter:
             self._count_write()
             try:
                 await self._inverter.write_setting(name, desired[name])
-                logger.info(f'Control write {name} = {desired[name]}')
+                # The read-back tells a register the inverter reset apart from a bad read
+                cause = 'new target' if self._new_target else 'unchanged target'
+                logger.info(f'Control write {name} = {desired[name]} (read {self.readback.get(name)}, {cause})')
             except Exception as e:
                 self.last_error = f'{name}: write failed: {e}'
                 logger.warning(f'Control write {name} failed: {e}')

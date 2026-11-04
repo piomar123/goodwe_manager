@@ -92,6 +92,15 @@ class ControlWriterTest(unittest.TestCase):
         run_steps(w2, clock, FREEZE_EXPORT, 20)
         self.assertEqual(len(inv.writes), writes_before)
 
+    def test_carried_state_keeps_the_new_target_label(self):
+        clock, inv, w = self.make(base_values(), delay=30.0)  # write not yet visible when the link drops
+        run_steps(w, clock, CHARGE_2K, 2)
+        w2 = control_io.ControlWriter(inv, now_fn=clock, shadow=False)
+        w2.carry_state_from(w)
+        with self.assertLogs('control_io', level='INFO') as logs:
+            run_steps(w2, clock, CHARGE_2K, 10)
+        self.assertIn('new target', logs.output[0])
+
     def test_new_desired_bypasses_backoff(self):
         clock, inv, w = self.make(base_values(), delay=10_000)
         run_steps(w, clock, FREEZE_EXPORT, 12)  # error at t=9, back-off until t=69
@@ -123,6 +132,23 @@ class ControlWriterTest(unittest.TestCase):
         run_steps(w, clock, AUTO, 40)  # must not raise
         self.assertEqual(inv.writes, [])
         self.assertEqual(w.readback['ems_mode'], 1)  # last good value kept
+
+    def test_rewrite_after_drift_logs_what_was_read(self):
+        # Same-value rewrites are ~1/4 of all writes on the live box; the log
+        # must show what the inverter reported, to tell a real reset from a bad read
+        clock, inv, w = self.make(base_values())
+        run_steps(w, clock, AUTO, 20)
+        inv.values['battery_charge_current'] = 5.0
+        with self.assertLogs('control_io', level='INFO') as logs:
+            run_steps(w, clock, AUTO, 20)
+        self.assertIn('Control write battery_charge_current = 19.0 (read 5.0, unchanged target)', logs.output[0])
+
+    def test_write_for_a_new_target_logs_it_as_such(self):
+        clock, inv, w = self.make(base_values())
+        run_steps(w, clock, AUTO, 20)
+        with self.assertLogs('control_io', level='INFO') as logs:
+            run_steps(w, clock, CHARGE_2K, 20)
+        self.assertIn('Control write ems_power_limit = 2000 (read 0, new target)', logs.output[0])
 
     def test_startup_reverts_leftover_freeze_export(self):
         clock, inv, w = self.make(base_values(battery_charge_current=0.0, ems_mode=3, ems_power_limit=1000))
