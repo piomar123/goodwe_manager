@@ -255,7 +255,7 @@ Invalid commands are rejected (the current one stays) and reported in `control/s
 
 ## `control/reserve/set` (subscribed, retained)
 
-Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or below it (for 30 s) switches to `freeze_charge` until SoC is 2 points above.
+Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or below it (for 30 s) switches to `freeze_charge` until SoC is 2 points above. In `freeze_export` the on-grid minimum SoC is set to it instead (`export_floor` in the state; never above the SoC, set when the freeze starts or the reserve changes, not lowered as the SoC falls), so the battery stops covering the house at the reserve without charging from PV.
 
 ## `control/state` (retained, on change and every 10 s)
 
@@ -263,7 +263,7 @@ Integer SoC % software reserve; empty payload clears it. In `auto`, SoC at or be
 {"mode": "charge", "effective_mode": "freeze_charge", "power_w": 3000, "power_applied_w": 3000,
  "power_clamped": false, "bms_charge_limit_w": 3420, "bms_discharge_limit_w": 3420, "target_soc": 80, "source": "predbat", "expires_at": "2026-09-26T15:10:00+02:00",
  "since": "2026-09-26T14:58:12+02:00", "override": null, "reserve_soc": 25, "reason": "target_soc reached",
- "shadow": false, "off_grid": false, "freeze_floor": 80, "applied": true, "last_error": null, "warnings": [],
+ "shadow": false, "off_grid": false, "freeze_floor": 80, "export_floor": null, "applied": true, "last_error": null, "warnings": [],
  "writes_today": 14,
  "registers": {"ems_mode": 1, "ems_power_limit": 0, "battery_charge_current": 19.0,
                "battery_discharge_current": 19.0, "battery_discharge_depth": 80, "soc_upper_limit": 100,

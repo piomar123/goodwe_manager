@@ -572,6 +572,81 @@ class ExecutorFreezeFloorTest(unittest.TestCase):
         self.assertFalse(ex.min_soc_hold)
 
 
+class ExecutorFreezeExportReserveTest(unittest.TestCase):
+    """freeze_export keeps the inverter on-grid minimum at the software reserve
+    (the AUTO reserve latch would switch to freeze_charge, which lets PV charge
+    the battery - not what Predbat asked for)."""
+
+    def frozen(self, soc, reserve):
+        ex = control.Executor(CFG)
+        warm(ex, soc)
+        ex.set_reserve(reserve)
+        ex.submit(Command(Mode.FREEZE_EXPORT, expires_at=at(3600)))
+        return ex
+
+    def test_depth_is_the_reserve(self):
+        ex = self.frozen(50, 25)
+        self.assertEqual(ex.tick(S(50), NOW), {'ems_mode': 1, 'ems_power_limit': 0, 'battery_charge_current': 0,
+                                                'battery_discharge_current': 18.5, 'battery_discharge_depth': 25})
+        self.assertEqual(ex.snapshot(NOW)['export_floor'], 25)
+
+    def test_depth_never_above_the_soc(self):
+        # A depth above the SoC makes the inverter's DoD Holding top up from the grid
+        ex = self.frozen(50.6, 60)
+        self.assertEqual(ex.tick(S(50.6), NOW)['battery_discharge_depth'], 50)
+
+    def test_single_high_sample_does_not_raise_the_depth(self):
+        ex = self.frozen(40, 60)
+        self.assertEqual(ex.tick(S(100), NOW)['battery_discharge_depth'], 40)
+
+    def test_without_soc_samples_the_depth_stays_at_min(self):
+        ex = control.Executor(CFG)
+        ex.set_reserve(25)
+        ex.submit(Command(Mode.FREEZE_EXPORT, expires_at=at(3600)))
+        self.assertEqual(ex.tick(S(None), NOW)['battery_discharge_depth'], 14)
+
+    def test_no_reserve_or_reserve_below_min_is_min(self):
+        for reserve in (None, 8):
+            with self.subTest(reserve):
+                self.assertEqual(self.frozen(50, reserve).tick(S(50), NOW)['battery_discharge_depth'], 14)
+
+    def test_depth_is_not_lowered_when_the_soc_falls(self):
+        # Set once (a write per freeze); a BMS jump below it gets a small hardware top-up
+        ex = self.frozen(30, 60)
+        ex.tick(S(30), at(0))
+        self.assertEqual(ex.tick(S(26), at(60))['battery_discharge_depth'], 30)
+
+    def test_reserve_change_during_the_freeze_is_followed(self):
+        # Predbat's car hold writes reserve = SoC to stop the battery feeding the car
+        ex = self.frozen(50, 12)
+        self.assertEqual(ex.tick(S(50), at(0))['battery_discharge_depth'], 14)
+        ex.set_reserve(50)
+        self.assertEqual(ex.tick(S(50), at(5))['battery_discharge_depth'], 50)
+        ex.set_reserve(12)
+        self.assertEqual(ex.tick(S(50), at(10))['battery_discharge_depth'], 14)
+
+    def test_leaving_restores_min_and_reentry_takes_the_new_soc(self):
+        ex = self.frozen(50, 60)
+        ex.tick(S(50), at(0))
+        ex.submit(Command(Mode.AUTO, stop='export'))
+        self.assertEqual(ex.tick(S(45), at(40))['battery_discharge_depth'], 14)
+        self.assertIsNone(ex.snapshot(at(40))['export_floor'])
+        ex.submit(Command(Mode.FREEZE_EXPORT, expires_at=at(3600)))
+        self.assertEqual(ex.tick(S(45), at(41))['battery_discharge_depth'], 45)
+
+    def test_min_soc_hold_after_a_freeze_near_min(self):
+        ex = self.frozen(16, 16)
+        self.assertEqual(ex.tick(S(16), at(0))['battery_discharge_depth'], 16)
+        ex.submit(Command(Mode.AUTO, stop='export'))
+        ex.set_reserve(None)
+        self.assertEqual(ex.tick(S(16), at(1))['battery_discharge_depth'], 14)
+        self.assertTrue(ex.min_soc_hold)
+
+    def test_off_grid_still_wins(self):
+        ex = self.frozen(50, 25)
+        self.assertEqual(ex.tick(S(50, off_grid=True), NOW)['battery_discharge_depth'], 14)
+
+
 class ExecutorHoldAboveTargetTest(unittest.TestCase):
     """Predbat "Hold charging": freeze_charge with a target_soc below the SoC.
     The battery may discharge down to the target, then is frozen there. A

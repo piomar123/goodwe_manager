@@ -289,6 +289,8 @@ class Executor:
         self._last_soc: Optional[float] = None
         self._soc_window: deque = deque()  # (time, soc) of the last TARGET_DEBOUNCE
         self._floor: Optional[int] = None
+        self._export_floor: Optional[int] = None
+        self._export_floor_reserve: Optional[int] = None  # the reserve it was set from
         self._min_soc_hold = False
 
     # --- inputs ---------------------------------------------------------
@@ -401,6 +403,7 @@ class Executor:
     def _update_floor(self, mode: Mode) -> None:
         min_soc, soc = self._config.min_soc, self._last_soc
         if mode is Mode.FREEZE_CHARGE:
+            self._export_floor = None
             whole = int(self._steady_soc())
             if self._floor is None:
                 self._floor = max(min_soc, whole)
@@ -408,11 +411,27 @@ class Executor:
                 self._floor = whole  # keep surplus PV charge; never lowered
             self._min_soc_hold = False
             return
-        if self._floor is not None and soc is not None and soc < min_soc + INVERTER_RESUME_MARGIN:
+        if mode is Mode.FREEZE_EXPORT:
+            # The AUTO reserve latch doesn't run here (it would switch to
+            # freeze_charge, letting PV charge the battery), so the on-grid
+            # minimum holds the reserve instead. Never above the SoC (DoD
+            # Holding would top up from the grid) and set once per freeze:
+            # a later drop below it only gets a small hardware top-up, which
+            # costs less than a register write per point of drift.
+            self._floor = None
+            # A reserve change re-sets it (e.g. Predbat's car hold writes reserve = SoC)
+            if self._export_floor is None or self._reserve != self._export_floor_reserve:
+                self._export_floor, self._export_floor_reserve = min_soc, self._reserve
+                if self._reserve is not None and self._soc_window:
+                    self._export_floor = max(min_soc, min(self._reserve, int(self._steady_soc())))
+            self._min_soc_hold = False
+            return
+        if (self._floor is not None or self._export_floor is not None) and soc is not None and soc < min_soc + INVERTER_RESUME_MARGIN:
             self._min_soc_hold = True
         elif soc is not None and soc >= min_soc + INVERTER_RESUME_MARGIN:
             self._min_soc_hold = False
         self._floor = None
+        self._export_floor = None
 
     def _update_off_grid(self, off_grid: bool, now: datetime) -> bool:
         if off_grid:
@@ -528,7 +547,7 @@ class Executor:
             Mode.CHARGE: (EMS_CHARGE_BATTERY, power, c, m),
             Mode.EXPORT: (EMS_DISCHARGE_PV, power, c, m),
             Mode.FREEZE_CHARGE: (EMS_AUTO, 0, c, self._floor),
-            Mode.FREEZE_EXPORT: (EMS_AUTO, 0, 0, m),
+            Mode.FREEZE_EXPORT: (EMS_AUTO, 0, 0, self._export_floor),
         }[mode]
         return {'ems_mode': ems, 'ems_power_limit': limit, 'battery_charge_current': charge_a,
                 'battery_discharge_current': d, 'battery_discharge_depth': depth}
@@ -558,6 +577,7 @@ class Executor:
             'bms_charge_limit_w': self._bms_limits_w[0],
             'bms_discharge_limit_w': self._bms_limits_w[1],
             'freeze_floor': self._floor,
+            'export_floor': self._export_floor,
         }
 
 

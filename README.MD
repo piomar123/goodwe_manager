@@ -142,7 +142,7 @@ isn't frozen.
 | Exporting | `export` P | EMS 3 (Discharge PV), EMS power limit P | battery discharges at exactly P W; PV not curtailed, the rest is exported |
 | Freeze charging | `freeze_charge` | EMS 1 (Auto), on-grid minimum SoC raised to the current SoC | no discharge; surplus PV still charges |
 | Hold charging | `freeze_charge` with `target_soc` below the SoC | as `auto` until the SoC is down to the target, then as Freeze charging | discharges to the target, then holds it |
-| Freeze exporting | `freeze_export` | EMS 1 (Auto), charge current 0 | no charging; surplus exported, battery covers the deficit |
+| Freeze exporting | `freeze_export` | EMS 1 (Auto), charge current 0, on-grid min SoC = reserve (never above the SoC) | no charging; surplus exported, battery covers the deficit down to the reserve |
 
 The Predbat column follows the `apps.yaml` services in [`MQTT_TOPICS.md`](MQTT_TOPICS.md#home-assistant--predbat-example).
 Hold exporting is Predbat stopping an export once its target is reached (`stop: export`). The
