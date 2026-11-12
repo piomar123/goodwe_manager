@@ -149,6 +149,17 @@
   </form>
 
   <hr>
+  <form class="row row-cols-lg-auto g-3 align-items-center" method="post" action="/inverter/restart"
+        onsubmit="return confirm('Restart the inverter now? It stops converting until it reconnects to the grid.')">
+    <div class="col-9">
+      <label class="form-label">Restart the inverter (same command as SolarGo's restart)</label>
+    </div>
+    <div class="col-3">
+      <button type="submit" class="btn btn-sm btn-danger">Restart</button>
+    </div>
+  </form>
+
+  <hr>
 
   <div class="row">
     <div class="col">

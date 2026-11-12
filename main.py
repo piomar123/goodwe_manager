@@ -776,6 +776,19 @@ def update_config(setting: str):
     return flask.redirect('/config')
 
 
+async def restart_inverter():
+    logger.warning('Restarting the inverter (requested from the config page)')
+    await asyncio_thread.inverter.restart()
+
+
+@app.post('/inverter/restart')
+def post_inverter_restart():
+    asyncio_thread.ensure_inverter_ready()
+    restart_future = asyncio_thread.run_coroutine_threadsafe(restart_inverter())
+    restart_future.result(timeout=60)
+    return flask.redirect('/config')
+
+
 CONTROL_CALL_TIMEOUT_S = 10
 
 
