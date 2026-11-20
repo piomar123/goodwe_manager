@@ -173,6 +173,17 @@ restore is kept in `shadow_scan_guard.json` (git-ignored), so a restart
 mid-outage still puts it back. A manual change on the `/config` page during
 an outage or the cooldown is replaced by the saved value when it's restored.
 
+## Raw running-data capture (on by default)
+
+Every poll already reads the inverter's running-data block (registers
+35100-35224) in one request; the goodwe library decodes most of it and drops
+the rest. `runtime_raw.py` keeps the whole 250-byte block of each poll in
+`runtime_raw.db` (git-ignored, ~11 MB/day, separate from `data.db`), with no
+extra inverter traffic, so undocumented registers can be checked later, e.g.
+for status flags. `RAW_RUNTIME_CAPTURE=0` turns it off. List changes over a
+window with `python _raw_registers.py --from "YYYY-MM-DD HH:MM" --to ...`
+(`--regs`, `--all`, `--show`; see its docstring).
+
 ## Architecture
 
 Data is pulled every few seconds from the inverter in the local network using the Goodwe API 

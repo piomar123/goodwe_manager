@@ -35,6 +35,7 @@ import forecast_history
 import history
 import mqtt_bridge
 import pv_forecast_payload
+import runtime_raw
 import shadow_scan_guard
 import storage
 import tariff_engine
@@ -142,6 +143,9 @@ class AsyncioThread(threading.Thread):
     _asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
     _inverter: Optional[goodwe.Inverter] = None
     _db_conn: Optional[aiosqlite.Connection] = None
+    # Raw running-data block capture (runtime_raw.py); None while off.
+    _raw_capture: Optional[runtime_raw.RawBlockCapture] = None
+    _raw_conn: Optional[aiosqlite.Connection] = None
     _should_stop = threading.Event()
     _calculated_values_evaluator = CalculatedValuesEvaluator()
     # Safety valve for the hour-rollover backfill retry loop (see
@@ -285,6 +289,7 @@ class AsyncioThread(threading.Thread):
         if control_runtime_instance is not None:
             control_runtime_instance.attach(self._inverter)
         self._db_conn = await storage.init_db_async(storage.DATA_DB_PATH, sensor_columns())
+        await self._start_raw_capture()
         try:
             await mqtt.connect()
         except Exception as e:
@@ -325,6 +330,7 @@ class AsyncioThread(threading.Thread):
                 sensors_data = {sid: (None if (v := inverter_runtime.get(sid)) is None else str(v)) for sid in SELECTED_SENSORS}
                 sensors_data_with_calculated = sensors_data | self._calculated_values_evaluator.calculate_values(sensors_data)
                 await storage.insert_sample_async(self._db_conn, db_row(sensors_data_with_calculated))
+                await self._store_raw_block(sensors_data['timestamp'])
                 # Freshness/lag fields for the UI only - deliberately not
                 # persisted (would need a schema/migration change), just
                 # attached to the SSE payload. `_read_duration_seconds` isolates
@@ -383,6 +389,38 @@ class AsyncioThread(threading.Thread):
                     return
         finally:
             await self._db_conn.close()
+            if self._raw_conn is not None:
+                await self._raw_conn.close()
+                self._raw_conn = None
+
+    async def _start_raw_capture(self) -> None:
+        """Wraps the (new) inverter connection for runtime_raw.py. Any failure
+        only turns the capture off: it must never stop inverter polling (this
+        runs inside _get_inverter_data_with_retry's reconnect loop)."""
+        self._raw_capture = None
+        if not runtime_raw.enabled():
+            return
+        try:
+            capture = runtime_raw.RawBlockCapture()
+            if capture.attach(self._inverter):
+                if self._raw_conn is None:
+                    self._raw_conn = await runtime_raw.init_db_async()
+                self._raw_capture = capture
+                logger.info("Raw runtime block capture on (runtime_raw.db)")
+        except Exception as e:
+            logger.warning(f"Raw runtime capture off: {e}")
+            self._raw_capture = None
+
+    async def _store_raw_block(self, timestamp: str) -> None:
+        if self._raw_capture is None or self._raw_conn is None:
+            return
+        block = self._raw_capture.take()
+        if block is None:
+            return
+        try:
+            await runtime_raw.insert_async(self._raw_conn, storage.parse_timestamp_epoch(timestamp), block)
+        except Exception as e:
+            logger.warning(f"Could not store the raw runtime block: {e}")
 
     async def _publish_export_prices_safely(self) -> None:
         """A locked rce_prices.db (RcePrefetchThread writing concurrently)

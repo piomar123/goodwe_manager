@@ -190,6 +190,9 @@ cython_debug/
 /bms.db
 /bms.db-wal
 /bms.db-shm
+/runtime_raw.db
+/runtime_raw.db-wal
+/runtime_raw.db-shm
 /.idea
 .superpowers/
 /.worktrees/
