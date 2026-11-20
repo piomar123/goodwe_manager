@@ -13,7 +13,14 @@
   var WORK_MODE = { WAIT: 0, NORMAL_ON_GRID: 1, NORMAL_OFF_GRID: 2, FAULT: 3, FLASH: 4, CHECK: 5 };
   var WORK_MODE_COLORS = { 0: 'grey', 1: 'green', 2: 'pink', 3: 'red', 4: 'orange', 5: 'yellow' };
 
-  var BACKUP_CURRENT_ALERT_THRESHOLD_A = 13.5;
+  // Backup overload (GW8KN-ET, from our own data - home-assistant-raspberry4's
+  // docs/backup-overload.md): bit 4 of function_bit is set while a backup
+  // phase carries ~2.7 kW or more, and ~10 min of it cuts the backup output;
+  // at ~3 kW the cut comes after ~1 min. A phase is flagged from 2650 W, just
+  // under the bit's edge, but only while the bit is set.
+  var BACKUP_OVERLOAD_PENDING_BIT = 0x10;
+  var BACKUP_PHASE_WARN_W = 2650;
+  var BACKUP_PHASE_HIGH_W = 3000;
   // Backup output above this is real usage, not CT-crosstalk noise (see
   // docs/superpowers/notes/2026-09-08-backup-threshold-investigation.md - a
   // flat constant for now, pending the adaptive-threshold formula explored
@@ -186,13 +193,26 @@
   // low wattage there) - callers combine this with gridState's `crossed`
   // themselves, same as the mockup's backupActive() did, so this stays a
   // pure function of backup's own data.
+  //
+  // Overload: overloadPending = bit 4 of function_bit; phaseHigh = phase at
+  // >= BACKUP_PHASE_HIGH_W (counted even without the bit - it lags a sample);
+  // phaseWarn = bit set and phase at >= BACKUP_PHASE_WARN_W but not high;
+  // expand = either, so the per-phase lines show without a tap.
   function backupState(data) {
     var watts = toNumber(data.backup_ptotal);
     var phaseCurrents = [toNumber(data.backup_i1), toNumber(data.backup_i2), toNumber(data.backup_i3)];
-    var phaseAlerts = phaseCurrents.map(function (amps) {
-      return amps >= BACKUP_CURRENT_ALERT_THRESHOLD_A;
+    var phasePowers = [toNumber(data.backup_p1), toNumber(data.backup_p2), toNumber(data.backup_p3)];
+    var overloadPending = (Math.trunc(toNumber(data.function_bit)) & BACKUP_OVERLOAD_PENDING_BIT) !== 0;
+    var phaseHigh = phasePowers.map(function (w) { return w >= BACKUP_PHASE_HIGH_W; });
+    var phaseWarn = phasePowers.map(function (w, i) {
+      return overloadPending && !phaseHigh[i] && w >= BACKUP_PHASE_WARN_W;
     });
-    return { watts: watts, active: watts > BACKUP_ACTIVE_THRESHOLD_W, phaseCurrents: phaseCurrents, phaseAlerts: phaseAlerts };
+    var high = phaseHigh.some(Boolean);
+    return {
+      watts: watts, active: watts > BACKUP_ACTIVE_THRESHOLD_W, phaseCurrents: phaseCurrents, phasePowers: phasePowers,
+      overloadPending: overloadPending, phaseWarn: phaseWarn, phaseHigh: phaseHigh, high: high,
+      expand: overloadPending || high,
+    };
   }
 
   // Backup can be fed two different ways depending on the relay matrix's
@@ -278,12 +298,12 @@
     return normalOnGrid ? backup.active : true;
   }
 
-  // Node status color - a real phase overload always turns the Backup
-  // node red as an alert flag. The arrow itself deliberately never uses
-  // this (see backupArrowFallbackColor): it represents the physical
-  // source mix, not alarm status.
+  // Node status color: just active/inactive. A backup overload is drawn on
+  // top by its own classes (red border with bit 4, red fill at >= 3 kW - see
+  // diagram-render.js), so the arrow, which follows the source mix (see
+  // backupArrowFallbackColor), never turns red either.
   function backupNodeColor(backup, isBackupActive) {
-    return backup.phaseAlerts.some(Boolean) ? 'red' : (isBackupActive ? 'orange' : 'grey');
+    return isBackupActive ? 'orange' : 'grey';
   }
 
   // Backup arrow's flat fallback color, used only when there's no source
@@ -398,7 +418,9 @@
     GRID_IN_OUT: GRID_IN_OUT,
     GRID_MODE: GRID_MODE,
     WORK_MODE: WORK_MODE,
-    BACKUP_CURRENT_ALERT_THRESHOLD_A: BACKUP_CURRENT_ALERT_THRESHOLD_A,
+    BACKUP_OVERLOAD_PENDING_BIT: BACKUP_OVERLOAD_PENDING_BIT,
+    BACKUP_PHASE_WARN_W: BACKUP_PHASE_WARN_W,
+    BACKUP_PHASE_HIGH_W: BACKUP_PHASE_HIGH_W,
     toNumber: toNumber,
     setBackupActiveThreshold: setBackupActiveThreshold,
     arrowThickness: arrowThickness,

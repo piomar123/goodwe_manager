@@ -170,6 +170,28 @@
 .diagram-details--open { display: block; }
 .diagram-alert { color: #dc3545 !important; font-weight: bold; }
 
+/* Backup overload (diagram-calc.js backupState, docs in
+   home-assistant-raspberry4/docs/backup-overload.md): bit 4 -> red border +
+   orange triangle; a phase >= 2650 W with bit 4 -> red text (yellow on the
+   red fill); any phase >= 3000 W -> red fill, white text, red "!" on a white
+   circle, that phase in a white pill. Details are forced open meanwhile. */
+.diagram-details--forced { display: block; }
+.backup-icon-wrap { position: relative; display: inline-block; }
+.backup-overload-mark { display: none; position: absolute; top: -4px; right: -14px; font-size: 1rem; line-height: 1; }
+.backup-overload-mark--pending { display: inline-block; color: #fd7e14; }
+.backup-overload-mark--high {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.1rem; height: 1.1rem; border-radius: 50%; font-size: .9rem;
+  background: #fff; color: #dc3545; -webkit-text-stroke: .5px #dc3545;
+}
+#node-backup.backup-overload-pending { border-color: #dc3545; }
+#node-backup.backup-overload-high { background: #dc3545; border-color: #dc3545; color: #fff; }
+#node-backup.backup-overload-high .diagram-icon,
+#node-backup.backup-overload-high .diagram-details { color: #fff; opacity: 1; }
+.backup-phase-warn { color: #dc3545; font-weight: bold; }
+#node-backup.backup-overload-high .backup-phase-warn { color: #ffc107; }
+.backup-phase-high { background: #fff; color: #dc3545; border-radius: 4px; padding: 0 4px; font-weight: bold; }
+
 /* Status text pulled out of the (now icon-only) Inverter box - see
    #node-inverter above. */
 .inverter-status-line { max-width: 620px; margin: 0 auto 24px; text-align: center; font-size: 1rem; font-weight: 600; }

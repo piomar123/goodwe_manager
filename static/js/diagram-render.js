@@ -451,9 +451,21 @@
     // covers the phase-overload case) - avoid computing/setting it twice.
     ['backup-i1', 'backup-i2', 'backup-i3'].forEach(function (id, i) {
       byId(id).textContent = backup.phaseCurrents[i].toFixed(1);
-      byId(id.replace('backup-i', 'backup-p')).textContent = Math.round(calc.toNumber(data[id.replace('backup-i', 'backup_p')]));
-      byId(id.replace('backup-i', 'backup-line')).classList.toggle('diagram-alert', backup.phaseAlerts[i]);
+      byId(id.replace('backup-i', 'backup-p')).textContent = Math.round(backup.phasePowers[i]);
+      var line = byId(id.replace('backup-i', 'backup-line'));
+      line.classList.toggle('backup-phase-warn', backup.phaseWarn[i]);
+      line.classList.toggle('backup-phase-high', backup.phaseHigh[i]);
     });
+    // Overload (see backupState): red border + orange triangle with bit 4,
+    // red fill + red "!" on white at >= 3 kW, details forced open meanwhile
+    // (a separate class, so the user's own tap state comes back after).
+    var backupNode = byId('node-backup');
+    backupNode.classList.toggle('backup-overload-pending', backup.overloadPending);
+    backupNode.classList.toggle('backup-overload-high', backup.high);
+    byId('backup-overload-mark').className = 'bi backup-overload-mark' +
+      (backup.high ? ' bi-exclamation-lg backup-overload-mark--high'
+        : backup.overloadPending ? ' bi-exclamation-triangle-fill backup-overload-mark--pending' : '');
+    byId('backup-details').classList.toggle('diagram-details--forced', backup.expand);
 
     byId('grid-watts').textContent = fmtW(grid.watts);
     setNodeColor('node-grid', grid.color);

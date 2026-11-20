@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const {
   toNumber, arrowThickness, pvState, inverterBusState, batteryState,
   inverterState, gridState, loadState, backupState, backupSource,
-  setBackupActiveThreshold, BACKUP_CURRENT_ALERT_THRESHOLD_A,
+  setBackupActiveThreshold, BACKUP_OVERLOAD_PENDING_BIT, BACKUP_PHASE_WARN_W, BACKUP_PHASE_HIGH_W,
   busFlow, batteryChargeGridWatts, isBackupActive, backupNodeColor,
   backupArrowFallbackColor, edgeStates, backupIslandingShiftPx,
   BACKUP_ISLANDING_SHIFT_PX,
@@ -191,13 +191,48 @@ test('backupState reports watts, active flag, and per-phase currents', () => {
   assert.equal(result.watts, 500);
   assert.equal(result.active, true);
   assert.deepEqual(result.phaseCurrents, [2.1, 2.2, 2.0]);
-  assert.deepEqual(result.phaseAlerts, [false, false, false]);
+  assert.equal(result.overloadPending, false);
+  assert.equal(result.high, false);
+  assert.equal(result.expand, false);
+  assert.deepEqual(result.phaseWarn, [false, false, false]);
+  assert.deepEqual(result.phaseHigh, [false, false, false]);
 });
 
-test('backupState flags a phase red at/above the 13.5A threshold', () => {
-  const result = backupState({ backup_ptotal: '3000', backup_i1: '13.5', backup_i2: '13.4', backup_i3: '14.0' });
-  assert.deepEqual(result.phaseAlerts, [true, false, true]);
-  assert.equal(BACKUP_CURRENT_ALERT_THRESHOLD_A, 13.5);
+test('backup overload thresholds: bit 4 (0x10) of function_bit, 2650 W with bit 4, 3000 W', () => {
+  assert.equal(BACKUP_OVERLOAD_PENDING_BIT, 0x10);
+  assert.equal(BACKUP_PHASE_WARN_W, 2650);
+  assert.equal(BACKUP_PHASE_HIGH_W, 3000);
+});
+
+test('backupState: bit 4 marks overload pending and expands, a phase >= 2650 W warns only with bit 4', () => {
+  const base = { backup_ptotal: '2870', backup_p1: '120', backup_p2: '2650', backup_p3: '60' };
+  const on = backupState({ ...base, function_bit: '16433.0' });
+  assert.equal(on.overloadPending, true);
+  assert.equal(on.expand, true);
+  assert.equal(on.high, false);
+  assert.deepEqual(on.phasePowers, [120, 2650, 60]);
+  assert.deepEqual(on.phaseWarn, [false, true, false]);
+  const off = backupState({ ...base, function_bit: '16417' });
+  assert.equal(off.overloadPending, false);
+  assert.equal(off.expand, false);
+  assert.deepEqual(off.phaseWarn, [false, false, false]);
+  assert.deepEqual(backupState({ ...base, backup_p2: '2649', function_bit: '16433' }).phaseWarn, [false, false, false]);
+});
+
+test('backupState: any phase >= 3000 W is high (also expands, even without bit 4); lower bit-4 phases still warn', () => {
+  const r = backupState({ backup_ptotal: '6100', backup_p1: '100', backup_p2: '2800', backup_p3: '3000', function_bit: '16433' });
+  assert.equal(r.high, true);
+  assert.deepEqual(r.phaseHigh, [false, false, true]);
+  assert.deepEqual(r.phaseWarn, [false, true, false]);
+  const lag = backupState({ backup_ptotal: '3150', backup_p1: '60', backup_p2: '3050', backup_p3: '40', function_bit: '16417' });
+  assert.equal(lag.high, true);
+  assert.equal(lag.expand, true);
+  assert.equal(lag.overloadPending, false);
+  assert.equal(backupState({ backup_p2: '2999', function_bit: '16433' }).high, false);
+});
+
+test('backupState: missing function_bit means no overload flag', () => {
+  assert.equal(backupState({ backup_ptotal: '100' }).overloadPending, false);
 });
 
 test('backupState is inactive at 0W', () => {
@@ -311,10 +346,10 @@ test('isBackupActive: gates on backup.active only in Normal (On-Grid); every oth
   assert.equal(isBackupActive({ active: false }, grid, { work_mode: '5' }), true);
 });
 
-test('backupNodeColor: a phase alert is red regardless of active, otherwise active/inactive maps to orange/grey', () => {
-  assert.equal(backupNodeColor({ phaseAlerts: [false, true, false] }, false), 'red');
-  assert.equal(backupNodeColor({ phaseAlerts: [false, false, false] }, true), 'orange');
-  assert.equal(backupNodeColor({ phaseAlerts: [false, false, false] }, false), 'grey');
+test('backupNodeColor: active/inactive maps to orange/grey; overload is drawn by its own classes, not the node color', () => {
+  assert.equal(backupNodeColor({ high: true, overloadPending: true }, true), 'orange');
+  assert.equal(backupNodeColor({ high: false }, true), 'orange');
+  assert.equal(backupNodeColor({ high: false }, false), 'grey');
 });
 
 test('backupArrowFallbackColor: never red, unlike backupNodeColor - just active/inactive', () => {
@@ -358,17 +393,17 @@ test('edgeStates: genuine grid-charging (netBus negative) puts the grid stripe o
   assert.equal(e.bus.stripes, null); // single-color flat orange, not striped
 });
 
-test('edgeStates: a real phase overload never turns the Backup arrow red - only the node', () => {
-  // High phase current (>= 13.5A alert threshold) with plenty of real
-  // wattage (well above the 35W active threshold).
+test('edgeStates: a backup overload never turns the Backup arrow red', () => {
+  // A phase over 3 kW with bit 4 set and plenty of real wattage (well above
+  // the 35W active threshold).
   const data = {
     ppv: '0', pbattery1: '0', battery_mode: '0', battery_soc: '0', battery_discharge_limit: '0',
     meter_active_power_total: '0', grid_in_out: '0', grid_mode: '1',
-    load_ptotal: '0', backup_ptotal: '3000', backup_i1: '14.0', backup_i2: '13.0', backup_i3: '13.0',
-    work_mode: '1',
+    load_ptotal: '0', backup_ptotal: '3300', backup_p1: '3100', backup_p2: '100', backup_p3: '100',
+    backup_i1: '14.0', function_bit: '16433', work_mode: '1',
   };
   const e = edgeStates(data);
-  assert.equal(e.backup.nodeColor, 'red');
+  assert.equal(e.backup.nodeColor, 'orange');
   assert.notEqual(e.backup.colorName, 'red');
   assert.equal(e.backup.colorName, 'orange');
 });
