@@ -1,0 +1,9 @@
+# Import price history for /stats (TARIFF_HISTORY_CONFIG). Each period
+# lasts until the next one starts. A period is either a flat gross zl/kWh
+# price or a tariff_engine YAML (see TARIFF_SCHEMA.md), relative to this
+# file. Copy to e.g. tariff_history.yaml (gitignored) and fill in yours.
+periods:
+  - from: 2024-01-01
+    price: 1.10                 # G11, all taxes included
+  - from: 2025-09-18
+    tariff: tariff_import.yaml  # G12w

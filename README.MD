@@ -58,6 +58,36 @@ your actual rates, and set `TARIFF_IMPORT_CONFIG=tariff_import.yaml` in
 constant, unchanged from today's behavior. See `TARIFF_SCHEMA.md` for
 the full YAML schema.
 
+## Settlement and savings stats (optional)
+
+`/stats` (the 💰 Savings button) shows, per day, month and year, what
+the grid operator settles and what PV and the battery saved:
+
+- **Net import / net export**: the meter's import and export offset
+  within each hour, as the operator's meter does. Net import is priced at
+  the import tariff; net export is the prosument deposit credit at the
+  hourly average RCE (x1.23 from 2025-02-01, 0 for a negative hour).
+- **Without PV**: the house load bought from the grid at each hour's
+  import price, less `PV_EXTRA_LOAD_FACTOR` (default 0.10) of the PV used
+  in the house - load that exists only because PV made it cheap.
+- **Savings** = without PV - net import cost + deposit credit. Grid energy
+  stored at a cheap hour and used at an expensive one counts as savings.
+- A cumulative savings chart against `INVESTMENT_NET_PLN` (net of
+  subsidies and tax relief) with a payback date projected from the last
+  12 months. `/stats/daily.csv` downloads every day.
+
+The data is the inverter's grid meter, so expect a few % difference from
+the bill; fixed monthly fees aren't included. Rows live in `data.db`'s
+`daily_settlement` table; today's and yesterday's are recomputed after
+every new `hourly_summary` hour.
+
+Import prices that changed over time go in a tariff history
+(`TARIFF_HISTORY_CONFIG`, see `tariff_examples/tariff_history.yaml`): each
+period is a flat price or a tariff YAML as above. Without it,
+`TARIFF_IMPORT_CONFIG` prices every day. Fill past days once with
+`python _backfill_daily_settlement.py` (it fetches missing RCE days from
+PSE into `rce_prices.db`, ~1 s per day the first time).
+
 ## MQTT bridge for Home Assistant / Predbat (optional)
 
 Set `MQTT_HOST` (and `MQTT_USERNAME`/`MQTT_PASSWORD` if your broker

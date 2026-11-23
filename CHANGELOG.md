@@ -8,6 +8,11 @@ grouped under `Unreleased` until that changes.
 
 ### Changed
 
+- Settlement and savings stats: `/stats` shows hourly-netted import/export
+  (kWh, zl), the deposit credit, and savings vs no PV/battery per day, month
+  and year, with a payback chart. New optional `.env` keys
+  `TARIFF_HISTORY_CONFIG`, `PV_EXTRA_LOAD_FACTOR`, `INVESTMENT_NET_PLN`; run
+  `python _backfill_daily_settlement.py` once to fill past days.
 - goodwe is now a pinned fork (0.4.10 + upstream PR #156 + UDP fixes): a
   late inverter response to an earlier attempt is accepted instead of lost,
   each retry waits longer (1, 1.5, 2.25, then 3 s), and stray datagrams no
