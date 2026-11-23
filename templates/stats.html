@@ -22,9 +22,10 @@
 {% macro pln(v) %}{{ '%.2f' % v if v is not none else '' }}{% endmacro %}
 {% macro row_cells(r, link) %}
   <td>{% if link %}<a href="/stats?month={{ r.period }}">{{ r.period }}</a>{% else %}{{ r.period }}{% endif %}</td>
-  <td class="{{ 'incomplete' if r.hours < r.days * 24 or r.export_price_missing_hours }}"
-      title="{{ r.hours }} h with data of {{ r.days * 24 }}{% if r.export_price_missing_hours %}, {{ r.export_price_missing_hours }} h without RCE price{% endif %}">
-    {{ '%.0f' % (100 * r.hours / (r.days * 24)) }}%</td>
+  {% set expected_hours = (r.expected_days or r.days) * 24 %}
+  <td class="{{ 'incomplete' if r.hours < expected_hours - 1 or r.export_price_missing_hours }}"
+      title="{{ r.days }} days, {{ r.hours }} h with data of {{ expected_hours }}{% if r.export_price_missing_hours %}, {{ r.export_price_missing_hours }} h without RCE price{% endif %}">
+    {{ '%.0f' % (100 * r.hours / expected_hours) if expected_hours else '-' }}%</td>
   <td>{{ kwh(r.import_kwh) }}</td>
   <td>{{ kwh(r.export_kwh) }}</td>
   <td>{{ kwh(r.net_import_kwh) }}</td>

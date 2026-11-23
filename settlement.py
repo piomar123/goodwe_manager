@@ -334,5 +334,17 @@ def payback(rows_by_day: List[Tuple[str, float]], investment_pln: float, today: 
     return result
 
 
+def expected_days(month: str, today: date, first_day: Optional[str]) -> int:
+    """Calendar days of `month` ('YYYY-MM') that should have data: not
+    before the first stored day, not after today."""
+    year, mon = int(month[:4]), int(month[5:7])
+    start = date(year, mon, 1)
+    end = (date(year + (mon == 12), mon % 12 + 1, 1)) - timedelta(days=1)
+    if first_day:
+        start = max(start, date.fromisoformat(first_day))
+    end = min(end, today)
+    return max(0, (end - start).days + 1)
+
+
 def cumulative(conn: sqlite3.Connection) -> List[Tuple[str, float]]:
     return conn.execute("SELECT day, savings_pln FROM daily_settlement ORDER BY day").fetchall()

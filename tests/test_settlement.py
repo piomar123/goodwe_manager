@@ -194,3 +194,11 @@ class PaybackTest(unittest.TestCase):
         self.assertAlmostEqual(result['total_pln'], 3650.0)
         self.assertAlmostEqual(result['per_year_pln'], 3650.0)
         self.assertEqual(result['payback_date'], (today + timedelta(days=365)).isoformat())
+
+
+class ExpectedDaysTest(unittest.TestCase):
+    def test_caps_at_first_day_and_today(self):
+        self.assertEqual(settlement.expected_days('2025-07', date(2026, 1, 1), '2024-08-12'), 31)
+        self.assertEqual(settlement.expected_days('2024-08', date(2026, 1, 1), '2024-08-12'), 20)
+        self.assertEqual(settlement.expected_days('2026-11', date(2026, 11, 23), '2024-08-12'), 23)
+        self.assertEqual(settlement.expected_days('2025-12', date(2026, 1, 1), None), 31)

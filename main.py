@@ -1101,7 +1101,12 @@ def get_stats_page():
         month = request.args.get('month') or (months[-1]['period'] if months else datetime.now().strftime('%Y-%m'))
         days = settlement.daily(conn, month)
         cumulative = settlement.cumulative(conn)
-    payback = settlement.payback(cumulative, INVESTMENT_NET_PLN, datetime.now().date())
+    today = datetime.now().date()
+    payback = settlement.payback(cumulative, INVESTMENT_NET_PLN, today)
+    for row in months:
+        row['expected_days'] = settlement.expected_days(row['period'], today, cumulative[0][0] if cumulative else None)
+    for row in days:
+        row['expected_days'] = 1
     years = {}
     for row in months:
         year = years.setdefault(row['period'][:4], {'period': row['period'][:4]})
