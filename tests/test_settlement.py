@@ -202,3 +202,65 @@ class ExpectedDaysTest(unittest.TestCase):
         self.assertEqual(settlement.expected_days('2024-08', date(2026, 1, 1), '2024-08-12'), 20)
         self.assertEqual(settlement.expected_days('2026-11', date(2026, 11, 23), '2024-08-12'), 23)
         self.assertEqual(settlement.expected_days('2025-12', date(2026, 1, 1), None), 31)
+
+
+class LoadShiftTest(unittest.TestCase):
+    def test_grid_charge_at_night_used_in_the_evening(self):
+        price = lambda dt: 0.69 if dt.hour == 2 else 1.31
+        hours = [
+            # night: import 4.5, load 0.5, battery +4.0 (no PV) -> 4.0 kWh from the grid
+            (_epoch(2026, 1, 5, 2), 4.5, 0.0, 0.5, 0.0, 4.0, 0.0),
+            # evening: battery -2.0 to a 3.0 load
+            (_epoch(2026, 1, 5, 18), 1.0, 0.0, 3.0, 0.0, 0.0, 2.0),
+        ]
+        t = settlement.compute_day(hours, price, {})
+        self.assertAlmostEqual(t['grid_charge_kwh'], 4.0)
+        self.assertAlmostEqual(t['shifted_kwh'], 2.0)
+        # 2.0 used of 3.6 left after losses, cost 4.0 x 0.69 x 2.0/3.6
+        self.assertAlmostEqual(t['shift_profit_pln'], round(2.0 * 1.31 - 2.76 * 2.0 / 3.6, 4), places=4)
+        self.assertAlmostEqual(t['grid_pool_kwh'], 1.6)
+        self.assertAlmostEqual(t['grid_pool_pln'], round(2.76 * 1.6 / 3.6, 4), places=4)
+
+    def test_pv_surplus_charge_is_not_grid(self):
+        hours = [(_epoch(2026, 6, 1, 12), 0.0, 1.0, 1.0, 5.0, 3.0, 0.0),
+                 (_epoch(2026, 6, 1, 20), 0.0, 0.0, 2.0, 0.0, 0.0, 2.0)]
+        t = settlement.compute_day(hours, _flat(1.0), {'12': 0.5})
+        self.assertEqual(t['grid_charge_kwh'], 0.0)
+        self.assertEqual(t['shifted_kwh'], 0.0)
+
+    def test_carried_pool_is_used_the_next_morning_and_not_beyond_the_load(self):
+        hours = [(_epoch(2026, 1, 6, 7), 0.0, 0.0, 1.0, 0.0, 0.0, 2.5)]  # 2.5 out, 1.0 load: the rest is export
+        t = settlement.compute_day(hours, _flat(1.31), {}, pool=(3.0, 2.07))
+        self.assertAlmostEqual(t['shifted_kwh'], 1.0)
+        self.assertAlmostEqual(t['shift_profit_pln'], round(1.31 - 0.69, 4))
+        self.assertAlmostEqual(t['grid_pool_kwh'], 2.0)
+
+
+class LoadShiftStorageTest(StorageTest):
+    def test_pool_carries_over_a_missing_day(self):
+        night = _epoch(2026, 1, 5, 2)
+        self.conn.execute(
+            "INSERT INTO hourly_summary (hour_start, meter_import_kwh, meter_export_kwh, load_kwh, pv_kwh, "
+            "battery_charge_kwh, battery_discharge_kwh) VALUES (?, 4.0, 0, 0, 0, 4.0, 0), (?, 0, 0, 2.0, 0, 0, 2.0)",
+            (night, _epoch(2026, 1, 7, 18)))
+        self.conn.commit()
+        history = settlement.TariffHistory([settlement.TariffPeriod(date(2024, 1, 1), flat_price=1.0)])
+        settlement.update_day(self.conn, date(2026, 1, 5), history, lambda d: [])
+        t = settlement.update_day(self.conn, date(2026, 1, 7), history, lambda d: [])
+        self.assertAlmostEqual(t['shifted_kwh'], 2.0)
+        months = settlement.monthly(self.conn)
+        self.assertNotIn('grid_pool_kwh', months[0])
+
+
+class LoadShiftCapTest(unittest.TestCase):
+    def test_grid_part_never_exceeds_the_energy_in_the_battery(self):
+        # 6 kWh "from the grid" but the battery only reached 50 % of 7.1 kWh this hour
+        hours = [(_epoch(2026, 1, 5, 2), 6.0, 0.0, 0.0, 0.0, 6.0, 0.0, 50.0)]
+        t = settlement.compute_day(hours, _flat(0.69), {}, battery_capacity_kwh=7.1)
+        self.assertAlmostEqual(t['grid_pool_kwh'], 3.55)
+        self.assertAlmostEqual(t['grid_pool_pln'], round(6.0 * 0.69 * 3.55 / 5.4, 4), places=4)
+
+    def test_text_none_soc_counts_as_unknown(self):
+        hours = [(_epoch(2026, 1, 5, 2), 2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 'None')]
+        t = settlement.compute_day(hours, _flat(0.69), {}, battery_capacity_kwh=7.1)
+        self.assertAlmostEqual(t['grid_pool_kwh'], 1.8)

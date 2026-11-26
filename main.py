@@ -517,7 +517,8 @@ def _update_settlement(conn) -> None:
         settlement.init_table(conn)
         factor = settlement.pv_extra_load_factor_from_env()
         for day in settlement.days_needing_update(conn, datetime.now().date()):
-            settlement.update_day(conn, day, tariffs, get_rce_15min, factor)
+            settlement.update_day(conn, day, tariffs, get_rce_15min, factor,
+                                  settlement.battery_capacity_from_env())
     except Exception as e:
         logger.warning(f"Could not update daily settlement: {e}")
 

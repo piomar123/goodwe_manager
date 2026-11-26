@@ -37,6 +37,9 @@
   <td>{{ kwh(r.pv_self_kwh) }}</td>
   <td>{{ pln(r.baseline_pln) }}</td>
   <td><b>{{ pln(r.savings_pln) }}</b></td>
+  <td>{{ kwh(r.grid_charge_kwh) }}</td>
+  <td>{{ kwh(r.shifted_kwh) }}</td>
+  <td>{{ pln(r.shift_profit_pln) }}</td>
 {% endmacro %}
 {% macro header() %}
   <tr>
@@ -51,6 +54,9 @@
     <th title="PV not exported in the same hour">PV used kWh</th>
     <th title="House load bought from the grid without PV and battery (minus the PV-induced extra load)">Without PV zł</th>
     <th title="Without PV - net import + deposit credit">Savings zł</th>
+    <th title="Grid energy charged into the battery: net charge the PV surplus didn't cover">Grid→batt kWh</th>
+    <th title="Grid-charged energy the house used later (after 10 % round-trip loss); the house uses it before stored PV">Shifted kWh</th>
+    <th title="Shifted energy at the import price of the hour it was used, minus what it cost when charged. Already part of Savings">Shift profit zł</th>
   </tr>
 {% endmacro %}
 
@@ -119,7 +125,9 @@
       Hourly net settlement from the inverter's grid meter: import and export are offset within each hour;
       a net import is priced at the import tariff, a net export at the hourly average RCE (x1.23 from 2025-02-01,
       0 for a negative hour). Savings = cost of the house load without PV and battery (less the PV-induced extra
-      load) - net import cost + deposit credit. Fixed monthly fees are not included.
+      load) - net import cost + deposit credit. Shift profit is the part of the savings from grid energy
+      stored at one price and used at a higher one (10 % round-trip loss; the house uses stored grid energy
+      before stored PV). Fixed monthly fees are not included.
       <a href="/stats/daily.csv">Download daily CSV</a>.
     </p>
 

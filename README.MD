@@ -72,6 +72,13 @@ the grid operator settles and what PV and the battery saved:
   in the house - load that exists only because PV made it cheap.
 - **Savings** = without PV - net import cost + deposit credit. Grid energy
   stored at a cheap hour and used at an expensive one counts as savings.
+- **Load shift**: grid energy charged into the battery (net charge the PV
+  surplus didn't cover), how much of it the house used later and the profit
+  (value at the import price of the hour of use - its cost when charged;
+  already part of Savings). The battery's grid part loses 10 % round trip, is
+  used before stored PV (Predbat's `pv_origin` rule), carries over between
+  days and is capped at the energy in the battery (`BATTERY_CAPACITY_KWH`,
+  default 7.1, x the hour's max SoC).
 - A cumulative savings chart against `INVESTMENT_NET_PLN` (net of
   subsidies and tax relief) with a payback date projected from the last
   12 months. `/stats/daily.csv` downloads every day.

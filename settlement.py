@@ -40,6 +40,11 @@ LOCAL_TZ = ZoneInfo('Europe/Warsaw')
 EXPORT_BONUS_MULTIPLIER = 1.23
 EXPORT_BONUS_START = date(2025, 2, 1)
 DEFAULT_PV_EXTRA_LOAD_FACTOR = 0.10
+# Share of grid energy charged into the battery that comes back out (round
+# trip). The inverter's battery counters can't give it: over a year they
+# show more out than in.
+SHIFT_ROUND_TRIP = 0.90
+DEFAULT_BATTERY_CAPACITY_KWH = 7.1
 
 DAILY_COLUMNS = [
     ('hours', 'INTEGER'),             # hours with complete data (24 on a normal day)
@@ -57,11 +62,17 @@ DAILY_COLUMNS = [
     ('baseline_kwh', 'REAL'),         # load without PV and battery
     ('baseline_pln', 'REAL'),
     ('savings_pln', 'REAL'),
+    ('grid_charge_kwh', 'REAL'),      # grid energy into the battery (charge PV surplus didn't cover)
+    ('shifted_kwh', 'REAL'),          # grid-charged energy the house used later
+    ('shift_profit_pln', 'REAL'),     # its value at the hour of use - its cost when charged (part of savings)
     ('export_price_missing_hours', 'INTEGER'),
+    ('grid_pool_kwh', 'REAL'),        # end of day: grid-charged energy still in the battery (after losses)
+    ('grid_pool_pln', 'REAL'),        # ... and what it cost
     ('computed_at', 'INTEGER'),
 ]
 _COLUMN_NAMES = [name for name, _ in DAILY_COLUMNS]
-_SUM_COLUMNS = [name for name, _ in DAILY_COLUMNS if name not in ('computed_at',)]
+_STATE_COLUMNS = ('grid_pool_kwh', 'grid_pool_pln', 'computed_at')
+_SUM_COLUMNS = [name for name, _ in DAILY_COLUMNS if name not in _STATE_COLUMNS]
 
 
 # --- tariff history -------------------------------------------------------
@@ -184,23 +195,46 @@ def fetch_day_hours(conn: sqlite3.Connection, day: date) -> list:
     start, end = day_bounds(day)
     return conn.execute(
         "SELECT hour_start, meter_import_kwh, meter_export_kwh, load_kwh, pv_kwh, "
-        "battery_charge_kwh, battery_discharge_kwh FROM hourly_summary "
+        "battery_charge_kwh, battery_discharge_kwh, battery_soc_max FROM hourly_summary "
         "WHERE hour_start >= ? AND hour_start < ? ORDER BY hour_start",
         (start, end),
     ).fetchall()
 
 
+def _number_or_none(value) -> Optional[float]:
+    """Some old hourly_summary rows hold the text 'None' for the SoC."""
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def compute_day(hours: list, import_price_at: Callable[[datetime], Optional[float]],
                 export_prices: Dict[str, float],
-                pv_extra_load_factor: float = DEFAULT_PV_EXTRA_LOAD_FACTOR) -> dict:
+                pv_extra_load_factor: float = DEFAULT_PV_EXTRA_LOAD_FACTOR,
+                pool: Tuple[float, float] = (0.0, 0.0),
+                battery_capacity_kwh: float = DEFAULT_BATTERY_CAPACITY_KWH) -> dict:
     """Pure: one day's totals from its hourly_summary rows
     (hour_start, import, export, load, pv, battery_charge, battery_discharge).
     Hours with any missing meter/load/PV value are left out (counted in
-    `hours`); missing battery values count as 0."""
+    `hours`); missing battery values count as 0.
+
+    Load shifting: the battery's grid part (`pool`, kWh it can still give
+    back and what it cost, carried over from the previous day) grows by
+    each hour's net charge that the PV surplus over the house load didn't
+    cover (at most the import), times SHIFT_ROUND_TRIP, at that hour's
+    import price. The house uses the grid part first when the battery
+    discharges (Predbat's pv_origin rule); that energy is `shifted_kwh`,
+    valued at the import price of the hour it's used, minus its cost. The
+    grid part never holds more than the battery did that hour (max SoC x
+    capacity): hourly totals can't tell PV that charged the battery inside
+    the hour from grid energy, and the excess is dropped with its cost."""
     totals = {name: 0.0 for name in _SUM_COLUMNS}
     totals['hours'] = 0
     totals['export_price_missing_hours'] = 0
-    for hour_start, imp, exp, load, pv, b_chg, b_dis in hours:
+    pool_kwh, pool_pln = pool
+    for hour_start, imp, exp, load, pv, b_chg, b_dis, *rest in hours:
+        soc_max = _number_or_none(rest[0]) if rest else None
         if None in (imp, exp, load, pv):
             continue
         dt = datetime.fromtimestamp(hour_start, LOCAL_TZ)
@@ -231,7 +265,26 @@ def compute_day(hours: list, import_price_at: Callable[[datetime], Optional[floa
         totals['battery_discharge_kwh'] += b_dis or 0.0
         totals['baseline_kwh'] += baseline
         totals['baseline_pln'] += baseline * import_price
+        battery_net = (b_chg or 0.0) - (b_dis or 0.0)
+        if battery_net > 0:
+            grid_charge = min(imp, max(0.0, battery_net - max(0.0, pv - load)))
+            totals['grid_charge_kwh'] += grid_charge
+            pool_kwh += grid_charge * SHIFT_ROUND_TRIP
+            pool_pln += grid_charge * import_price
+        elif battery_net < 0 and pool_kwh > 0:
+            used = min(-battery_net, load, pool_kwh)
+            cost = pool_pln * used / pool_kwh
+            totals['shifted_kwh'] += used
+            totals['shift_profit_pln'] += used * import_price - cost
+            pool_kwh -= used
+            pool_pln -= cost
+        stored = battery_capacity_kwh * (soc_max if soc_max is not None else 100.0) / 100.0
+        if pool_kwh > stored:
+            pool_pln *= stored / pool_kwh if pool_kwh else 0.0
+            pool_kwh = stored
     totals['savings_pln'] = totals['baseline_pln'] - totals['net_import_pln'] + totals['export_credit_pln']
+    totals['grid_pool_kwh'] = pool_kwh
+    totals['grid_pool_pln'] = pool_pln
     return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in totals.items()}
 
 
@@ -259,7 +312,8 @@ def store_day(conn: sqlite3.Connection, day: date, totals: dict) -> None:
 
 def update_day(conn: sqlite3.Connection, day: date, tariffs: TariffHistory,
                rce_fetch: Callable[[date], list],
-               pv_extra_load_factor: float = DEFAULT_PV_EXTRA_LOAD_FACTOR) -> Optional[dict]:
+               pv_extra_load_factor: float = DEFAULT_PV_EXTRA_LOAD_FACTOR,
+               battery_capacity_kwh: float = DEFAULT_BATTERY_CAPACITY_KWH) -> Optional[dict]:
     """Recomputes and stores one day. Returns the totals, or None if the
     day has no hourly data yet. A failed RCE fetch leaves the export
     credit for those hours out (export_price_missing_hours) rather than
@@ -272,7 +326,11 @@ def update_day(conn: sqlite3.Connection, day: date, tariffs: TariffHistory,
     except Exception as exc:  # network, PSE not published, ...
         logger.warning(f"Settlement {day}: no RCE prices ({exc}), export credit left out")
         export_prices = {}
-    totals = compute_day(hours, tariffs.price_at, export_prices, pv_extra_load_factor)
+    # the latest earlier day, so a day with no data doesn't empty the battery's grid part
+    previous = conn.execute("SELECT grid_pool_kwh, grid_pool_pln FROM daily_settlement WHERE day < ? "
+                            "ORDER BY day DESC LIMIT 1", (day.isoformat(),)).fetchone()
+    pool = (previous[0] or 0.0, previous[1] or 0.0) if previous else (0.0, 0.0)
+    totals = compute_day(hours, tariffs.price_at, export_prices, pv_extra_load_factor, pool, battery_capacity_kwh)
     store_day(conn, day, totals)
     return totals
 
@@ -286,6 +344,10 @@ def days_needing_update(conn: sqlite3.Connection, today: date) -> List[date]:
             ((today - timedelta(days=1)).isoformat(),)):
         days.add(date.fromisoformat(day_str))
     return sorted(days)
+
+
+def battery_capacity_from_env(environ=os.environ) -> float:
+    return float(environ.get('BATTERY_CAPACITY_KWH', DEFAULT_BATTERY_CAPACITY_KWH))
 
 
 def pv_extra_load_factor_from_env(environ=os.environ) -> float:

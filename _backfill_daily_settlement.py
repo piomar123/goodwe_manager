@@ -30,6 +30,7 @@ def main():
     if tariffs is None:
         raise SystemExit("Set TARIFF_HISTORY_CONFIG or TARIFF_IMPORT_CONFIG")
     factor = settlement.pv_extra_load_factor_from_env()
+    capacity = settlement.battery_capacity_from_env()
 
     conn = sqlite3.connect(args.db_path)
     settlement.init_table(conn)
@@ -48,7 +49,7 @@ def main():
 
     day = start
     while day <= end:
-        totals = settlement.update_day(conn, day, tariffs, fetch, factor)
+        totals = settlement.update_day(conn, day, tariffs, fetch, factor, capacity)
         if totals:
             print(f"{day} hours={totals['hours']:2d} net_import={totals['net_import_kwh']:6.2f} kWh "
                   f"{totals['net_import_pln']:7.2f} zl  net_export={totals['net_export_kwh']:6.2f} kWh "
