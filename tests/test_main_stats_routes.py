@@ -49,6 +49,8 @@ class StatsRoutesTest(unittest.TestCase):
         self.assertIn('2026-01', page)
         self.assertIn('Daily 2025-12', page)
         self.assertIn('29300 zł', page)
+        self.assertIn("initStickyTableHeader(document.getElementById('monthly-table'))", page)
+        self.assertIn("initStickyTableHeader(document.getElementById('daily-table'))", page)
 
     def test_stats_page_works_with_no_data(self):
         conn = storage.init_db_sync(self.db_path, sensor_columns())

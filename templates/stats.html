@@ -98,7 +98,7 @@
 
     <h3>Monthly</h3>
     <div class="table-responsive">
-      <table class="table table-dark table-sm stats">
+      <table id="monthly-table" class="table table-dark table-sm stats">
         <thead>{{ header() }}</thead>
         <tbody>
           {% for y in years %}
@@ -113,7 +113,7 @@
 
     <h3>Daily {{ month }}</h3>
     <div class="table-responsive">
-      <table class="table table-dark table-sm stats">
+      <table id="daily-table" class="table table-dark table-sm stats">
         <thead>{{ header() }}</thead>
         <tbody>
           {% for r in days %}<tr>{{ row_cells(r, false) }}</tr>{% endfor %}
@@ -140,6 +140,14 @@
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <script src="/static/chart-theme.js"></script>
+  <script src="/static/table.js"></script>
+  <script>
+    // The tables scroll sideways inside .table-responsive, where CSS sticky
+    // can't work; table.js pins a fixed clone of the header instead (as on
+    // the history page).
+    initStickyTableHeader(document.getElementById('monthly-table'));
+    initStickyTableHeader(document.getElementById('daily-table'));
+  </script>
   <script>
     (function () {
       const rows = {{ cumulative | tojson }};
