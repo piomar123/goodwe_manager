@@ -35,6 +35,7 @@ import forecast_history
 import history
 import mqtt_bridge
 import pv_forecast_payload
+import settlement
 import shadow_scan_guard
 import storage
 import tariff_engine
@@ -76,6 +77,8 @@ BMS_CONFIG: Optional[bms_poller.BmsConfig] = None
 TARIFF_IMPORT_CONFIG = os.environ.get('TARIFF_IMPORT_CONFIG')
 RCE_EXPORT_GRANULARITY = os.environ.get('RCE_EXPORT_GRANULARITY', '15min')
 RCE_EXPORT_NEGATIVE_PRICES = os.environ.get('RCE_EXPORT_NEGATIVE_PRICES', 'zero')
+# Net investment for the /stats payback line, zl (0 hides it).
+INVESTMENT_NET_PLN = float(os.environ.get('INVESTMENT_NET_PLN', 0) or 0)
 # Invalid CONTROL_* values fail startup on purpose - better than silently
 # running without the control the user configured.
 CONTROL_CONFIG = control.config_from_env(os.environ)
@@ -443,6 +446,8 @@ class AsyncioThread(threading.Thread):
         def _run():
             with _data_db_connection() as conn:
                 backfilled = storage.backfill_hourly_summary(conn)
+                if backfilled:
+                    _update_settlement(conn)
                 if verify_hour_start is None:
                     return backfilled, True
                 row = conn.execute("SELECT 1 FROM hourly_summary WHERE hour_start = ?", (verify_hour_start,)).fetchone()
@@ -499,6 +504,23 @@ class AsyncioThread(threading.Thread):
 
 mqtt = mqtt_bridge.MqttBridge(host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USERNAME,
                               password=MQTT_PASSWORD, topic_prefix=MQTT_TOPIC_PREFIX)
+
+
+def _update_settlement(conn) -> None:
+    """Recomputes today's and yesterday's daily_settlement rows (plus any
+    older day still missing export prices) after new hourly_summary rows.
+    Never raises: stats must not break the hourly backfill."""
+    try:
+        tariffs = settlement.tariff_history_from_env()
+        if tariffs is None:
+            return
+        settlement.init_table(conn)
+        factor = settlement.pv_extra_load_factor_from_env()
+        for day in settlement.days_needing_update(conn, datetime.now().date()):
+            settlement.update_day(conn, day, tariffs, get_rce_15min, factor,
+                                  settlement.battery_capacity_from_env())
+    except Exception as e:
+        logger.warning(f"Could not update daily settlement: {e}")
 
 
 def _bms_sample_handler(conn):
@@ -1070,6 +1092,43 @@ def get_forecast_hourly_json():
         'fetch_times': fetch_times,
         'selected_fetched_at': fetched_at,
     })
+
+
+@app.get('/stats')
+def get_stats_page():
+    with _data_db_connection() as conn:
+        settlement.init_table(conn)
+        months = settlement.monthly(conn)
+        month = request.args.get('month') or (months[-1]['period'] if months else datetime.now().strftime('%Y-%m'))
+        days = settlement.daily(conn, month)
+        cumulative = settlement.cumulative(conn)
+    today = datetime.now().date()
+    payback = settlement.payback(cumulative, INVESTMENT_NET_PLN, today)
+    for row in months:
+        row['expected_days'] = settlement.expected_days(row['period'], today, cumulative[0][0] if cumulative else None)
+    for row in days:
+        row['expected_days'] = 1
+    years = {}
+    for row in months:
+        year = years.setdefault(row['period'][:4], {'period': row['period'][:4]})
+        for key, value in row.items():
+            if key != 'period' and value is not None:
+                year[key] = year.get(key, 0) + value
+    return flask.render_template('stats.html', months=months, years=list(years.values()), days=days,
+                                 month=month, payback=payback,
+                                 cumulative=[{'day': d, 'savings': s} for d, s in cumulative])
+
+
+@app.get('/stats/daily.csv')
+def get_stats_csv():
+    """All daily_settlement rows as CSV, for a spreadsheet next to the bills."""
+    with _data_db_connection() as conn:
+        settlement.init_table(conn)
+        cursor = conn.execute("SELECT * FROM daily_settlement ORDER BY day")
+        names = [d[0] for d in cursor.description]
+        lines = [','.join(names)] + [','.join('' if v is None else str(v) for v in row) for row in cursor]
+    return flask.Response('\n'.join(lines) + '\n', mimetype='text/csv',
+                          headers={'Content-Disposition': 'attachment; filename=daily_settlement.csv'})
 
 
 @app.get('/history')

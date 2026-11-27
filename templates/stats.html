@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="/static/bootstrap.min.css" rel="stylesheet">
+  <title>Settlement - Energy Manager</title>
+  <style>
+    .stats td, .stats th { text-align: right; white-space: nowrap; font-size: 0.85rem; padding: 2px 6px; }
+    .stats td:first-child, .stats th:first-child { text-align: left; }
+    .stats tr.year td { font-weight: bold; border-top: 2px solid #666; }
+    .stats tr.selected td { background: #333; }
+    .incomplete { color: #e0a040; }
+    .card-value { font-size: 1.5rem; font-weight: bold; }
+    #savings-chart { height: 320px; }
+    @media (max-width: 576px) { #savings-chart { height: 220px; } }
+  </style>
+</head>
+
+{% macro kwh(v) %}{{ '%.1f' % v if v is not none else '' }}{% endmacro %}
+{% macro pln(v) %}{{ '%.2f' % v if v is not none else '' }}{% endmacro %}
+{% macro row_cells(r, link) %}
+  <td>{% if link %}<a href="/stats?month={{ r.period }}">{{ r.period }}</a>{% else %}{{ r.period }}{% endif %}</td>
+  {% set expected_hours = (r.expected_days or r.days) * 24 %}
+  <td class="{{ 'incomplete' if r.hours < expected_hours - 1 or r.export_price_missing_hours }}"
+      title="{{ r.days }} days, {{ r.hours }} h with data of {{ expected_hours }}{% if r.export_price_missing_hours %}, {{ r.export_price_missing_hours }} h without RCE price{% endif %}">
+    {{ '%.0f' % (100 * r.hours / expected_hours) if expected_hours else '-' }}%</td>
+  <td>{{ kwh(r.import_kwh) }}</td>
+  <td>{{ kwh(r.export_kwh) }}</td>
+  <td>{{ kwh(r.net_import_kwh) }}</td>
+  <td>{{ pln(r.net_import_pln) }}</td>
+  <td>{{ kwh(r.net_export_kwh) }}</td>
+  <td>{{ pln(r.export_credit_pln) }}</td>
+  <td>{{ kwh(r.load_kwh) }}</td>
+  <td>{{ kwh(r.pv_kwh) }}</td>
+  <td>{{ kwh(r.pv_self_kwh) }}</td>
+  <td>{{ pln(r.baseline_pln) }}</td>
+  <td><b>{{ pln(r.savings_pln) }}</b></td>
+  <td>{{ kwh(r.grid_charge_kwh) }}</td>
+  <td>{{ kwh(r.shifted_kwh) }}</td>
+  <td>{{ pln(r.shift_profit_pln) }}</td>
+{% endmacro %}
+{% macro header() %}
+  <tr>
+    <th></th><th title="Hours with complete data">Data</th>
+    <th title="Meter import before hourly netting">Import kWh</th>
+    <th title="Meter export before hourly netting">Export kWh</th>
+    <th title="Sum of hourly net imports - what the bill charges">Net imp. kWh</th>
+    <th title="Net import x hourly import price">Net imp. zł</th>
+    <th title="Sum of hourly net exports - what goes to the deposit">Net exp. kWh</th>
+    <th title="Net export x hourly RCE (x1.23 from 2025-02-01)">Deposit zł</th>
+    <th>Load kWh</th><th>PV kWh</th>
+    <th title="PV not exported in the same hour">PV used kWh</th>
+    <th title="House load bought from the grid without PV and battery (minus the PV-induced extra load)">Without PV zł</th>
+    <th title="Without PV - net import + deposit credit">Savings zł</th>
+    <th title="Grid energy charged into the battery: net charge the PV surplus didn't cover">Grid→batt kWh</th>
+    <th title="Grid-charged energy the house used later (after 10 % round-trip loss); the house uses it before stored PV">Shifted kWh</th>
+    <th title="Shifted energy at the import price of the hour it was used, minus what it cost when charged. Already part of Savings">Shift profit zł</th>
+  </tr>
+{% endmacro %}
+
+<body>
+  <div class="container-fluid">
+    <h1>Settlement &amp; savings</h1>
+
+    <div class="row mb-3">
+      <div class="col-6 col-md-3">
+        <div>Savings so far</div>
+        <div class="card-value">{{ '%.0f' % payback.total_pln }} zł</div>
+      </div>
+      {% if payback.investment_pln %}
+      <div class="col-6 col-md-3">
+        <div>Net investment</div>
+        <div class="card-value">{{ '%.0f' % payback.investment_pln }} zł</div>
+        <div>{{ '%.1f' % (100 * payback.paid_back_fraction) }}% paid back</div>
+      </div>
+      {% endif %}
+      <div class="col-6 col-md-3">
+        <div>Last 12 months</div>
+        <div class="card-value">{{ '%.0f' % payback.per_year_pln if payback.per_year_pln is not none else '-' }} zł/yr</div>
+      </div>
+      {% if payback.payback_date %}
+      <div class="col-6 col-md-3">
+        <div>Projected payback</div>
+        <div class="card-value">{{ payback.payback_date }}</div>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="row mb-3">
+      <div class="col">
+        <div style="background:#111;border-radius:6px;padding:12px">
+          <canvas id="savings-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <h3>Monthly</h3>
+    <div class="table-responsive">
+      <table id="monthly-table" class="table table-dark table-sm stats">
+        <thead>{{ header() }}</thead>
+        <tbody>
+          {% for y in years %}
+            {% for r in months if r.period.startswith(y.period) %}
+            <tr class="{{ 'selected' if r.period == month }}">{{ row_cells(r, true) }}</tr>
+            {% endfor %}
+            <tr class="year">{{ row_cells(y, false) }}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Daily {{ month }}</h3>
+    <div class="table-responsive">
+      <table id="daily-table" class="table table-dark table-sm stats">
+        <thead>{{ header() }}</thead>
+        <tbody>
+          {% for r in days %}<tr>{{ row_cells(r, false) }}</tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <p class="text-muted small">
+      Hourly net settlement from the inverter's grid meter: import and export are offset within each hour;
+      a net import is priced at the import tariff, a net export at the hourly average RCE (x1.23 from 2025-02-01,
+      0 for a negative hour). Savings = cost of the house load without PV and battery (less the PV-induced extra
+      load) - net import cost + deposit credit. Shift profit is the part of the savings from grid energy
+      stored at one price and used at a higher one (10 % round-trip loss; the house uses stored grid energy
+      before stored PV). Fixed monthly fees are not included.
+      <a href="/stats/daily.csv">Download daily CSV</a>.
+    </p>
+
+    <div class="row mt-2 mb-4">
+      <div class="col">
+        <a href="/" class="btn btn-primary">&lt; Back</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="/static/chart-theme.js"></script>
+  <script src="/static/table.js"></script>
+  <script>
+    // The tables scroll sideways inside .table-responsive, where CSS sticky
+    // can't work; table.js pins a fixed clone of the header instead (as on
+    // the history page).
+    initStickyTableHeader(document.getElementById('monthly-table'));
+    initStickyTableHeader(document.getElementById('daily-table'));
+  </script>
+  <script>
+    (function () {
+      const rows = {{ cumulative | tojson }};
+      const investment = {{ payback.investment_pln | tojson }};
+      let total = 0;
+      const labels = [], values = [];
+      rows.forEach(r => { total += r.savings || 0; labels.push(r.day); values.push(Math.round(total)); });
+      const datasets = [{
+        label: 'Cumulative savings, zł', data: values, borderColor: ChartTheme.seriesColor(0),
+        backgroundColor: ChartTheme.withAlpha(ChartTheme.seriesColor(0), 0.2), fill: true, pointRadius: 0, borderWidth: 2,
+      }];
+      if (investment) {
+        datasets.push({ label: 'Net investment, zł', data: labels.map(() => investment),
+          borderColor: ChartTheme.seriesColor(1), borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 });
+      }
+      const axis = { ticks: { color: ChartTheme.axisTickColor }, border: { color: ChartTheme.axisBorderColor },
+        grid: { color: ChartTheme.gridColor, borderDash: ChartTheme.gridDash } };
+      new Chart(document.getElementById('savings-chart'), {
+        type: 'line', data: { labels, datasets },
+        options: { responsive: true, maintainAspectRatio: false, animation: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: { legend: ChartTheme.legend, tooltip: ChartTheme.tooltip },
+          scales: { x: { ...axis, ticks: { ...axis.ticks, maxTicksLimit: 12 } }, y: { ...axis, beginAtZero: true } } },
+      });
+    })();
+  </script>
+</body>
+</html>

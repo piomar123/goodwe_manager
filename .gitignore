@@ -184,6 +184,7 @@ cython_debug/
 /rce_prices.db-wal
 /rce_prices.db-shm
 /tariff_import.yaml
+/tariff_history.yaml
 /forecast_history.db
 /forecast_history.db-wal
 /forecast_history.db-shm
